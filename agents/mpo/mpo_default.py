@@ -78,15 +78,6 @@ class Actor(nn.Module):
         sigma = F.softplus(self.log_sigma_head(logits)) + self.min_scale
         return dist.Independent(dist.Normal(mu, sigma), 1)
 
-    def get_action(self, obs: torch.Tensor, n_samples: int = 1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        d = self.forward(obs)
-        actions = d.rsample((n_samples,))
-        actions = torch.clamp(actions, self.action_low, self.action_high)
-        log_probs = d.log_prob(actions) #TODO: verify log prob consistency
-        actions = actions.permute(1, 0, 2)  # (batch, n_samples, act_dim)
-        log_probs = log_probs.transpose(0, 1).unsqueeze(-1)
-        return actions, log_probs, d.mean
-
     def get_log_probs(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         d = self.forward(obs)
         return d.log_prob(action).unsqueeze(-1)
@@ -263,7 +254,6 @@ class MPO:
 
 
     def get_action(self, obs, evaluate=False):
-        act_dim = self.envs.single_action_space.shape[0]
 
         if self.obs is None:
             self.obs = obs
