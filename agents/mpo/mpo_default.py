@@ -37,7 +37,7 @@ def arr_to_str(x):
 class Actor(nn.Module):
     def __init__(self,
                  env,
-                 hidden_dims: List[int] = [256, 256],
+                 hidden_dims: List[int] = [256, 256, 256],
                  use_layer_norm: bool = False,
                  min_scale: float = 1e-3,
                  init_scale: float = 0.5,):
@@ -84,7 +84,7 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, env, hidden_dims: List[int] = [256, 256], use_layer_norm: bool = False):
+    def __init__(self, env, hidden_dims: List[int] = [256, 256, 256], use_layer_norm: bool = False):
         super().__init__()
         obs_dim = int(np.array(env.single_observation_space.shape).prod())
         act_dim = int(np.prod(env.single_action_space.shape))
@@ -700,7 +700,7 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.92)
     parser.add_argument("--use_layer_norm", type=bool, default=True)
     parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--n_hidden_layers", type=int, default=2)
+    parser.add_argument("--n_hidden_layers", type=int, default=3)
     parser.add_argument("--utd_ratio", type=int, default=1)
     parser.add_argument("--td_horizon", type=int, default=1,
                         help="n-step TD horizon for Q learning")
