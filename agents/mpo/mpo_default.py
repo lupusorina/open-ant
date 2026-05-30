@@ -776,6 +776,8 @@ if __name__ == "__main__":
     obs, info = envs.reset(seed=args.seed)
     agent.initialize_logging(info)
 
+    time_start_learning = time.time()
+
     for step in tqdm(range(agent.global_step, args.total_timesteps)):
 
         selected_actions = agent.get_action(obs, args.eval)
@@ -791,5 +793,8 @@ if __name__ == "__main__":
 
         if step % args.save_every_n_steps == 0:
             agent.save_checkpoint(step)
+
+    time_end_learning = time.time()
+    print(f"Learning time: {time_end_learning - time_start_learning} seconds")
 
     agent.cleanup()
