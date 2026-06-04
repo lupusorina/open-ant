@@ -21,7 +21,7 @@ if [ "$1" == "sim" ]; then
             --policy_learning_starts 2000 \
             --td_horizon 3 \
             --seed $SEED \
-            --cuda &   # <-- background each process
+            --cuda
     done
 
     wait   # <-- block until all seeds finish
