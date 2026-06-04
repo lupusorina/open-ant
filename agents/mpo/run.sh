@@ -52,7 +52,7 @@ fi
 if [ "$1" == "hw" ]; then
     python3 mpo_default.py \
         --render_mode rgb_array \
-        --dt 0.20 \
+        --dt 0.12 \
         --total_timesteps 60000 \
         --env_id HwEmbodiedAnt \
         --hw_config ../../embodied_ant_env/ant12.json \
