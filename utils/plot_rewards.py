@@ -33,6 +33,8 @@ TIME_WINDOW = 120.0  # seconds
 
 # Strip trailing _YYYYMMDD-HHMMSS_seed_N from a run directory name.
 _DATE_SEED_RE = re.compile(r'_\d{8}-\d{6}_seed_\d+$')
+# Strip leading seed_N_ prefix (e.g. seed_1079_trial_helios → trial_helios).
+_LEADING_SEED_RE = re.compile(r'^seed_\d+_')
 
 
 def get_dt(run_path):
@@ -123,7 +125,7 @@ def load_avg_rewards(run_path):
     df['avg_reward_per_second'] = avg_rewards
     df = df.iloc[int(TIME_WINDOW / dt):]   # drop warm-up window
 
-    label = _DATE_SEED_RE.sub('', os.path.basename(run_path))
+    label = _LEADING_SEED_RE.sub('', _DATE_SEED_RE.sub('', os.path.basename(run_path)))
     return df, dt, label
 
 
@@ -153,38 +155,33 @@ for agent, runs_path in RUNS.items():
     if not loaded:
         continue
 
-    trials = [(df, dt, lbl) for df, dt, lbl in loaded if 'trial' in lbl.lower()]
-    other  = [(df, dt, lbl) for df, dt, lbl in loaded if 'trial' not in lbl.lower()]
+    # Group runs by base label (seed suffix already stripped by load_avg_rewards).
+    groups: dict[str, list] = {}
+    for df, dt, lbl in loaded:
+        groups.setdefault(lbl, []).append((df, dt))
 
-    if args.stats and len(trials) > 1:
-        trial_color = PALETTE[color_idx % len(PALETTE)]
-        color_idx += 1
-        min_len = min(len(df) for df, _, _ in trials)
-        dt0 = trials[0][1]
-        steps = trials[0][0]['step'].values[:min_len] * dt0 / 60
-        rewards_mat = np.array([df['avg_reward_per_second'].values[:min_len] * 100
-                                for df, _, _ in trials])
-        for df, dt, _ in trials:
-            ax.plot(df['step'].values[:min_len] * dt / 60,
-                    df['avg_reward_per_second'].values[:min_len] * 100,
-                    color=trial_color, alpha=0.25, linewidth=0.8)
-        mean = rewards_mat.mean(axis=0)
-        std = rewards_mat.std(axis=0)
-        ax.plot(steps, mean, linewidth=2.0, color=trial_color,
-                label=f'{agent} trials — mean ± 1 std ({len(trials)} runs)')
-        ax.fill_between(steps, mean - std, mean + std, color=trial_color, alpha=0.2)
-    else:
-        for df, dt, lbl in (trials if args.stats else loaded):
-            color = PALETTE[color_idx % len(PALETTE)]
-            color_idx += 1
-            ax.plot(df['step'] * dt / 60, df['avg_reward_per_second'] * 100,
-                    linewidth=1.5, color=color, label=f'{agent} — {lbl}')
-
-    for df, dt, lbl in other:
+    for lbl, entries in groups.items():
         color = PALETTE[color_idx % len(PALETTE)]
         color_idx += 1
-        ax.plot(df['step'] * dt / 60, df['avg_reward_per_second'] * 100,
-                linewidth=1.5, color=color, label=f'{agent} — {lbl}')
+        if args.stats and len(entries) > 1:
+            min_len = min(len(df) for df, _ in entries)
+            dt0 = entries[0][1]
+            steps = entries[0][0]['step'].values[:min_len] * dt0 / 60
+            rewards_mat = np.array([df['avg_reward_per_second'].values[:min_len] * 100
+                                    for df, _ in entries])
+            for df, dt in entries:
+                ax.plot(df['step'].values[:min_len] * dt / 60,
+                        df['avg_reward_per_second'].values[:min_len] * 100,
+                        color=color, alpha=0.25, linewidth=0.8)
+            mean = rewards_mat.mean(axis=0)
+            std = rewards_mat.std(axis=0)
+            ax.plot(steps, mean, linewidth=2.0, color=color,
+                    label=f'{agent} — {lbl} mean ± 1 std ({len(entries)} seeds)')
+            ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.2)
+        else:
+            for df, dt in entries:
+                ax.plot(df['step'] * dt / 60, df['avg_reward_per_second'] * 100,
+                        linewidth=1.5, color=color, label=f'{agent} — {lbl}')
 
 ax.axhline(y=0, color='black', linestyle='--', linewidth=1.0)
 ax.set_xlabel('Time [minutes]')
