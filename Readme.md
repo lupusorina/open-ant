@@ -100,6 +100,7 @@ To create a new config file, run:
 ```
 python3 embodied_ant_env/make_ant_config.py /dev/tty.usbserial-XXXXXXX <APRIL_TAG_ID>
 ```
+User needs to be part of the dialout grp on ubuntu to be allowed to send commands out of port.
 which will create a new config file `ant<APRIL_TAG_ID>.json` in the current directory.
 
 Next, edit the config file to specify imu port, camera id and fov.
