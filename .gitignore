@@ -12,3 +12,5 @@ logs/
 runs*
 
 copy_from_hpc.sh
+ant_rl/
+embodied_ant_env/ant12.json
