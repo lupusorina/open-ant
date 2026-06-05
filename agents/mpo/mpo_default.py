@@ -240,7 +240,7 @@ class MPO:
         self.keys_agent_vars = [
             'loss_q', 'loss_p', 'mean_q', 'eta',
             'kl_mu', 'kl_sigma', 'alpha_mu', 'alpha_sigma',
-            'utd_ratio', 'SPS', 'average_reward_per_second', 'reward',
+            'utd_ratio', 'SPS', 'average_reward_per_second', 'reward','dt_learn','dt_step'
         ]
         self.info_log_buffer = []
         self.agent_vars_buffer = []
@@ -309,7 +309,7 @@ class MPO:
     def _learn(self):
         if self.global_step >= self.args.learning_starts + self.policy_learning_starts:
             self.args.decouple_q_learning = False
-
+        t0 = time.time()
         data = self.rb.sample_nstep(self.batch_size, self.trajectory_length)
 
         # t0 = time.time()
@@ -331,6 +331,7 @@ class MPO:
             # t_mstep = time.time() - t0
 
         self._update_targets()
+        t_learn = time.time() - t0
 
         return {
             'loss_q': loss_q,
@@ -344,6 +345,7 @@ class MPO:
             # 't_critic': t_critic,
             # 't_estep': t_estep,
             # 't_mstep': t_mstep,
+            't_learn': t_learn,
         }
 
     def _update_critic(self, data: NStepReplayBufferSamples) -> Tuple[float, float]:
@@ -565,12 +567,11 @@ class MPO:
         self.info_log_buffer = []
         self.agent_vars_buffer = []
 
-    def log_step(self, global_step, infos, rewards, metrics=None):
+    def log_step(self, global_step, infos, rewards, metrics=None, t_step=None):
         if self.writer_info is None:
             return
 
         self.reward_tracker.update(infos['original_reward'][0])
-        self.reward_tracker.log()
 
         row = {"step": global_step}
         for k in self.keys_info:
@@ -593,9 +594,12 @@ class MPO:
                 "SPS": int(global_step / (time.time() - self.start_time)) if self.start_time else 0,
                 "average_reward_per_second": self.reward_tracker.average_reward_per_second,
                 "reward": rewards[0] if hasattr(rewards, '__len__') else float(rewards),
+                "dt_learn": metrics.get('t_learn'),
+                "dt_step": t_step,
             })
 
         if global_step % self.args.save_every_n_steps == 0:
+            self.reward_tracker.log()
             for row in self.info_log_buffer:
                 self.writer_info.writerow(row)
             self.csv_file_info.flush()
@@ -777,9 +781,9 @@ if __name__ == "__main__":
     agent.initialize_logging(info)
 
     time_start_learning = time.time()
-
+    
     for step in tqdm(range(agent.global_step, args.total_timesteps)):
-
+        t0 = time.time()
         selected_actions = agent.get_action(obs, args.eval)
         next_obs, rewards, terminations, truncations, infos = envs.step(selected_actions)
 
@@ -789,11 +793,14 @@ if __name__ == "__main__":
         else:
             metrics = agent.agent_step(next_obs, selected_actions, rewards, terminations, truncations, infos)
 
-        agent.log_step(step, infos, rewards, metrics)
+        
 
         if step % args.save_every_n_steps == 0:
             agent.save_checkpoint(step)
-
+        
+        t_step = time.time() - t0
+        agent.log_step(step, infos, rewards, metrics, t_step)
+    
     time_end_learning = time.time()
     print(f"Learning time: {time_end_learning - time_start_learning} seconds")
 
