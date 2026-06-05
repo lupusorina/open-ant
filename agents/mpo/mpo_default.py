@@ -205,9 +205,12 @@ class MPO:
 
         self.policy_learning_starts = args.policy_learning_starts
 
-        # Dual variable for E-step temperature.
-        self.log_eta = torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True)
-        self.dual_temp_optimizer = optim.Adam([self.log_eta], lr=args.dual_lr)
+        # Dual variable for E-step temperature (Adam state stored as raw tensors, no autograd).
+        self.log_eta = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        self.dual_m = torch.zeros((), dtype=torch.float32, device=self.device)
+        self.dual_v = torch.zeros((), dtype=torch.float32, device=self.device)
+        self.dual_beta1_pow = torch.ones((), dtype=torch.float32, device=self.device)
+        self.dual_beta2_pow = torch.ones((), dtype=torch.float32, device=self.device)
 
         # Scalar Lagrange multipliers for M-step KL constraints.
         self.alpha_mu = 1e-3 #if 0.0 first policy imporvement steps are unconstrained
@@ -327,7 +330,7 @@ class MPO:
         # t_critic = time.time() - t0
 
         loss_p = kl_mu = kl_sigma = 0.0
-        eta = self.log_eta.exp().detach()
+        eta = self.log_eta.exp()
         # t_estep = t_mstep = 0.0
 
         # Always run E-step so eta stays calibrated during Q warmup.
@@ -462,19 +465,17 @@ class MPO:
 
     def _solve_temp_dual(self, q_values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         q = q_values.detach()  # (B, N)
-        n_samples = q.shape[-1]
+        q = (q - q.mean()) / q.std().clamp_min(1e-6)
 
-        q = (q - q.mean()) / q.std().clamp_min(1e-6) #mkae temp dual coeff reward scale inv.
+        self.log_eta, self.dual_m, self.dual_v, self.dual_beta1_pow, self.dual_beta2_pow = \
+            _run_dual_optim(
+                self.log_eta, self.dual_m, self.dual_v,
+                self.dual_beta1_pow, self.dual_beta2_pow,
+                q, self.args.dual_constraint, math.log(q.shape[-1]),
+                self.args.dual_lr, self.args.dual_steps,
+            )
 
-        with torch.enable_grad():
-            for _ in range(self.args.dual_steps):
-                self.dual_temp_optimizer.zero_grad()
-                dual_loss = _compiled_dual_loss(log_eta=self.log_eta, q=q, dual_constraint=self.args.dual_constraint, log_n=math.log(n_samples))
-                dual_loss.backward()
-                self.dual_temp_optimizer.step()
-                self.log_eta.data.clamp_(-4.0, 4.0)
-
-        eta_star = self.log_eta.exp().detach()
+        eta_star = self.log_eta.exp()
         weights = torch.softmax(q / eta_star, dim=-1)  # (B, N)
         return eta_star, weights
 
@@ -582,6 +583,9 @@ class MPO:
         self.reward_tracker.update(infos['original_reward'][0])
         self.reward_tracker.log()
 
+        if global_step % self.args.log_every_n_steps != 0:
+            return
+
         row = {"step": global_step}
         for k in self.keys_info:
             if k in infos:
@@ -625,7 +629,10 @@ class MPO:
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizers": [opt.state_dict() for opt in self.critic_optimizers],
             "log_eta": self.log_eta.item(),
-            "dual_temp_optimizer": self.dual_temp_optimizer.state_dict(),
+            "dual_m": self.dual_m.item(),
+            "dual_v": self.dual_v.item(),
+            "dual_beta1_pow": self.dual_beta1_pow.item(),
+            "dual_beta2_pow": self.dual_beta2_pow.item(),
             "alpha_mu": self.alpha_mu,
             "alpha_sigma": self.alpha_sigma,
             "global_step": global_step,
@@ -649,9 +656,12 @@ class MPO:
         for opt, sd in zip(self.critic_optimizers, checkpoint["critic_optimizers"]):
             opt.load_state_dict(sd)
         if "log_eta" in checkpoint:
-            self.log_eta.data.fill_(checkpoint["log_eta"])
-        if "dual_temp_optimizer" in checkpoint:
-            self.dual_temp_optimizer.load_state_dict(checkpoint["dual_temp_optimizer"])
+            self.log_eta.fill_(checkpoint["log_eta"])
+        if "dual_m" in checkpoint:
+            self.dual_m.fill_(checkpoint["dual_m"])
+            self.dual_v.fill_(checkpoint["dual_v"])
+            self.dual_beta1_pow.fill_(checkpoint["dual_beta1_pow"])
+            self.dual_beta2_pow.fill_(checkpoint["dual_beta2_pow"])
         self.alpha_mu = float(checkpoint.get("alpha_mu", 0.0))
         self.alpha_sigma = float(checkpoint.get("alpha_sigma", 0.0))
         self.global_step = checkpoint.get("global_step", 0)
@@ -679,9 +689,32 @@ class MPO:
             self.envs.close()
 
 @torch.compile
-def _compiled_dual_loss(log_eta, q, dual_constraint, log_n):
-    eta = log_eta.exp()
-    return eta * dual_constraint + eta * (torch.logsumexp(q / eta, dim=-1) - log_n).mean()
+def _run_dual_optim(log_eta, m, v, beta1_pow, beta2_pow, q, dual_constraint, log_n, lr, n_steps):
+    """
+    Runs n_steps of Adam on the temperature dual variable using the analytical gradient,
+    avoiding autograd entirely. The gradient of the dual loss w.r.t. log_eta is:
+        dL/d(log_eta) = L(eta) - mean((softmax(q/eta, dim=-1) * q).sum(-1))
+    where L(eta) = eta*(eps + mean(logsumexp(q/eta)) - log_n).
+    """
+    beta1 = 0.9
+    beta2 = 0.999
+    adam_eps = 1e-8
+    for _ in range(n_steps):
+        eta = log_eta.exp()
+        scaled_q = q / eta
+        w = torch.softmax(scaled_q, dim=-1)
+        L = eta * (dual_constraint + torch.logsumexp(scaled_q, dim=-1).mean() - log_n)
+        grad = L - (w * q).sum(-1).mean()
+
+        m = beta1 * m + (1.0 - beta1) * grad
+        v = beta2 * v + (1.0 - beta2) * grad * grad
+        beta1_pow = beta1_pow * beta1
+        beta2_pow = beta2_pow * beta2
+        m_hat = m / (1.0 - beta1_pow)
+        v_hat = v / (1.0 - beta2_pow)
+        log_eta = (log_eta - lr * m_hat / (v_hat.sqrt() + adam_eps)).clamp(-4.0, 4.0)
+
+    return log_eta, m, v, beta1_pow, beta2_pow
 
 
 def parse_args():
@@ -696,6 +729,7 @@ def parse_args():
     parser.add_argument("--capture_video", action="store_true")
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
+    parser.add_argument("--log_every_n_steps", type=int, default=100)
 
     # Algorithm.
     parser.add_argument("--env_id", type=str, default="EAnt")
@@ -741,7 +775,7 @@ def parse_args():
     # Environment.
     parser.add_argument("--dt", type=float, default=0.15)
     parser.add_argument("--hw_config", type=str, default=None)
-    parser.add_argument("--render_mode", type=str, default="rgb_array")
+    parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
     parser.add_argument("--weights_path", type=str, default=None)
     parser.add_argument("--task_type", type=str, default="back_and_forth",
@@ -786,7 +820,11 @@ if __name__ == "__main__":
     obs, info = envs.reset(seed=args.seed)
     agent.initialize_logging(info)
 
+    time_start_learning = time.time()
+    step_times = []
+
     for step in tqdm(range(agent.global_step, args.total_timesteps)):
+        time_now = time.time()
 
         selected_actions = agent.get_action(obs, args.eval)
         next_obs, rewards, terminations, truncations, infos = envs.step(selected_actions)
@@ -801,5 +839,9 @@ if __name__ == "__main__":
 
         if step % args.save_every_n_steps == 0:
             agent.save_checkpoint(step)
+        step_times.append(f"{step},{time.time() - time_now}\n")
+
+    with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
+        f.writelines(step_times)
 
     agent.cleanup()
