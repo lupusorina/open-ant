@@ -42,7 +42,7 @@ if [ "$1" == "sim_continual_learning" ]; then
         --decouple_q_learning \
         --policy_learning_starts 2000 \
         --td_horizon 3 \
-        --weights_path /home/sorina/linc/open-ant/agents/mpo/runs/retrace_20260521-121134_seed_0/weights_and_args \
+        --weights_path ~/embodied-mujoco-ant/agents/mpo/runs/retrace_20260521-121134_seed_0/weights_and_args \
         --model_path ../../sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml \
         --cuda \
         --seed 0
@@ -66,6 +66,7 @@ if [ "$1" == "hw" ]; then
         --decouple_q_learning \
         --policy_learning_starts 1000 \
         --td_horizon 3 \
+        --cuda
         # --weights_path /Users/mathieudecker/embodied-mujoco-ant/agents/mpo/runs/seed_459_trial_helios_20260507-180606_seed_459/weights_and_args \
         # --eval
 fi
