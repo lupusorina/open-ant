@@ -112,6 +112,8 @@ def main():
     actor = Actor(obs_dim, n_actions, use_layer_norm=args.use_layer_norm).to(DEVICE)
     critic = Critic(obs_dim, use_layer_norm=args.use_layer_norm).to(DEVICE)
 
+    # creates an Adam optimizer for the actor, and one for the critic. 
+    # actor_opt updates all actor parameters using the actor_lr
     actor_opt = optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_opt = optim.Adam(critic.parameters(), lr=args.critic_lr)
 
@@ -162,8 +164,12 @@ def main():
 
             # update critic via gradient descent to minimize delta^2 
             critic_loss = delta.pow(2)
+            #zeros any old graidents in critic optimizer
             critic_opt.zero_grad()
+            # find derivative of critic_loss w.r.t. every critic parameter
             critic_loss.backward()
+            # now, every critic weight has a p.grad attached that = partial of critic_loss / that weight
+            #..step means weight is changed: w <- w - lr * w.grad
             critic_opt.step()
             critic_loss_sum += critic_loss.item()
 
