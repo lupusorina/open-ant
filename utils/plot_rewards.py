@@ -1,5 +1,4 @@
 import re
-import glob
 import json
 import os
 import sys
@@ -18,14 +17,13 @@ plt.rcParams.update({'font.size': 13})
 AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'agents')
 
 RUNS = {
-    'SAC': os.path.join(AGENTS_DIR, 'sac', 'runs'),
+    'SAC': os.path.join(AGENTS_DIR, 'sac', 'runs_sim_test'),
     # 'PPO': os.path.join(AGENTS_DIR, 'ppo', 'runs'),
     'MPO': os.path.join(AGENTS_DIR, 'mpo', 'runs'),
 }
 
-SAC_HW_DIR = os.path.join(AGENTS_DIR, 'sac', 'runs_hw', 'runs_expensive_ant_back_and_forth')
+SAC_HW_DIR = os.path.join(AGENTS_DIR, 'sac', 'runs_hw_new_refactored_code')
 MPO_HW_DIR = os.path.join(AGENTS_DIR, 'mpo', 'runs_hw')
-SAC_HW_DT = 0.12
 
 PALETTE = plt.cm.tab10.colors
 
@@ -44,12 +42,6 @@ def get_dt(run_path):
             with open(f) as fh:
                 return json.load(fh)['dt']
     return 0.15
-
-
-def load_sac_hw_trials(dir_path):
-    """Load all average_rewards_df_trial_N.csv from the SAC hw directory."""
-    files = sorted(glob.glob(os.path.join(dir_path, 'average_rewards_df_trial_*.csv')))
-    return [(pd.read_csv(f), os.path.splitext(os.path.basename(f))[0]) for f in files]
 
 
 def get_transfer_step_offset(run_path):
@@ -103,18 +95,25 @@ def get_all_runs(runs_path):
         os.path.join(runs_path, d)
         for d in os.listdir(runs_path)
         if os.path.isdir(os.path.join(runs_path, d))
-        and os.path.exists(os.path.join(runs_path, d, 'info_logs.csv'))
-        and os.path.exists(os.path.join(runs_path, d, 'weights_and_args', 'args.json'))
+        and (os.path.exists(os.path.join(runs_path, d, 'info_logs.csv')) or os.path.exists(os.path.join(runs_path, d, 'info_sac_logs.csv')))
+        and (os.path.exists(os.path.join(runs_path, d, 'weights_and_args', 'args.json')) or os.path.exists(os.path.join(runs_path, d, 'args.json')))
     ])
 
 
 def load_avg_rewards(run_path):
-    """Load info_logs.csv and return smoothed reward series + dt + short label."""
-    with open(os.path.join(run_path, 'weights_and_args', 'args.json')) as f:
-        config = json.load(f)
-    dt = config['dt']
-
-    df = pd.read_csv(os.path.join(run_path, 'info_logs.csv'))
+    """Load info_logs.csv (MPO) or info_sac_logs.csv (SAC) and return smoothed reward series + dt + short label."""
+    dt = get_dt(run_path)
+    print(f"using sampling time {dt}")
+    sac_csv = os.path.join(run_path, 'info_sac_logs.csv')
+    mpo_csv = os.path.join(run_path, 'info_logs.csv')
+    if os.path.exists(sac_csv):
+        df = pd.read_csv(sac_csv)
+        df = df.rename(columns={'global_step': 'step'})
+        # original_rewards is stored as a stringified list e.g. "[-0.005]"
+        df['original_reward'] = df['original_rewards'].apply(
+            lambda x: float(str(x).strip('[]').split(',')[0]))
+    else:
+        df = pd.read_csv(mpo_csv)
 
     tracker = RewardTracker(env_dt=dt, env_id="plot", time_window=TIME_WINDOW, log_folder=".")
     avg_rewards = []
@@ -201,24 +200,27 @@ fig_hw, ax_hw = plt.subplots(figsize=(14, 6))
 color_idx = 0
 
 # SAC hw: mean ± std across trials, individual trials as faint lines
-sac_trials = load_sac_hw_trials(SAC_HW_DIR)
-if sac_trials:
+sac_hw_trials, sac_hw_other = load_mpo_hw_runs(SAC_HW_DIR)
+if sac_hw_trials:
     sac_color = PALETTE[color_idx]
     color_idx += 1
-    warmup_sac = int(TIME_WINDOW / SAC_HW_DT)
-    min_len = min(len(df) for df, _ in sac_trials)
-    steps_sac = sac_trials[0][0]['step'].values[warmup_sac:min_len] * SAC_HW_DT / 60
-    rewards_mat = np.array([df['reward'].values[warmup_sac:min_len] * 100 for df, _ in sac_trials])
-    for df, _ in sac_trials:
-        ax_hw.plot(df['step'].values[warmup_sac:min_len] * SAC_HW_DT / 60,
+    min_len = min(len(df) for df, _, _, _ in sac_hw_trials)
+    df0, dt0, _, off0 = sac_hw_trials[0]
+    warmup_sac = int(TIME_WINDOW / dt0)
+    steps_sac = (df0['step'].values[warmup_sac:min_len] + off0) * dt0 / 60
+    rewards_mat = np.array([df['reward'].values[warmup_sac:min_len] * 100
+                            for df, _, _, _ in sac_hw_trials])
+    for df, dt_i, label, off_i in sac_hw_trials:
+        ax_hw.plot((df['step'].values[warmup_sac:min_len] + off_i) * dt_i / 60,
                    df['reward'].values[warmup_sac:min_len] * 100,
                    color=sac_color, alpha=0.25, linewidth=0.8)
+        print(f"  SAC hw: {label}  ({len(df) - warmup_sac} steps after warm-up)")
     mean = rewards_mat.mean(axis=0)
     std = rewards_mat.std(axis=0)
     ax_hw.plot(steps_sac, mean, color=sac_color, linewidth=2.0,
-               label=f'SAC hw — mean ± std ({len(sac_trials)} trials)')
+               label=f'SAC hw — mean ± std ({len(sac_hw_trials)} trials)')
     ax_hw.fill_between(steps_sac, mean - std, mean + std, color=sac_color, alpha=0.2)
-    print(f"SAC hw: {len(sac_trials)} trials, {min_len} steps each")
+    print(f"SAC hw: {len(sac_hw_trials)} trials, {min_len} steps each")
 else:
     print(f"No SAC hw trials found in {SAC_HW_DIR}")
 
@@ -244,6 +246,14 @@ if mpo_hw_trials:
     ax_hw.fill_between(steps_ref, mean - std, mean + std, color=trial_color, alpha=0.2)
     print(f"MPO hw trials: {len(mpo_hw_trials)} trials, {min_len} steps each")
 
+for df, dt, label, step_offset in mpo_hw_other:
+    warmup = int(TIME_WINDOW / dt)
+    color = PALETTE[color_idx % len(PALETTE)]
+    color_idx += 1
+    ax_hw.plot((df['step'].values[warmup:] + step_offset) * dt / 60,
+               df['reward'].values[warmup:] * 100,
+               linewidth=1.5, color=color, label=f'MPO hw — {label}')
+    print(f"MPO hw run: {label}  ({len(df) - warmup} steps after warm-up)")
 
 ax_hw.axhline(y=0, color='black', linestyle='--', linewidth=1.0)
 ax_hw.set_xlabel('Time [minutes]')
