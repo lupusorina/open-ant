@@ -13,11 +13,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 import numpy as np
 
-GAMMA = 0.99
-ACTOR_LR = 6.85e-05
-CRITIC_LR = 0.0117
-NUM_EPISODES = 1000
-USE_LAYER_NORM = True
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -69,20 +65,28 @@ class Critic(nn.Module):
         x = F.relu(x)
         x = self.fc3(x)
         return x.squeeze(-1)
-
+# making sure the us elayer norm arg is correctly parsed
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "1", "y"):
+        return True
+    if v.lower() in ("no", "false", "f", "0", "n"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--num_episodes", type=int, default=NUM_EPISODES)
+    parser.add_argument("--num_episodes", type=int, default=1000)
     parser.add_argument("--run_dir", type=str, default="runs")
     parser.add_argument("--exp_name", type=str, default="one_step_ac")
-    parser.add_argument("--actor_lr", type=float, default=ACTOR_LR)
-    parser.add_argument("--critic_lr", type=float, default=CRITIC_LR)
-    parser.add_argument("--gamma", type=float, default=GAMMA)
-    parser.add_argument("--use_layer_norm", type=bool, default=USE_LAYER_NORM)
+    parser.add_argument("--actor_lr", type=float, default=6.85e-05)
+    parser.add_argument("--critic_lr", type=float, default=0.0117)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--use_layer_norm", type=str2bool, default=True)
     parser.add_argument("--solved_threshold", type=float, default=195.0,
-                        help="rolling-average return considered 'solved' (CartPole-v1 standard)")
+                        help="rolling-average return where the experiment will be considered 'solved'")
     parser.add_argument("--solved_window", type=int, default=100,
                         help="number of episodes to average over for the solved check")
     return parser.parse_args()
