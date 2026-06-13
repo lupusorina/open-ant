@@ -155,7 +155,6 @@ def main():
         v_s_sum = 0.0
         critic_loss_sum = 0.0
         n_steps = 0
-
         while not done:
             dist = actor(obs)
             action = dist.sample()
@@ -176,14 +175,13 @@ def main():
             td_target = reward + args.gamma * v_s_next
             delta = td_target - v_s
 
-            
             delta_sum += delta.item()
             abs_delta_sum += abs(delta.item())
             v_s_sum += v_s.item()
 
-            # update critic via gradient descent to minimize delta^2 
+            # update critic via gradient descent to minimize delta^2.
             critic_loss = delta.pow(2)
-            #zeros any old graidents in critic optimizer
+            # zeros any old gradients in critic optimizer
             critic_opt.zero_grad()
             # find derivative of critic_loss w.r.t. every critic parameter
             critic_loss.backward()
@@ -198,7 +196,6 @@ def main():
             actor_loss.backward()
             actor_opt.step()
 
-        
             obs = next_obs_t
 
         episode_returns.append(ep_return)
