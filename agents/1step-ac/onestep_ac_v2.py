@@ -87,11 +87,20 @@ def parse_args():
     parser.add_argument("--actor_lr", type=float, default=6.85e-05)
     parser.add_argument("--critic_lr", type=float, default=0.0117)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--use_layer_norm", type=str2bool, default=True)
+    parser.add_argument("--no-use_layer_norm", action="store_false",
+                        dest="use_layer_norm",
+                        help="disable layer normalization in networks")
     parser.add_argument("--solved_threshold", type=float, default=195.0,
                         help="rolling-average return where the experiment will be considered 'solved'")
     parser.add_argument("--solved_window", type=int, default=100,
                         help="number of episodes to average over for the solved check")
+    parser.add_argument("--capture_video", action="store_true",
+                        help="whether to capture videos")
+    parser.add_argument("--save_video_every_n_episodes", type=int, default=1,
+                        help="save video every n episodes")
+    parser.set_defaults(
+        use_layer_norm=True,
+    )
     return parser.parse_args()
 
 
@@ -108,7 +117,13 @@ def main():
     out_dir = os.path.join(args.run_dir, run_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    env = gym.make("CartPole-v1")
+    render_mode = "rgb_array" if args.capture_video else None
+    env = gym.make("CartPole-v1", render_mode=render_mode)
+    if args.capture_video:
+        print('RecordVideo')
+        env = gym.wrappers.RecordVideo(env, os.path.join(out_dir, "videos", run_name),
+                                       episode_trigger=lambda ep: ep % args.save_video_every_n_episodes == 0,
+                                       video_length=0)
     env.action_space.seed(args.seed)
     obs_dim = env.observation_space.shape[0]
     n_actions = env.action_space.n
