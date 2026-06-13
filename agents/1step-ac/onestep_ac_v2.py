@@ -68,7 +68,7 @@ class Critic(nn.Module):
         x = F.relu(x)
         x = self.fc3(x)
         return x.squeeze(-1)
-# making sure the us elayer norm arg is correctly parsed
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
