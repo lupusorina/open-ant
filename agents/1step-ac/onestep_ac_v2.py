@@ -4,8 +4,9 @@ import os
 import csv
 import argparse
 import random
-
 import gymnasium as gym
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -102,8 +103,9 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-  
-    out_dir = os.path.join(args.run_dir, f"{args.exp_name}_seed_{args.seed}")
+    date_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{args.exp_name}_{date_time}_seed_{args.seed}"
+    out_dir = os.path.join(args.run_dir, run_name)
     os.makedirs(out_dir, exist_ok=True)
 
     env = gym.make("CartPole-v1")
