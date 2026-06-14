@@ -90,14 +90,16 @@ def parse_args():
     parser.add_argument("--no-use_layer_norm", action="store_false",
                         dest="use_layer_norm",
                         help="disable layer normalization in networks")
-    parser.add_argument("--solved_threshold", type=float, default=195.0,
-                        help="rolling-average return where the experiment will be considered 'solved'")
-    parser.add_argument("--solved_window", type=int, default=100,
-                        help="number of episodes to average over for the solved check")
+    # parser.add_argument("--solved_threshold", type=float, default=195.0,
+    #                     help="rolling-average return where the experiment will be considered 'solved'")
+    # parser.add_argument("--solved_window", type=int, default=100,
+    #                     help="number of episodes to average over for the solved check")
     parser.add_argument("--capture_video", action="store_true",
                         help="whether to capture videos")
     parser.add_argument("--save_video_every_n_episodes", type=int, default=1,
                         help="save video every n episodes")
+    parser.add_argument("--flush_log_every_n_episodes", type=int, default=1,
+                        help="flush episode_log.csv every n episodes")
     parser.set_defaults(
         use_layer_norm=True,
     )
@@ -133,127 +135,152 @@ def main():
 
     # creates a SGD optimizer for the actor, and one for the critic. 
     # actor_opt updates all actor parameters using the actor_lr
-    actor_opt = optim.SGD(actor.parameters(), lr=args.actor_lr)
-    critic_opt = optim.SGD(critic.parameters(), lr=args.critic_lr)
+    #actor_opt = optim.SGD(actor.parameters(), lr=args.actor_lr)
+    #critic_opt = optim.SGD(critic.parameters(), lr=args.critic_lr)
 
     episode_returns = []
 
-    log_rows = []
+    episode_avg_delta = []
+    episode_avg_abs_delta = []
+    episode_avg_v_s = []
+    episode_avg_critic_loss = []
+
     global_step = 0
 
-    for episode in range(args.num_episodes):
-        obs, _ = env.reset(seed=args.seed + episode)
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
-
-        I = 1.0
-        ep_return = 0.0
-        done = False
-
-        # some metrics we keep track for an episode
-        delta_sum = 0.0
-        abs_delta_sum = 0.0
-        v_s_sum = 0.0
-        critic_loss_sum = 0.0
-        n_steps = 0
-        while not done:
-            dist = actor(obs)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-
-            next_obs, reward, terminated, truncated, _ = env.step(action.item())
-            done = terminated or truncated
-            ep_return += reward
-            global_step += 1
-            n_steps += 1
-
-            next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=DEVICE)
-
-            v_s = critic(obs.unsqueeze(0)).squeeze(0)
-            with torch.no_grad():
-                v_s_next = critic(next_obs_t.unsqueeze(0)).squeeze(0) if not terminated else torch.tensor(0.0, device=DEVICE)
-
-            td_target = reward + args.gamma * v_s_next
-            delta = td_target - v_s
-
-            delta_sum += delta.item()
-            abs_delta_sum += abs(delta.item())
-            v_s_sum += v_s.item()
-
-            # update critic via gradient descent to minimize delta^2.
-            critic_loss = delta.pow(2)
-            # zeros any old gradients in critic optimizer
-            critic_opt.zero_grad()
-            # find derivative of critic_loss w.r.t. every critic parameter
-            critic_loss.backward()
-            # now, every critic weight has a p.grad attached that = partial of critic_loss / that weight
-            #..step means weight is changed: w <- w - lr * w.grad
-            critic_opt.step()
-            critic_loss_sum += critic_loss.item()
-
-            # update actor via gradient ascent, maximize the objective
-            actor_loss = -delta.detach() * log_prob
-            actor_opt.zero_grad()
-            actor_loss.backward()
-            actor_opt.step()
-
-            obs = next_obs_t
-
-        episode_returns.append(ep_return)
-
-        # average metrics for this episode
-        avg_delta = delta_sum / n_steps
-        avg_abs_delta = abs_delta_sum / n_steps
-        avg_v_s = v_s_sum / n_steps
-        avg_critic_loss = critic_loss_sum / n_steps
-
-        log_rows.append({
-            "episode": episode + 1,
-            "global_step": global_step,
-            "ep_return": ep_return,
-            "avg_delta": avg_delta,
-            "avg_abs_delta": avg_abs_delta,
-            "avg_v_s": avg_v_s,
-            "avg_critic_loss": avg_critic_loss,
-        })
-
-        if (episode + 1) % 20 == 0:
-            avg_return = np.mean(episode_returns[-20:])
-            recent = log_rows[-20:]
-            recent_avg_delta = np.mean([r["avg_delta"] for r in recent])
-            recent_avg_abs_delta = np.mean([r["avg_abs_delta"] for r in recent])
-            recent_avg_v_s = np.mean([r["avg_v_s"] for r in recent])
-            recent_avg_critic_loss = np.mean([r["avg_critic_loss"] for r in recent])
-            print(
-                f"[seed {args.seed}] Episode {episode+1}, "
-                f"avg return (last 20): {avg_return:.2f}, "
-                f"avg|delta|: {recent_avg_abs_delta:.3f}, "
-                f"avg delta: {recent_avg_delta:.3f}, "
-                f"avg v_s: {recent_avg_v_s:.3f}, "
-                f"avg critic_loss: {recent_avg_critic_loss:.4f}"
-            )
-
-        # check if the solved condition for rewards is met.
-        if len(episode_returns) >= args.solved_window:
-            rolling_avg = np.mean(episode_returns[-args.solved_window:])
-            if rolling_avg >= args.solved_threshold:
-                print(
-                    f"[seed {args.seed}] Solved at episode {episode+1}! "
-                    f"Rolling avg over last {args.solved_window} episodes: {rolling_avg:.2f} "
-                    f">= threshold {args.solved_threshold}"
-                )
-                break
-
-    env.close()
-
-
     csv_path = os.path.join(out_dir, "episode_log.csv")
-    fieldnames = ["episode", "global_step", "ep_return", "avg_delta", "avg_abs_delta", "avg_v_s", "avg_critic_loss"]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in log_rows:
-            writer.writerow(row)
-    print(f"[seed {args.seed}] Saved log to {csv_path}")
+    fieldnames = [
+        "episode",
+        "global_step",
+        "ep_return",
+        "avg_delta",
+        "avg_abs_delta",
+        "avg_v_s",
+        "avg_critic_loss",
+    ]
+
+    # create CSV to write to 
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    csv_writer.writeheader()
+    csv_file.flush()
+    os.fsync(csv_file.fileno())
+
+    try:
+        for episode in range(args.num_episodes):
+            obs, _ = env.reset(seed=args.seed + episode)
+            obs = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
+
+            I = 1.0
+            ep_return = 0.0
+            done = False
+
+            # some metrics we keep track for an episode
+            delta_sum = 0.0
+            abs_delta_sum = 0.0
+            v_s_sum = 0.0
+            critic_loss_sum = 0.0
+            n_steps = 0
+
+            while not done:
+                dist = actor(obs)
+                action = dist.sample()
+                log_prob = dist.log_prob(action)
+
+                next_obs, reward, terminated, truncated, _ = env.step(action.item())
+                done = terminated or truncated
+                ep_return += reward
+                global_step += 1
+                n_steps += 1
+
+                next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=DEVICE)
+
+                v_s = critic(obs.unsqueeze(0)).squeeze(0)
+                with torch.no_grad():
+                    v_s_next = critic(next_obs_t.unsqueeze(0)).squeeze(0) if not terminated else torch.tensor(0.0, device=DEVICE)
+
+                td_target = reward + args.gamma * v_s_next
+                delta = td_target - v_s
+
+                delta_sum += delta.item()
+                abs_delta_sum += abs(delta.item())
+                v_s_sum += v_s.item()
+                critic_loss_sum += 0.5 * (delta.item() ** 2)
+
+                # zero old gradients
+                critic.zero_grad()
+                #take gradient of Vw(S)
+                v_s.backward(retain_graph=True)
+                
+                #Update critic weight
+                with torch.no_grad():
+                    for p in critic.parameters():
+                        if p.grad is not None:
+                            p += args.critic_lr * delta.detach() * p.grad
+
+                # update actor via manual gradient ascent, maximize the objective
+                actor.zero_grad()
+                log_prob.backward()
+                with torch.no_grad():
+                    for p in actor.parameters():
+                        if p.grad is not None:
+                            p += args.actor_lr * delta.detach() * p.grad
+            
+                obs = next_obs_t
+
+            episode_returns.append(ep_return)
+
+            # average metrics for this episode
+            avg_delta = delta_sum / n_steps
+            avg_abs_delta = abs_delta_sum / n_steps
+            avg_v_s = v_s_sum / n_steps
+            avg_critic_loss = critic_loss_sum / n_steps
+
+            episode_avg_delta.append(avg_delta)
+            episode_avg_abs_delta.append(avg_abs_delta)
+            episode_avg_v_s.append(avg_v_s)
+            episode_avg_critic_loss.append(avg_critic_loss)
+
+            row = {
+                "episode": episode + 1,
+                "global_step": global_step,
+                "ep_return": ep_return,
+                "avg_delta": avg_delta,
+                "avg_abs_delta": avg_abs_delta,
+                "avg_v_s": avg_v_s,
+                "avg_critic_loss": avg_critic_loss,
+            }
+
+            csv_writer.writerow(row)
+
+            if (episode + 1) % 20 == 0:
+                avg_return = np.mean(episode_returns[-20:])
+                recent_avg_delta = np.mean(episode_avg_delta[-20:])
+                recent_avg_abs_delta = np.mean(episode_avg_abs_delta[-20:])
+                recent_avg_v_s = np.mean(episode_avg_v_s[-20:])
+                recent_avg_critic_loss = np.mean(episode_avg_critic_loss[-20:])
+
+                print(
+                    f"[seed {args.seed}] Episode {episode+1}, "
+                    f"avg return (last 20): {avg_return:.2f}, "
+                    f"avg|delta|: {recent_avg_abs_delta:.3f}, "
+                    f"avg delta: {recent_avg_delta:.3f}, "
+                    f"avg v_s: {recent_avg_v_s:.3f}, "
+                    f"avg critic_loss: {recent_avg_critic_loss:.4f}"
+                )
+
+            if (episode + 1) % args.flush_log_every_n_episodes == 0:
+                csv_file.flush()
+                os.fsync(csv_file.fileno())
+
+        
+
+    finally:
+        csv_file.flush()
+        os.fsync(csv_file.fileno())
+        csv_file.close()
+        print(f"[seed {args.seed}] Finished writing log to {csv_path}")
+        
+        env.close()
 
     
     weights_path = os.path.join(out_dir, "weights.pth")
