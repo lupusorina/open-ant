@@ -6,16 +6,16 @@ for SEED in "${SEEDS[@]}"; do
 
     echo "Running seed $SEED: one-step actor-critic on CartPole..."
 
-    python3 test_onestep_ac.py \
+    python3 onestep_ac_v2.py \
         --exp_name one_step_ac \
-        --run_dir runs_cartpole/experiment14 \
+        --run_dir runs_cartpole/experiment17 \
         --num_episodes 5000 \
         --seed $SEED \
         --actor_lr 0.0001 \
         --critic_lr 0.0001 \
         --gamma 0.99 \
         --capture_video \
-        --save_video_every_n_episodes 40 \
+        --save_video_every_n_episodes 400 \
         --no-use_layer_norm
 
 

@@ -121,6 +121,8 @@ def main():
 
     render_mode = "rgb_array" if args.capture_video else None
     env = gym.make("CartPole-v1", render_mode=render_mode)
+    env_dt = env.unwrapped.tau
+    print(f"CartPole integration dt = {env_dt}", flush=True)
     if args.capture_video:
         print('RecordVideo')
         env = gym.wrappers.RecordVideo(env, os.path.join(out_dir, "videos", run_name),
@@ -156,6 +158,8 @@ def main():
         "avg_abs_delta",
         "avg_v_s",
         "avg_critic_loss",
+        "physical_time",
+        "episode_time",
     ]
 
     # create CSV to write to 
@@ -243,6 +247,8 @@ def main():
             row = {
                 "episode": episode + 1,
                 "global_step": global_step,
+                "physical_time": global_step * env_dt,
+                "episode_time": n_steps * env_dt,
                 "ep_return": ep_return,
                 "avg_delta": avg_delta,
                 "avg_abs_delta": avg_abs_delta,
