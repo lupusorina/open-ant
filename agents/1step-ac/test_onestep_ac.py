@@ -142,7 +142,7 @@ def main():
     global_step = 0
 
     for episode in range(args.num_episodes):
-        obs, _ = env.reset(seed=args.seed + episode)
+        obs, _ = env.reset(seed=args.seed)
         obs = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
 
         I = 1.0
