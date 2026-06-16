@@ -84,8 +84,8 @@ def parse_args():
     parser.add_argument("--num_episodes", type=int, default=1000)
     parser.add_argument("--run_dir", type=str, default="runs")
     parser.add_argument("--exp_name", type=str, default="one_step_ac")
-    parser.add_argument("--actor_lr", type=float, default=6.85e-05)
-    parser.add_argument("--critic_lr", type=float, default=0.0117)
+    parser.add_argument("--actor_step_size", type=float, default=6.85e-05)
+    parser.add_argument("--critic_step_size", type=float, default=0.0117)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--no-use_layer_norm", action="store_false",
                         dest="use_layer_norm",
@@ -132,9 +132,9 @@ def main():
     critic = Critic(obs_dim, use_layer_norm=args.use_layer_norm).to(DEVICE)
 
     # creates a SGD optimizer for the actor, and one for the critic. 
-    # actor_opt updates all actor parameters using the actor_lr
-    #actor_opt = optim.SGD(actor.parameters(), lr=args.actor_lr)
-    #critic_opt = optim.SGD(critic.parameters(), lr=args.critic_lr)
+    # actor_opt updates all actor parameters using the actor_step_size
+    #actor_opt = optim.SGD(actor.parameters(), lr=args.actor_step_size)
+    #critic_opt = optim.SGD(critic.parameters(), lr=args.critic_step_size)
 
     episode_returns = []
 
@@ -190,7 +190,7 @@ def main():
             with torch.no_grad():
                 for p in critic.parameters():
                     if p.grad is not None:
-                        p += args.critic_lr * delta.detach() * p.grad
+                        p += args.critic_step_size * delta.detach() * p.grad
 
             # update actor via manual gradient ascent, maximize the objective
             actor.zero_grad()
@@ -198,8 +198,8 @@ def main():
             with torch.no_grad():
                 for p in actor.parameters():
                     if p.grad is not None:
-                        p += args.actor_lr * delta.detach() * p.grad
-        
+                        p += args.actor_step_size * delta.detach() * p.grad
+
             obs = next_obs_t
 
         episode_returns.append(ep_return)

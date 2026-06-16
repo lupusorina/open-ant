@@ -11,8 +11,8 @@ for SEED in "${SEEDS[@]}"; do
         --run_dir runs_cartpole/experiment17 \
         --num_episodes 5000 \
         --seed $SEED \
-        --actor_lr 0.0001 \
-        --critic_lr 0.0001 \
+        --actor_step_size 0.0001 \
+        --critic_step_size 0.0001 \
         --gamma 0.99 \
         --no-use_layer_norm
         # --capture_video \
