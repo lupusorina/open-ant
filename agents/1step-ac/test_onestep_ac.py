@@ -131,10 +131,8 @@ def main():
     actor = Actor(obs_dim, n_actions, use_layer_norm=args.use_layer_norm).to(DEVICE)
     critic = Critic(obs_dim, use_layer_norm=args.use_layer_norm).to(DEVICE)
 
-    # creates a SGD optimizer for the actor, and one for the critic. 
-    # actor_opt updates all actor parameters using the actor_step_size
-    #actor_opt = optim.SGD(actor.parameters(), lr=args.actor_step_size)
-    #critic_opt = optim.SGD(critic.parameters(), lr=args.critic_step_size)
+    actor_opt = optim.SGD(actor.parameters(), lr=args.actor_step_size)
+    critic_opt = optim.SGD(critic.parameters(), lr=args.critic_step_size)
 
     episode_returns = []
 
@@ -181,24 +179,15 @@ def main():
             v_s_sum += v_s.item()
             critic_loss_sum += 0.5 * (delta.item() ** 2)
 
-            # zero old gradients
-            critic.zero_grad()
-            # take gradient of V_w(S)
-            v_s.backward()
+            critic_opt.zero_grad()
+            critic_loss = -delta.detach() * v_s
+            critic_loss.backward()
+            critic_opt.step()
 
-            #Update critic weight
-            with torch.no_grad():
-                for p in critic.parameters():
-                    if p.grad is not None:
-                        p += args.critic_step_size * delta.detach() * p.grad
-
-            # update actor via manual gradient ascent, maximize the objective
-            actor.zero_grad()
-            log_prob.backward()
-            with torch.no_grad():
-                for p in actor.parameters():
-                    if p.grad is not None:
-                        p += args.actor_step_size * delta.detach() * p.grad
+            actor_opt.zero_grad()
+            actor_loss = -delta.detach() * log_prob
+            actor_loss.backward()
+            actor_opt.step()
 
             obs = next_obs_t
 
