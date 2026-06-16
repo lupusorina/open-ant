@@ -137,7 +137,7 @@ def parse_args():
                         choices=["forward", "back_and_forth"])
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3)
     parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3])
-    parser.add_argument("--reward_scale", type=float, default=100.0)
+    parser.add_argument("--reward_scale", type=float, default=1)
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
     parser.add_argument("--no-terminate_on_upside_down", action="store_false",
@@ -354,7 +354,7 @@ def main():
             # critic update, zero old gradients
             critic.zero_grad()
             #take gradient of Vw(S)
-            v_s.backward(retain_graph=True)
+            v_s.backward()
 
             # update critic weight
             with torch.no_grad():

@@ -3,10 +3,13 @@
 import os
 import csv
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-CSV_PATH = "runs_cartpole/experiment17/one_step_ac_20260616-110002_seed_0/episode_log.csv"
+CSV_PATH = "/home/seliu/open-ant/agents/1step-ac/runs_cartpole/experiment17/one_step_ac_20260616-180734_seed_0/episode_log.csv"
+
+ENV_DT = 0.02
 
 YLIMS = {
     "ep_return": (0, 600),
@@ -114,7 +117,8 @@ def main():
     axes[2, 1].axis("off")
 
     fig.tight_layout()
-    plt.show()
+    fig.savefig(out_path, dpi=150)
+    print(f"Saved plot to {out_path}")
 
 
 if __name__ == "__main__":
