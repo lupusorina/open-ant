@@ -183,8 +183,8 @@ def main():
 
             # zero old gradients
             critic.zero_grad()
-            #take gradient of Vw(S)
-            v_s.backward(retain_graph=True)
+            # take gradient of Vw(S)
+            v_s.backward()
             
             #Update critic weight
             with torch.no_grad():
