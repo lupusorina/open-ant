@@ -8,6 +8,21 @@ import time
 import random
 import argparse
 import numpy as np
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
 from tqdm import tqdm
 import gymnasium as gym
 from datetime import datetime
@@ -28,6 +43,107 @@ from reward import RewardTracker
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 from utils.buffers import ReplayBuffer, NStepReplayBufferSamples
 
+
+
+
+class DiscreteValuedDistribution:
+    """Categorical distribution over a fixed set of scalar atom values."""
+    def __init__(self, values: torch.Tensor, logits: torch.Tensor):
+        # values: (num_atoms,)   logits: (..., num_atoms)
+        self.values = values
+        self.logits = logits
+
+    @property
+    def probs(self) -> torch.Tensor:
+        return torch.softmax(self.logits, dim=-1)
+
+    def mean(self) -> torch.Tensor:
+        # (..., 1)
+        return (self.probs * self.values).sum(dim=-1, keepdim=True)
+    
+def l2_project(Zp: torch.Tensor, P: torch.Tensor, Zq: torch.Tensor) -> torch.Tensor:
+    """Project distribution (Zp, P) onto support Zq under the L2 metric over CDFs.
+
+    Zp: (B, Kp) support of source distribution
+    P:  (B, Kp) probabilities P(Zp[i])
+    Zq: (Kq,)   target support to project onto
+    returns: (B, Kq)
+    """
+    # Zq assumed 1-D (Kq,).
+    vmin, vmax = Zq[0], Zq[-1]
+
+    # d_pos[i] = Zq[i+1] - Zq[i], d_neg[i] = Zq[i] - Zq[i-1]
+    # built via the same shifted-concat trick as the TF source.
+    d_pos = torch.cat([Zq, vmin[None]], dim=0)[1:]   # (Kq,)
+    d_neg = torch.cat([vmax[None], Zq], dim=0)[:-1]  # (Kq,)
+
+    # Clip source atoms into [vmin, vmax]; shape (B, 1, Kp).
+    clipped_zp = torch.clamp(Zp, vmin, vmax)[:, None, :]
+    clipped_zq = Zq[None, :, None]                   # (1, Kq, 1)
+
+    d_pos = (d_pos - Zq)[None, :, None]              # (1, Kq, 1)
+    d_neg = (Zq - d_neg)[None, :, None]              # (1, Kq, 1)
+
+    delta_qp = clipped_zp - clipped_zq               # (B, Kq, Kp)
+    d_sign = (delta_qp >= 0.0).to(P.dtype)           # (B, Kq, Kp)
+
+    delta_hat = (d_sign * delta_qp / d_pos) - ((1.0 - d_sign) * delta_qp / d_neg)
+    P = P[:, None, :]                                # (B, 1, Kp)
+    return torch.sum(torch.clamp(1.0 - delta_hat, 0.0, 1.0) * P, dim=2)  # (B, Kq)
+
+
+def categorical(q_tm1: DiscreteValuedDistribution,
+                r_t: torch.Tensor,    # (B, 1)
+                d_t: torch.Tensor,    # (B, 1)  = discount * (1 - done)
+                q_t: DiscreteValuedDistribution) -> torch.Tensor:
+    """Categorical distributional TD(0) loss. Returns per-sample loss (B,)."""
+    values = q_t.values                              # (N,)
+    z_t = r_t.reshape(-1, 1) + d_t.reshape(-1, 1) * values  # (B, N)
+    p_t = torch.softmax(q_t.logits, dim=-1)          # (B, N)
+
+    target = l2_project(z_t, p_t, values).detach()   # (B, N), stop-grad
+
+    # softmax_cross_entropy_with_logits(logits, labels):
+    #   = -sum(labels * log_softmax(logits))
+    log_p_tm1 = torch.log_softmax(q_tm1.logits, dim=-1)  # (B, N)
+    return -(target * log_p_tm1).sum(dim=-1)             # (B,)
+
+class Critic(nn.Module):
+    def __init__(self, 
+                 env, 
+                 hidden_dims: List[int] = [256, 256], 
+                 use_layer_norm: bool = False,
+                 vmin: float = -150.0, 
+                 vmax: float = 150.0, 
+                 num_atoms: int = 51
+    ):
+        super().__init__()
+        obs_dim = int(np.array(env.single_observation_space.shape).prod())
+        act_dim = int(np.prod(env.single_action_space.shape))
+
+        self.register_buffer("atom_values", torch.linspace(vmin, vmax, num_atoms))
+
+        layers = []
+        prev = obs_dim + act_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev, h))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(h))
+            layers.append(nn.ReLU())
+            prev = h
+        layers.append(nn.Linear(prev, num_atoms))   # was nn.Linear(prev, 1)
+        self.net = nn.Sequential(*layers)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> DiscreteValuedDistribution:
+        logits = self.net(torch.cat([state, action], dim=-1))   # (B, num_atoms)
+        return DiscreteValuedDistribution(values=self.atom_values, logits=logits)
+    
 
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -92,33 +208,6 @@ class Actor(nn.Module):
         return d.log_prob(action).unsqueeze(-1)
 
 
-class Critic(nn.Module):
-    def __init__(self, env, hidden_dims: List[int] = [256, 256], use_layer_norm: bool = False):
-        super().__init__()
-        obs_dim = int(np.array(env.single_observation_space.shape).prod())
-        act_dim = int(np.prod(env.single_action_space.shape))
-
-        layers = []
-        prev = obs_dim + act_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(prev, h))
-            if use_layer_norm:
-                layers.append(nn.LayerNorm(h))
-            layers.append(nn.ReLU())
-            prev = h
-        layers.append(nn.Linear(prev, 1))
-        self.net = nn.Sequential(*layers)
-        self.apply(self._init_weights)
-
-    @staticmethod
-    def _init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([state, action], dim=-1))
-
-
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     def make_env(seed, idx, capture_video, run_name):
         def _init():
@@ -161,6 +250,47 @@ def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     print(f"[√] Created environment with {envs.num_envs} environments.")
     return envs
 
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+
+def get_system_metrics(device):
+    metrics = {}
+
+    if psutil is not None:
+        metrics["system/cpu_percent"] = psutil.cpu_percent(interval=None)
+        metrics["system/ram_used_mb"] = psutil.virtual_memory().used / (1024 ** 2)
+        metrics["system/ram_percent"] = psutil.virtual_memory().percent
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        metrics["system/gpu_memory_allocated_mb"] = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        metrics["system/gpu_memory_reserved_mb"] = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        metrics["system/gpu_max_memory_allocated_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+        if pynvml is not None:
+            try:
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+                metrics["system/gpu_util_percent"] = util.gpu
+                metrics["system/gpu_mem_util_percent"] = util.memory
+                metrics["system/gpu_memory_used_mb"] = mem.used / (1024 ** 2)
+                metrics["system/gpu_memory_total_mb"] = mem.total / (1024 ** 2)
+
+                try:
+                    power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
+                    metrics["system/gpu_power_watts"] = power_mw / 1000.0
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+    return metrics
+
 
 class MPO:
     def __init__(self, args, envs, disk_folder='', run_name=None, runs_directory='runs'):
@@ -177,6 +307,27 @@ class MPO:
         os.makedirs(self.weights_folder, exist_ok=True)
         with open(os.path.join(self.weights_folder, "args.json"), 'w') as f:
             json.dump(args.__dict__, f)
+        
+        self.use_wandb = bool(args.track_wandb)
+
+        if self.use_wandb:
+            if wandb is None:
+                raise ImportError(
+                    "You passed --track_wandb, but wandb is not installed. "
+                    "Install it with: pip install wandb"
+                )
+
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name or run_name,
+                group=args.wandb_group,
+                config=vars(args),
+                mode=args.wandb_mode,
+                dir=os.path.join(disk_folder, runs_directory, run_name),
+            )
+        else:
+            self.use_wandb = False
 
         random.seed(args.seed)
         np.random.seed(args.seed)
@@ -185,23 +336,69 @@ class MPO:
         torch.backends.cudnn.deterministic = args.torch_deterministic
         torch.backends.cudnn.benchmark = not args.torch_deterministic
 
-        hidden_dims = [args.hidden_dim] * args.n_hidden_layers
+        policy_hidden_dims = [args.policy_hidden_dim] * args.policy_n_hidden_layers
+        critic_hidden_dims = [args.critic_hidden_dim] * args.critic_n_hidden_layers
 
-        self.actor = Actor(envs, hidden_dims=hidden_dims, use_layer_norm=args.use_layer_norm).to(self.device)
-        self.actor_target = Actor(envs, hidden_dims=hidden_dims, use_layer_norm=args.use_layer_norm).to(self.device)
+
+        self.actor = Actor(
+            envs,
+            hidden_dims=policy_hidden_dims,
+            use_layer_norm=args.use_layer_norm,
+        ).to(self.device)
+
+        self.actor_target = Actor(
+            envs,
+            hidden_dims=policy_hidden_dims,
+            use_layer_norm=args.use_layer_norm,
+        ).to(self.device)
+
         self.actor_target.load_state_dict(self.actor.state_dict())
         for p in self.actor_target.parameters():
             p.requires_grad = False
         
-        self.critics = nn.ModuleList([Critic(envs,
-                                             hidden_dims=hidden_dims,
-                                             use_layer_norm=args.use_layer_norm) for _ in range(self.args.ensemble)]).to(self.device)
-        self.target_critics = copy.deepcopy(self.critics)
-        for p in self.target_critics.parameters():
+        self.critic = Critic(
+            envs,
+            hidden_dims=critic_hidden_dims,
+            use_layer_norm=args.use_layer_norm,
+            vmin=args.vmin,
+            vmax=args.vmax,
+            num_atoms=args.num_atoms,
+        ).to(self.device)
+        
+        self.target_critic = copy.deepcopy(self.critic)
+        for p in self.target_critic.parameters():
             p.requires_grad = False
-            
+
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.policy_lr)
-        self.critic_optimizers = [optim.Adam(c.parameters(), lr=args.q_lr) for c in self.critics]
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.q_lr)
+
+        self.actor_param_count = count_params(self.actor)
+        self.critic_param_count = count_params(self.critic)
+        self.total_train_param_count = self.actor_param_count + self.critic_param_count
+
+        print(f"[model] actor params: {self.actor_param_count}")
+        print(f"[model] critic params: {self.critic_param_count}")
+        print(f"[model] total train params: {self.total_train_param_count}")
+
+        if self.use_wandb:
+            wandb.log({
+                "model/actor_params": self.actor_param_count,
+                "model/critic_params": self.critic_param_count,
+                "model/total_train_params": self.total_train_param_count,
+                "model/num_atoms": self.args.num_atoms,
+                "model/critic_num_samples": self.args.critic_num_samples,
+            }, step=0)
+
+            if self.args.wandb_watch:
+                wandb.watch(
+                    self.actor,
+                    log="gradients",
+                    log_freq=max(100, self.args.log_every_n_steps),
+                )
+        
+
+            if self.args.wandb_watch:
+                wandb.watch(self.actor, log="gradients", log_freq=max(100, self.args.log_every_n_steps))
 
         self.policy_learning_starts = args.policy_learning_starts
 
@@ -237,6 +434,8 @@ class MPO:
         self.trajectory_length = self.args.td_horizon
 
         self.global_step = 0
+        self.phase_step = 0
+
         self.obs = None
         self.last_actions = None
         self.last_log_probs = None
@@ -252,7 +451,18 @@ class MPO:
         self.keys_agent_vars = [
             'loss_q', 'loss_p', 'mean_q', 'eta',
             'kl_mu', 'kl_sigma', 'alpha_mu', 'alpha_sigma',
-            'utd_ratio', 'SPS', 'average_reward_per_second', 'reward',
+            'utd_ratio', 'phase_step', 'q_only_phase', 'SPS', 'average_reward_per_second', 'reward',
+
+            't_critic', 't_estep', 't_mstep', 't_learn',
+
+            'actor_params', 'critic_params', 'total_train_params',
+
+            'gpu_memory_allocated_mb', 'gpu_memory_reserved_mb',
+            'gpu_max_memory_allocated_mb', 'gpu_util_percent',
+            'gpu_mem_util_percent', 'gpu_memory_used_mb',
+            'gpu_memory_total_mb', 'gpu_power_watts',
+
+            'cpu_percent', 'ram_used_mb', 'ram_percent',
         ]
         self.info_log_buffer = []
         self.agent_vars_buffer = []
@@ -266,31 +476,37 @@ class MPO:
 
 
     def get_action(self, obs, evaluate=False):
-        act_dim = self.envs.single_action_space.shape[0]
-
         if self.obs is None:
             self.obs = obs
-            rand_actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)]) #Gymnasium uses uniform sampling for box --> if other than change logprob formula
-            self.last_actions = rand_actions.copy()
-            self.last_log_probs = np.full((self.envs.num_envs, 1), self._uniform_log_prob, dtype=np.float32)
-            return rand_actions
 
-        if evaluate or self.global_step > self.args.learning_starts:
+        use_policy_action = (
+            evaluate
+            or self.args.warm_start
+            or self.phase_step > self.args.learning_starts
+        )
+
+        if use_policy_action:
             with torch.no_grad():
                 obs_t = torch.as_tensor(self.obs, dtype=torch.float32, device=self.device)
                 d = self.actor.forward(obs_t)
                 action = d.mean if evaluate else d.rsample()
-                actions = torch.clamp(action, self.actor.action_low, self.actor.action_high) #mjx clipos internally but overflowed action stored in buffer --> inconsistency
-                actions = actions.squeeze(1)     # (n_envs, act_dim)
-                
+                actions = torch.clamp(action, self.actor.action_low, self.actor.action_high)
+
                 log_probs = d.log_prob(actions).unsqueeze(-1)
                 self.last_actions = actions.cpu().numpy()
                 self.last_log_probs = log_probs.cpu().numpy()
                 return actions.cpu().numpy()
 
-        rand_actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
+        rand_actions = np.array([
+            self.envs.single_action_space.sample()
+            for _ in range(self.envs.num_envs)
+        ])
         self.last_actions = rand_actions.copy()
-        self.last_log_probs = np.full((self.envs.num_envs, 1), self._uniform_log_prob, dtype=np.float32)
+        self.last_log_probs = np.full(
+            (self.envs.num_envs, 1),
+            self._uniform_log_prob,
+            dtype=np.float32,
+        )
         return rand_actions
 
     def agent_step(self, next_obs, actions, rewards, terminations, truncations, infos):
@@ -305,10 +521,11 @@ class MPO:
                     [{}] * self.envs.num_envs,
                     behavior_log_prob=self.last_log_probs)
         self.global_step += 1
+        self.phase_step += 1
         self.obs = next_obs
 
         metrics = None
-        if self.global_step > self.args.learning_starts and self.rb.size() >= self.batch_size:
+        if self.phase_step > self.args.learning_starts and self.rb.size() >= self.batch_size:
             results = [self._learn() for _ in range(self.args.utd_ratio)]
             keys = results[0].keys()
             metrics = {k: sum(r[k] for r in results) / len(results) for k in keys}
@@ -317,33 +534,42 @@ class MPO:
 
     def agent_step_eval(self, next_obs):
         self.global_step += 1
+        self.phase_step += 1
         self.obs = next_obs
 
     def _learn(self):
-        if self.global_step >= self.args.learning_starts + self.policy_learning_starts:
-            self.args.decouple_q_learning = False
+        q_only_phase = (
+            self.args.decouple_q_learning
+            and self.phase_step < self.args.learning_starts + self.policy_learning_starts
+        )
 
         data = self.rb.sample_nstep(self.batch_size, self.trajectory_length)
 
-        # t0 = time.time()
+        t0 = time.time()
         loss_q, mean_q = self._update_critic(data)
-        # t_critic = time.time() - t0
+        t_critic = time.time() - t0
 
         loss_p = kl_mu = kl_sigma = 0.0
         eta = self.log_eta.exp()
-        # t_estep = t_mstep = 0.0
+        t_estep = t_mstep = 0.0
 
         # Always run E-step so eta stays calibrated during Q warmup.
-        # t0 = time.time()
+        t0 = time.time()
         action_samples, weights, eta, b_mu, b_sigma = self._e_step(data)
-        # t_estep = time.time() - t0
+        t_estep = time.time() - t0
 
-        if not self.args.decouple_q_learning:
-            # t0 = time.time()
-            loss_p, kl_mu, kl_sigma = self._m_step(data.observations, action_samples, weights, b_mu, b_sigma)
-            # t_mstep = time.time() - t0
+        if not q_only_phase:
+            t0 = time.time()
+            loss_p, kl_mu, kl_sigma = self._m_step(
+                data.observations,
+                action_samples,
+                weights,
+                b_mu,
+                b_sigma,
+            )
+            t_mstep = time.time() - t0
 
-        self._update_targets()
+        self._update_targets(update_actor_target=not q_only_phase)
 
         return {
             'loss_q': loss_q,
@@ -354,95 +580,70 @@ class MPO:
             'kl_sigma': kl_sigma,
             'alpha_mu': self.alpha_mu,
             'alpha_sigma': self.alpha_sigma,
-            # 't_critic': t_critic,
-            # 't_estep': t_estep,
-            # 't_mstep': t_mstep,
+            'phase_step': self.phase_step,
+            'q_only_phase': float(q_only_phase),
+            't_critic': t_critic,
+            't_estep': t_estep,
+            't_mstep': t_mstep,
+            't_learn': t_critic + t_estep + t_mstep,
         }
 
     def _update_critic(self, data: NStepReplayBufferSamples) -> Tuple[float, float]:
-        n = self.trajectory_length
         B = self.batch_size
+        N = self.args.critic_num_samples
         gamma_dt = self.args.gamma ** self.dt
 
         with torch.no_grad():
-            # Fixed critic subset for the entire Retrace computation — consistent targets.
-            subset_size = min(2, len(self.critics))
-            subset_idx = torch.randperm(len(self.critics), device=self.device)[:subset_size]
-            subset_size=subset_size
-            s_k_flat = data.all_observations.reshape(B*n, self.obs_dim)
-            a_k_flat = data.all_actions.reshape(B*n,self.act_dim)
-            q_traj_stack = self.aggregation_operator(state=s_k_flat, action=a_k_flat, critics=self.target_critics,
-                                                     mode='min_subset', subset_size=2, subset_idx=subset_idx)
-            q_traj = q_traj_stack.reshape(B,n)
-             
-            s_kp1_flat = data.all_next_observations.reshape(B*n, self.obs_dim)
-            # a_kp1_flat = self.actor_target.get_action(s_kp1_flat)[0].squeeze(1) #squeeze samples to (B*n;act_dim) discard mean and log probs
-            d_kp1 = self.actor_target.forward(s_kp1_flat)
-            a_kp1_flat = torch.clamp(d_kp1.rsample(),
-                                    self.actor_target.action_low,
-                                    self.actor_target.action_high)
-            q_kp1_stack = self.aggregation_operator(state=s_kp1_flat, action=a_kp1_flat, critics=self.target_critics,
-                                                    mode='min_subset', subset_size=2, subset_idx=subset_idx)
-            q_kp1_traj = q_kp1_stack.reshape(B,n)
-            if n > 1: #importance sampling coef only needed if td horizon larger than 1
-                s_middle_flat = data.all_observations[:,1:,:].reshape(B*(n-1), self.obs_dim)
-                a_middle_flat = data.all_actions[:,1:,:].reshape(B*(n-1), self.act_dim)
-                logp_pi = self.actor_target.get_log_probs(s_middle_flat, a_middle_flat).reshape(B,n-1) #log proba of obtaining a given s under target policy (even if samples are from traj folowing behavior pol)
-                logp_mu = data.behavior_log_probs[:,1:,:].squeeze(-1)
-                c_all = self.importance_sampling_coef(log_pi=logp_pi, log_mu=logp_mu)
+            s_kp1 = data.all_next_observations[:, 0, :]
+            r_t = data.rewards[:, 0, :] * self.dt
+            done = data.dones[:, 0, :]
+            d_t = gamma_dt * (1.0 - done)
 
-            # Bootstrap from Q_target(s_0, a_0).
-            y = q_traj[:,0:1].clone()
+            d_kp1 = self.actor_target.forward(s_kp1)
+            sampled_actions = d_kp1.rsample((N,))
+            sampled_actions = torch.clamp(
+                sampled_actions,
+                self.actor_target.action_low,
+                self.actor_target.action_high,
+            )
 
-            c_prod = torch.ones_like(y)   # running IS product (B, 1)
-            alive = torch.ones_like(y)   # episode-still-alive mask (B, 1)
-            prev_done = None
+            tiled_s = s_kp1.unsqueeze(0).expand(N, -1, -1).reshape(N * B, self.obs_dim)
+            flat_a = sampled_actions.reshape(N * B, self.act_dim)
 
-            for k in range(n):
-                q_kp1 = q_kp1_traj[:,k:k+1]
-                q_k = q_traj[:,k:k+1]
-                r_k = data.rewards[:, k, :]                # (B, 1)
-                done_k = data.dones[:, k, :]                  # (B, 1)
-                # s_kp1 = data.all_next_observations[:, k, :]  # (B, obs_dim)
+            sampled_dist = self.target_critic(tiled_s, flat_a)
 
-                # a_kp1, _, _ = self.actor_target.get_action(s_kp1)
-                # a_kp1 = a_kp1.squeeze(1)
-                # q_kp1 = self.aggregation_operator(
-                #     s_kp1, a_kp1, self.target_critics,
-                #     mode='min_subset', subset_size=2, subset_idx=subset_idx,
-                # )
-                # # k=0: reuse the initial y to avoid an extra forward pass.
-                # q_k = y if k == 0 else self.aggregation_operator(
-                #     s_k, a_k, self.target_critics,
-                #     mode='min_subset', subset_size=2, subset_idx=subset_idx,
-                # )
+            A = sampled_dist.logits.shape[-1]
+            logits = sampled_dist.logits.reshape(N, B, A)
 
-                delta_k = r_k * self.dt + gamma_dt * (1.0 - done_k) * q_kp1 - q_k
+            logprobs = torch.log_softmax(logits, dim=-1)
+            averaged_logits = torch.logsumexp(logprobs, dim=0) - math.log(N)
 
-                if k > 0:
-                    alive  = alive * (1.0 - prev_done)
-                    c_prod = c_prod * c_all[:,k-1:k]
+            q_t_distribution = DiscreteValuedDistribution(
+                values=self.target_critic.atom_values,
+                logits=averaged_logits,
+            )
 
-                y = y + (gamma_dt ** k) * c_prod * alive * delta_k
-                prev_done = done_k
+        q_tm1_distribution = self.critic(data.observations, data.actions)
 
-        losses = []
-        q_preds = torch.stack([c(data.observations, data.actions) for c in self.critics], dim=0)
-        joint_loss = F.mse_loss(q_preds, y.unsqueeze(0).expand_as(q_preds), reduction='sum') / B
+        critic_loss = categorical(
+            q_tm1=q_tm1_distribution,
+            r_t=r_t,
+            d_t=d_t,
+            q_t=q_t_distribution,
+        ).mean()
 
-        for opt in self.critic_optimizers:
-            opt.zero_grad()
-        joint_loss.backward()
-        for i, (critic, opt) in enumerate(zip(self.critics, self.critic_optimizers)):
-            if self.args.max_grad_norm > 0:
-                nn.utils.clip_grad_norm_(critic.parameters(), self.args.max_grad_norm)
-            opt.step()
-            losses.append(F.mse_loss(q_preds[i].detach(), y).item())
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+
+        if self.args.max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(self.critic.parameters(), self.args.max_grad_norm)
+
+        self.critic_optimizer.step()
 
         with torch.no_grad():
-            mean_q = q_preds.detach().mean().item()
+            mean_q = q_tm1_distribution.mean().mean().item()
 
-        return float(np.mean(losses)), mean_q
+        return float(critic_loss.item()), mean_q
 
     def aggregation_operator(self, state, action, critics, mode='mean', beta=1.0, subset_size=2, subset_idx=None):
         q_values = torch.stack([c(state, action) for c in critics], dim=0)
@@ -493,9 +694,8 @@ class MPO:
             action_samples = torch.clamp(action_samples, self.actor_target.action_low, self.actor_target.action_high) #mjx clipos internally but overflowed action stored in buffer --> inconsistency
             obs_exp = obs.unsqueeze(1).expand(-1, N, -1).reshape(-1, ds)
             acts_flat = action_samples.reshape(-1, da)
-            q_values = self.aggregation_operator(
-                obs_exp, acts_flat, self.target_critics, mode='mean'
-            ).reshape(B, N)
+            q_dist = self.target_critic(obs_exp, acts_flat)
+            q_values = q_dist.mean().reshape(B, N)
 
         eta, weights = self._solve_temp_dual(q_values)
         return action_samples, weights, eta, b_mu, b_sigma
@@ -545,15 +745,14 @@ class MPO:
 
         return loss_p_val, kl_mu_val, kl_sigma_val
 
-    def _update_targets(self):
-        if not self.args.decouple_q_learning:
+    def _update_targets(self, update_actor_target: bool = True):
+        if update_actor_target:
             for p, p_tgt in zip(self.actor.parameters(), self.actor_target.parameters()):
                 p_tgt.data.lerp_(p.data, self.args.tau)
-        
-        for critic, target_critic in zip(self.critics, self.target_critics):
-            for p, p_tgt in zip(critic.parameters(), target_critic.parameters()):
-                p_tgt.data.lerp_(p.data, self.args.tau)
 
+        for p, p_tgt in zip(self.critic.parameters(), self.target_critic.parameters()):
+            p_tgt.data.lerp_(p.data, self.args.tau)
+    
     def initialize_logging(self, info):
         self.start_time = time.time()
 
@@ -584,32 +783,94 @@ class MPO:
         self.reward_tracker.update(infos['original_reward'][0])
         self.reward_tracker.log()
 
-        if global_step % self.args.log_every_n_steps != 0:
-            return
-
+        # info_logs.csv: append one row EVERY STEP.
         row = {"step": global_step}
         for k in self.keys_info:
             if k in infos:
                 row[k] = arr_to_str(infos[k][0])
         self.info_log_buffer.append(row)
 
-        if metrics is not None:
-            self.agent_vars_buffer.append({
-                "step": global_step,
-                "loss_q": metrics.get('loss_q'),
-                "loss_p": metrics.get('loss_p'),
-                "mean_q": metrics.get('mean_q'),
-                "eta": metrics.get('eta'),
-                "kl_mu": metrics.get('kl_mu'),
-                "kl_sigma": metrics.get('kl_sigma'),
-                "alpha_mu": metrics.get('alpha_mu'),
-                "alpha_sigma": metrics.get('alpha_sigma'),
-                "utd_ratio": metrics.get('utd_ratio'),
-                "SPS": int(global_step / (time.time() - self.start_time)) if self.start_time else 0,
-                "average_reward_per_second": self.reward_tracker.average_reward_per_second,
-                "reward": rewards[0] if hasattr(rewards, '__len__') else float(rewards),
-            })
+        # performance_variables.csv: append one row EVERY STEP.
+        system_metrics = get_system_metrics(self.device)
 
+        row_agent = {
+            "step": global_step,
+
+            "loss_q": None if metrics is None else metrics.get('loss_q'),
+            "loss_p": None if metrics is None else metrics.get('loss_p'),
+            "mean_q": None if metrics is None else metrics.get('mean_q'),
+            "eta": None if metrics is None else metrics.get('eta'),
+            "kl_mu": None if metrics is None else metrics.get('kl_mu'),
+            "kl_sigma": None if metrics is None else metrics.get('kl_sigma'),
+            "alpha_mu": None if metrics is None else metrics.get('alpha_mu'),
+            "alpha_sigma": None if metrics is None else metrics.get('alpha_sigma'),
+            "utd_ratio": None if metrics is None else metrics.get('utd_ratio'),
+            "phase_step": self.phase_step,
+            "q_only_phase": None if metrics is None else metrics.get('q_only_phase'),
+            "SPS": int(global_step / (time.time() - self.start_time)) if self.start_time else 0,
+            "average_reward_per_second": self.reward_tracker.average_reward_per_second,
+            "reward": rewards[0] if hasattr(rewards, '__len__') else float(rewards),
+
+            "t_critic": None if metrics is None else metrics.get('t_critic'),
+            "t_estep": None if metrics is None else metrics.get('t_estep'),
+            "t_mstep": None if metrics is None else metrics.get('t_mstep'),
+            "t_learn": None if metrics is None else metrics.get('t_learn'),
+
+            "actor_params": self.actor_param_count,
+            "critic_params": self.critic_param_count,
+            "total_train_params": self.total_train_param_count,
+
+            "gpu_memory_allocated_mb": system_metrics.get("system/gpu_memory_allocated_mb"),
+            "gpu_memory_reserved_mb": system_metrics.get("system/gpu_memory_reserved_mb"),
+            "gpu_max_memory_allocated_mb": system_metrics.get("system/gpu_max_memory_allocated_mb"),
+            "gpu_util_percent": system_metrics.get("system/gpu_util_percent"),
+            "gpu_mem_util_percent": system_metrics.get("system/gpu_mem_util_percent"),
+            "gpu_memory_used_mb": system_metrics.get("system/gpu_memory_used_mb"),
+            "gpu_memory_total_mb": system_metrics.get("system/gpu_memory_total_mb"),
+            "gpu_power_watts": system_metrics.get("system/gpu_power_watts"),
+
+            "cpu_percent": system_metrics.get("system/cpu_percent"),
+            "ram_used_mb": system_metrics.get("system/ram_used_mb"),
+            "ram_percent": system_metrics.get("system/ram_percent"),
+        }
+
+        self.agent_vars_buffer.append(row_agent)
+
+        if self.use_wandb and (global_step % self.args.log_every_n_steps == 0):
+            wandb_log = {
+                "train/loss_q": row_agent["loss_q"],
+                "train/loss_p": row_agent["loss_p"],
+                "train/mean_q": row_agent["mean_q"],
+                "train/eta": row_agent["eta"],
+                "train/kl_mu": row_agent["kl_mu"],
+                "train/kl_sigma": row_agent["kl_sigma"],
+                "train/alpha_mu": row_agent["alpha_mu"],
+                "train/alpha_sigma": row_agent["alpha_sigma"],
+                "train/utd_ratio": row_agent["utd_ratio"],
+                "train/phase_step": row_agent["phase_step"],
+                "train/q_only_phase": row_agent["q_only_phase"],
+                "train/SPS": row_agent["SPS"],
+
+                "train/average_reward_per_second": row_agent["average_reward_per_second"],
+                "train/reward": row_agent["reward"],
+
+                "time/t_critic": row_agent["t_critic"],
+                "time/t_estep": row_agent["t_estep"],
+                "time/t_mstep": row_agent["t_mstep"],
+                "time/t_learn": row_agent["t_learn"],
+
+                "model/actor_params": self.actor_param_count,
+                "model/critic_params": self.critic_param_count,
+                "model/total_train_params": self.total_train_param_count,
+                "model/num_atoms": self.args.num_atoms,
+                "model/critic_num_samples": self.args.critic_num_samples,
+            }
+
+            wandb_log.update(system_metrics)
+            wandb.log(wandb_log, step=global_step)
+
+        # Still only write/flush to disk every save_every_n_steps.
+        # So CSV gets every-step rows, but disk I/O is not every step.
         if global_step % self.args.save_every_n_steps == 0:
             for row in self.info_log_buffer:
                 self.writer_info.writerow(row)
@@ -625,10 +886,10 @@ class MPO:
         checkpoint = {
             "actor": self.actor.state_dict(),
             "actor_target": self.actor_target.state_dict(),
-            "critics": [c.state_dict() for c in self.critics],
-            "target_critics": [c.state_dict() for c in self.target_critics],
+            "critic": self.critic.state_dict(),
+            "target_critic": self.target_critic.state_dict(),     
             "actor_optimizer": self.actor_optimizer.state_dict(),
-            "critic_optimizers": [opt.state_dict() for opt in self.critic_optimizers],
+            "critic_optimizer": self.critic_optimizer.state_dict(),
             "log_eta": self.log_eta.item(),
             "dual_m": self.dual_m.item(),
             "dual_v": self.dual_v.item(),
@@ -642,20 +903,35 @@ class MPO:
         if global_step % (10 * self.args.save_every_n_steps) == 0:
             self.rb.save(os.path.join(self.weights_folder, "replay_buffer.npz"))
 
-    def load_checkpoint(self, weights_path):
+    def load_checkpoint(self, weights_path, checkpoint_step=None, load_replay_buffer=True):
         checkpoint_files = [f for f in os.listdir(weights_path) if f.endswith(".pth")]
         checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
-        checkpoint = torch.load(os.path.join(weights_path, checkpoint_files[-1]), map_location=self.device)
+
+        if len(checkpoint_files) == 0:
+            raise FileNotFoundError(f"No checkpoint_*.pth files found in {weights_path}")
+
+        if checkpoint_step is None:
+            checkpoint_file = checkpoint_files[-1]
+        else:
+            checkpoint_file = f"checkpoint_{checkpoint_step}.pth"
+            if checkpoint_file not in checkpoint_files:
+                available = ", ".join(checkpoint_files)
+                raise FileNotFoundError(
+                    f"Requested {checkpoint_file}, but it was not found in {weights_path}.\n"
+                    f"Available checkpoints: {available}"
+                )
+
+        checkpoint_path = os.path.join(weights_path, checkpoint_file)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
         self.actor.load_state_dict(checkpoint["actor"])
         self.actor_target.load_state_dict(checkpoint["actor_target"])
-        for c, sd in zip(self.critics, checkpoint["critics"]):
-            c.load_state_dict(sd)
-        for c, sd in zip(self.target_critics, checkpoint["target_critics"]):
-            c.load_state_dict(sd)
+        self.critic.load_state_dict(checkpoint["critic"])
+        self.target_critic.load_state_dict(checkpoint["target_critic"])
+
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
-        for opt, sd in zip(self.critic_optimizers, checkpoint["critic_optimizers"]):
-            opt.load_state_dict(sd)
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+
         if "log_eta" in checkpoint:
             self.log_eta.fill_(checkpoint["log_eta"])
         if "dual_m" in checkpoint:
@@ -663,15 +939,23 @@ class MPO:
             self.dual_v.fill_(checkpoint["dual_v"])
             self.dual_beta1_pow.fill_(checkpoint["dual_beta1_pow"])
             self.dual_beta2_pow.fill_(checkpoint["dual_beta2_pow"])
+
         self.alpha_mu = float(checkpoint.get("alpha_mu", 0.0))
         self.alpha_sigma = float(checkpoint.get("alpha_sigma", 0.0))
         self.global_step = checkpoint.get("global_step", 0)
-        print(f"[√] Loaded checkpoint from {weights_path}, global_step={self.global_step}")
+
+        # Important: do NOT load phase_step from checkpoint.
+        # phase_step should start at 0 for this run.
+        self.phase_step = 0
+
+        print(f"[√] Loaded checkpoint from {checkpoint_path}, global_step={self.global_step}")
 
         buffer_path = os.path.join(weights_path, "replay_buffer.npz")
-        if os.path.exists(buffer_path):
+        if load_replay_buffer and os.path.exists(buffer_path):
             self.rb.load(buffer_path, self.device)
-            print(f"[√] Loaded replay buffer.")
+            print("[√] Loaded replay buffer.")
+        elif not load_replay_buffer:
+            print("[warm_start] Skipping loaded replay buffer. Fresh continual-learning buffer will be collected.")
 
     def cleanup(self):
         if self.writer_info is not None and self.info_log_buffer:
@@ -688,6 +972,8 @@ class MPO:
             self.csv_file_agent_vars.close()
         if self.envs:
             self.envs.close()
+        if getattr(self, "use_wandb", False):
+            wandb.finish()
 
 @torch.compile
 def _run_dual_optim(log_eta, m, v, beta1_pow, beta2_pow, q, dual_constraint, log_n, lr, n_steps):
@@ -744,14 +1030,32 @@ def parse_args():
     parser.add_argument("--q_lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.92)
     parser.add_argument("--use_layer_norm", type=bool, default=True)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--n_hidden_layers", type=int, default=2)
+    parser.add_argument("--policy_hidden_dim", type=int, default=256)
+    parser.add_argument("--policy_n_hidden_layers", type=int, default=2)
+
+    parser.add_argument("--critic_hidden_dim", type=int, default=512)
+    parser.add_argument("--critic_n_hidden_layers", type=int, default=3)
+
     parser.add_argument("--utd_ratio", type=int, default=1)
     parser.add_argument("--td_horizon", type=int, default=1,
                         help="n-step TD horizon for Q learning")
     parser.add_argument("--decouple_q_learning", action='store_true', default=False)
     parser.add_argument("--policy_learning_starts", type=int, default=0,
                         help="steps of Q-only warmup after learning_starts when --decouple_q_learning is set")
+
+    parser.add_argument(
+        "--warm_start",
+        action="store_true",
+        default=False,
+        help="For continual learning: load Sim1 weights, skip Sim1 replay buffer, and act with loaded policy immediately.",
+    )
+
+    parser.add_argument(
+        "--checkpoint_step",
+        type=int,
+        default=None,
+        help="Specific checkpoint step to load. If omitted, loads latest checkpoint.",
+    )
 
     # MPO specific.
     parser.add_argument("--dual_constraint", type=float, default=0.1,
@@ -766,13 +1070,16 @@ def parse_args():
     parser.add_argument("--alpha_var_max", type=float, default=10.0)
     parser.add_argument("--sample_action_num", type=int, default=64,
                         help="actions sampled per state in E-step")
-    parser.add_argument("--mstep_iteration_num", type=int, default=5,
+    parser.add_argument("--mstep_iteration_num", type=int, default=4,
                         help="actor gradient steps per learn() call")
     parser.add_argument("--dual_lr", type=float, default=1e-2)
     parser.add_argument("--dual_steps", type=int, default=30)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--ensemble", type=int, default=1)
-
+    parser.add_argument("--vmin", type=float, default=-300.0)
+    parser.add_argument("--vmax", type=float, default=10.0)
+    parser.add_argument("--num_atoms", type=int, default=101)
+    parser.add_argument("--critic_num_samples", type=int, default=20)
     # Environment.
     parser.add_argument("--dt", type=float, default=0.15)
     parser.add_argument("--hw_config", type=str, default=None)
@@ -787,6 +1094,17 @@ def parse_args():
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
+    # Weights & Biases logging.
+    parser.add_argument("--track_wandb", action="store_true", default=False)
+    parser.add_argument("--wandb_project", type=str, default="dmpo-ant")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online",
+                        choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_watch", action="store_true", default=False)
+
+    
     return parser.parse_args()
 
 
@@ -814,9 +1132,15 @@ if __name__ == "__main__":
     agent = MPO(args, envs, disk_folder=disk_folder, run_name=run_name, runs_directory=args.runs_directory)
 
     if args.weights_path is not None:
-        agent.load_checkpoint(args.weights_path)
+        agent.load_checkpoint(
+            args.weights_path,
+            checkpoint_step=args.checkpoint_step,
+            load_replay_buffer=not args.warm_start,
+        )
+
         if args.eval:
             agent.global_step = 0
+            agent.phase_step = 0
 
     obs, info = envs.reset(seed=args.seed)
     agent.initialize_logging(info)

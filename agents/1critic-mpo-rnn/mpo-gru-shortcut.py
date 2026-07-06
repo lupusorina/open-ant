@@ -8,6 +8,22 @@ import time
 import random
 import argparse
 import numpy as np
+from collections import deque
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
 from tqdm import tqdm
 import gymnasium as gym
 from datetime import datetime
@@ -18,6 +34,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as dist
+
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../sim')))
 from ant_mujoco import AntEnv
@@ -93,31 +110,170 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, env, hidden_dims: List[int] = [256, 256], use_layer_norm: bool = False):
+    def __init__(
+        self,
+        env,
+        hidden_dims: List[int] = [256, 256],
+        use_layer_norm: bool = False,
+        use_gru: bool = False,
+        history_len: int = 1,
+        gru_hidden_dim: int = 128,
+        shortcut_dim: int = 128,
+    ):
         super().__init__()
+
         obs_dim = int(np.array(env.single_observation_space.shape).prod())
         act_dim = int(np.prod(env.single_action_space.shape))
 
+        self.use_gru = use_gru
+        self.history_len = history_len
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.shortcut_dim = shortcut_dim
+
+        if self.use_gru:
+            assert history_len > 1, "use_gru=True requires history_len > 1"
+            assert obs_dim % history_len == 0, (
+                f"obs_dim={obs_dim} must be divisible by history_len={history_len}"
+            )
+            self.raw_obs_dim = obs_dim // history_len
+
+            # batch_first=False, GRU expects: (history_len, B, raw_obs_dim)
+            self.gru = nn.GRU(
+                input_size=self.raw_obs_dim,
+                hidden_size=gru_hidden_dim,
+                num_layers=1,
+                batch_first=False,
+            )
+            # Shortcut for current obs + current action. first concatenate O_t, A_t
+            shortcut_layers = [nn.Linear(self.raw_obs_dim + act_dim, shortcut_dim),]
+            if use_layer_norm:
+                shortcut_layers.append(nn.LayerNorm(shortcut_dim))
+            shortcut_layers.append(nn.ReLU())
+
+            self.current_shortcut_embedder = nn.Sequential(*shortcut_layers)
+
+            # Final Q MLP input = GRU hidden feature + shortcut(O_t, A_t) 
+            prev = gru_hidden_dim + shortcut_dim
+        else:
+            self.raw_obs_dim = obs_dim
+            self.gru = None
+            self.current_shortcut_embedder = None
+            prev = obs_dim + act_dim
+
         layers = []
-        prev = obs_dim + act_dim
         for h in hidden_dims:
             layers.append(nn.Linear(prev, h))
             if use_layer_norm:
                 layers.append(nn.LayerNorm(h))
             layers.append(nn.ReLU())
             prev = h
+
         layers.append(nn.Linear(prev, 1))
         self.net = nn.Sequential(*layers)
-        self.apply(self._init_weights)
 
+        self.apply(self._init_weights)
     @staticmethod
     def _init_weights(m):
         if isinstance(m, nn.Linear):
             nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([state, action], dim=-1))
+    # Convert observ. sequence into GRU tensor. 
+    # input = state = (B, history_len * raw obs dim). Output = (history_len, B, raw_obs_dim)
+    # i.e. state = [o_{t-H+1}, ..., o_t], then seq[0] = o_{t-H+1} 
+    def _as_sequence(self, state: torch.Tensor) -> torch.Tensor:
+        B = state.shape[0]
 
+        # reshape to time-first sequence: (history_len, B, raw_obs_dim)
+        return state.reshape(B, self.history_len, self.raw_obs_dim).permute(1, 0, 2)
+
+    def encode_state(self, state: torch.Tensor) -> torch.Tensor:
+        """ Encode stacked history. state = (B, history_len * raw_obs_dim)
+            seq = (history_len, B, raw_obs_dim). h_n = (num_layers, B, gru_hidden_dim)
+            history_feat: (B, gru_hidden_dim)
+        """
+        if not self.use_gru:
+            return state
+
+        seq = self._as_sequence(state)
+
+        # h_n = final hidden state features @ last timestep of GRU for every GRU layer
+        # Since num_layers=1, h_n[-1] has shape (B, gru_hidden_dim) 
+        _, h_n = self.gru(seq)
+
+        return h_n[-1]
+
+    def get_current_obs(self, state: torch.Tensor) -> torch.Tensor:
+        """ Get the latest/current raw observation o_t from flat stacked history.
+        Input: state: (B, history_len * raw_obs_dim)  
+        Output: current_obs: (B, raw_obs_dim)
+        """
+        if not self.use_gru:
+            return state
+        B = state.shape[0]
+
+        # (B, history_len * raw_obs_dim) --> (B, history_len, raw_obs_dim)
+        seq_batch_first = state.reshape(B, self.history_len, self.raw_obs_dim)
+
+        # latest observation o_t
+        current_obs = seq_batch_first[:, -1, :]
+        return current_obs
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        # history_feat = GRU([o_{t-H+1}, ..., o_t]), current_feat = MLP([o_t, action])
+        # Q input = [history_feat, current_feat] 
+        if not self.use_gru:
+            x = torch.cat([state, action], dim=-1)
+            return self.net(x)
+
+        history_feat = self.encode_state(state)       # (B, gru_hidden_dim)
+        current_obs = self.get_current_obs(state)     # (B, raw_obs_dim)
+
+        shortcut_input = torch.cat([current_obs, action], dim=-1)
+        current_feat = self.current_shortcut_embedder(shortcut_input)
+
+        x = torch.cat([history_feat, current_feat], dim=-1)
+        return self.net(x)
+
+
+class FlattenObsHistory(gym.Wrapper):
+    def __init__(self, env, history_len: int):
+        super().__init__(env)
+        self.history_len = history_len
+        self.hist = deque(maxlen=history_len)
+
+        old_space = env.observation_space
+        assert isinstance(old_space, gym.spaces.Box)
+
+        low = np.tile(old_space.low, history_len).astype(np.float32)
+        high = np.tile(old_space.high, history_len).astype(np.float32)
+
+        self.observation_space = gym.spaces.Box(
+            low=low,
+            high=high,
+            dtype=np.float32,
+        )
+
+    def _get_stacked_obs(self):
+        return np.concatenate(list(self.hist), axis=-1).astype(np.float32)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        obs = np.asarray(obs, dtype=np.float32)
+
+        self.hist.clear()
+        for _ in range(self.history_len):
+            self.hist.append(obs.copy())
+
+        return self._get_stacked_obs(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        obs = np.asarray(obs, dtype=np.float32)
+
+        self.hist.append(obs.copy())
+
+        return self._get_stacked_obs(), reward, terminated, truncated, info
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     def make_env(seed, idx, capture_video, run_name):
@@ -151,6 +307,9 @@ def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
                 )
             env.action_space.seed(seed)
             env = gym.wrappers.TransformReward(env, lambda r: r * args.reward_scale)
+
+            if args.history_len > 1:
+                env = FlattenObsHistory(env, args.history_len)
             return env
         return _init
 
@@ -160,6 +319,47 @@ def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     assert isinstance(envs.single_action_space, gym.spaces.Box), "[!] Only continuous action space is supported."
     print(f"[√] Created environment with {envs.num_envs} environments.")
     return envs
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+
+def get_system_metrics(device):
+    metrics = {}
+
+    if psutil is not None:
+        metrics["system/cpu_percent"] = psutil.cpu_percent(interval=None)
+        metrics["system/ram_used_mb"] = psutil.virtual_memory().used / (1024 ** 2)
+        metrics["system/ram_percent"] = psutil.virtual_memory().percent
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        metrics["system/gpu_memory_allocated_mb"] = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        metrics["system/gpu_memory_reserved_mb"] = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        metrics["system/gpu_max_memory_allocated_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+        if pynvml is not None:
+            try:
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+                metrics["system/gpu_util_percent"] = util.gpu
+                metrics["system/gpu_mem_util_percent"] = util.memory
+                metrics["system/gpu_memory_used_mb"] = mem.used / (1024 ** 2)
+                metrics["system/gpu_memory_total_mb"] = mem.total / (1024 ** 2)
+
+                try:
+                    power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
+                    metrics["system/gpu_power_watts"] = power_mw / 1000.0
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+    return metrics
 
 
 class MPO:
@@ -177,6 +377,27 @@ class MPO:
         os.makedirs(self.weights_folder, exist_ok=True)
         with open(os.path.join(self.weights_folder, "args.json"), 'w') as f:
             json.dump(args.__dict__, f)
+        
+        self.use_wandb = bool(args.track_wandb)
+
+        if self.use_wandb:
+            if wandb is None:
+                raise ImportError(
+                    "You passed --track_wandb, but wandb is not installed. "
+                    "Install it with: pip install wandb"
+                )
+
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name or run_name,
+                group=args.wandb_group,
+                config=vars(args),
+                mode=args.wandb_mode,
+                dir=os.path.join(disk_folder, runs_directory, run_name),
+            )
+        else:
+            self.use_wandb = False
 
         random.seed(args.seed)
         np.random.seed(args.seed)
@@ -193,15 +414,42 @@ class MPO:
         for p in self.actor_target.parameters():
             p.requires_grad = False
         
-        self.critics = nn.ModuleList([Critic(envs,
-                                             hidden_dims=hidden_dims,
-                                             use_layer_norm=args.use_layer_norm) for _ in range(self.args.ensemble)]).to(self.device)
+        self.critics = nn.ModuleList([
+            Critic(
+                envs,
+                hidden_dims=hidden_dims,
+                use_layer_norm=args.use_layer_norm,
+                use_gru=args.critic_use_gru,
+                history_len=args.history_len,
+                gru_hidden_dim=args.critic_gru_hidden_dim,
+            )
+            for _ in range(self.args.ensemble)
+        ]).to(self.device)
         self.target_critics = copy.deepcopy(self.critics)
         for p in self.target_critics.parameters():
             p.requires_grad = False
             
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.policy_lr)
         self.critic_optimizers = [optim.Adam(c.parameters(), lr=args.q_lr) for c in self.critics]
+
+        self.actor_param_count = count_params(self.actor)
+        self.critic_param_count = sum(count_params(c) for c in self.critics)
+        self.total_train_param_count = self.actor_param_count + self.critic_param_count
+
+        print(f"[model] actor params: {self.actor_param_count}")
+        print(f"[model] critic params: {self.critic_param_count}")
+        print(f"[model] total train params: {self.total_train_param_count}")
+
+        if self.use_wandb:
+            wandb.log({
+                "model/actor_params": self.actor_param_count,
+                "model/critic_params": self.critic_param_count,
+                "model/total_train_params": self.total_train_param_count,
+                "model/ensemble": self.args.ensemble,
+            }, step=0)
+
+            if self.args.wandb_watch:
+                wandb.watch(self.actor, log="gradients", log_freq=max(100, self.args.log_every_n_steps))
 
         self.policy_learning_starts = args.policy_learning_starts
 
@@ -253,6 +501,12 @@ class MPO:
             'loss_q', 'loss_p', 'mean_q', 'eta',
             'kl_mu', 'kl_sigma', 'alpha_mu', 'alpha_sigma',
             'utd_ratio', 'SPS', 'average_reward_per_second', 'reward',
+            't_critic', 't_estep', 't_mstep', 't_learn',
+            'actor_params', 'critic_params', 'total_train_params',
+            'gpu_memory_allocated_mb', 'gpu_memory_reserved_mb',
+            'gpu_max_memory_allocated_mb', 'gpu_util_percent',
+            'gpu_memory_used_mb', 'gpu_memory_total_mb', 'gpu_power_watts',
+            'cpu_percent', 'ram_used_mb', 'ram_percent',
         ]
         self.info_log_buffer = []
         self.agent_vars_buffer = []
@@ -325,23 +579,23 @@ class MPO:
 
         data = self.rb.sample_nstep(self.batch_size, self.trajectory_length)
 
-        # t0 = time.time()
+        t0 = time.time()
         loss_q, mean_q = self._update_critic(data)
-        # t_critic = time.time() - t0
+        t_critic = time.time() - t0
 
         loss_p = kl_mu = kl_sigma = 0.0
         eta = self.log_eta.exp()
-        # t_estep = t_mstep = 0.0
+        t_estep = t_mstep = 0.0
 
         # Always run E-step so eta stays calibrated during Q warmup.
-        # t0 = time.time()
+        t0 = time.time()
         action_samples, weights, eta, b_mu, b_sigma = self._e_step(data)
-        # t_estep = time.time() - t0
+        t_estep = time.time() - t0
 
         if not self.args.decouple_q_learning:
-            # t0 = time.time()
+            t0 = time.time()
             loss_p, kl_mu, kl_sigma = self._m_step(data.observations, action_samples, weights, b_mu, b_sigma)
-            # t_mstep = time.time() - t0
+            t_mstep = time.time() - t0
 
         self._update_targets()
 
@@ -354,9 +608,10 @@ class MPO:
             'kl_sigma': kl_sigma,
             'alpha_mu': self.alpha_mu,
             'alpha_sigma': self.alpha_sigma,
-            # 't_critic': t_critic,
-            # 't_estep': t_estep,
-            # 't_mstep': t_mstep,
+            't_critic': t_critic,
+            't_estep': t_estep,
+            't_mstep': t_mstep,
+            't_learn': t_critic + t_estep + t_mstep,
         }
 
     def _update_critic(self, data: NStepReplayBufferSamples) -> Tuple[float, float]:
@@ -368,11 +623,11 @@ class MPO:
             # Fixed critic subset for the entire Retrace computation — consistent targets.
             subset_size = min(2, len(self.critics))
             subset_idx = torch.randperm(len(self.critics), device=self.device)[:subset_size]
-            subset_size=subset_size
+
             s_k_flat = data.all_observations.reshape(B*n, self.obs_dim)
             a_k_flat = data.all_actions.reshape(B*n,self.act_dim)
             q_traj_stack = self.aggregation_operator(state=s_k_flat, action=a_k_flat, critics=self.target_critics,
-                                                     mode='min_subset', subset_size=2, subset_idx=subset_idx)
+                                                     mode='min_subset', subset_size=subset_size, subset_idx=subset_idx)
             q_traj = q_traj_stack.reshape(B,n)
              
             s_kp1_flat = data.all_next_observations.reshape(B*n, self.obs_dim)
@@ -382,7 +637,7 @@ class MPO:
                                     self.actor_target.action_low,
                                     self.actor_target.action_high)
             q_kp1_stack = self.aggregation_operator(state=s_kp1_flat, action=a_kp1_flat, critics=self.target_critics,
-                                                    mode='min_subset', subset_size=2, subset_idx=subset_idx)
+                                                    mode='min_subset', subset_size=subset_size, subset_idx=subset_idx)
             q_kp1_traj = q_kp1_stack.reshape(B,n)
             if n > 1: #importance sampling coef only needed if td horizon larger than 1
                 s_middle_flat = data.all_observations[:,1:,:].reshape(B*(n-1), self.obs_dim)
@@ -449,6 +704,7 @@ class MPO:
         if mode == 'mean':
             return q_values.mean(dim=0)
         elif mode == 'min_subset':
+            subset_size = min(subset_size, q_values.shape[0])
             if subset_idx is None:
                 subset_idx = torch.randperm(q_values.shape[0], device=self.device)[:subset_size]
             return q_values[subset_idx].min(dim=0).values
@@ -594,7 +850,9 @@ class MPO:
         self.info_log_buffer.append(row)
 
         if metrics is not None:
-            self.agent_vars_buffer.append({
+            system_metrics = get_system_metrics(self.device)
+
+            row_agent = {
                 "step": global_step,
                 "loss_q": metrics.get('loss_q'),
                 "loss_p": metrics.get('loss_p'),
@@ -608,7 +866,58 @@ class MPO:
                 "SPS": int(global_step / (time.time() - self.start_time)) if self.start_time else 0,
                 "average_reward_per_second": self.reward_tracker.average_reward_per_second,
                 "reward": rewards[0] if hasattr(rewards, '__len__') else float(rewards),
-            })
+
+                "t_critic": metrics.get('t_critic'),
+                "t_estep": metrics.get('t_estep'),
+                "t_mstep": metrics.get('t_mstep'),
+                "t_learn": metrics.get('t_learn'),
+
+                "actor_params": self.actor_param_count,
+                "critic_params": self.critic_param_count,
+                "total_train_params": self.total_train_param_count,
+
+                "gpu_memory_allocated_mb": system_metrics.get("system/gpu_memory_allocated_mb"),
+                "gpu_memory_reserved_mb": system_metrics.get("system/gpu_memory_reserved_mb"),
+                "gpu_max_memory_allocated_mb": system_metrics.get("system/gpu_max_memory_allocated_mb"),
+                "gpu_util_percent": system_metrics.get("system/gpu_util_percent"),
+                "gpu_memory_used_mb": system_metrics.get("system/gpu_memory_used_mb"),
+                "gpu_memory_total_mb": system_metrics.get("system/gpu_memory_total_mb"),
+                "gpu_power_watts": system_metrics.get("system/gpu_power_watts"),
+                "cpu_percent": system_metrics.get("system/cpu_percent"),
+                "ram_used_mb": system_metrics.get("system/ram_used_mb"),
+                "ram_percent": system_metrics.get("system/ram_percent"),
+            }
+
+            self.agent_vars_buffer.append(row_agent)
+
+            if self.use_wandb:
+                wandb_log = {
+                    "train/loss_q": metrics.get('loss_q'),
+                    "train/loss_p": metrics.get('loss_p'),
+                    "train/mean_q": metrics.get('mean_q'),
+                    "train/eta": metrics.get('eta'),
+                    "train/kl_mu": metrics.get('kl_mu'),
+                    "train/kl_sigma": metrics.get('kl_sigma'),
+                    "train/alpha_mu": metrics.get('alpha_mu'),
+                    "train/alpha_sigma": metrics.get('alpha_sigma'),
+                    "train/utd_ratio": metrics.get('utd_ratio'),
+                    "train/SPS": row_agent["SPS"],
+                    "train/average_reward_per_second": self.reward_tracker.average_reward_per_second,
+                    "train/reward": row_agent["reward"],
+
+                    "time/t_critic": metrics.get('t_critic'),
+                    "time/t_estep": metrics.get('t_estep'),
+                    "time/t_mstep": metrics.get('t_mstep'),
+                    "time/t_learn": metrics.get('t_learn'),
+
+                    "model/actor_params": self.actor_param_count,
+                    "model/critic_params": self.critic_param_count,
+                    "model/total_train_params": self.total_train_param_count,
+                    "model/ensemble": self.args.ensemble,
+                }
+
+                wandb_log.update(system_metrics)
+                wandb.log(wandb_log, step=global_step)
 
         if global_step % self.args.save_every_n_steps == 0:
             for row in self.info_log_buffer:
@@ -688,6 +997,8 @@ class MPO:
             self.csv_file_agent_vars.close()
         if self.envs:
             self.envs.close()
+        if getattr(self, "use_wandb", False):
+            wandb.finish()
 
 @torch.compile
 def _run_dual_optim(log_eta, m, v, beta1_pow, beta2_pow, q, dual_constraint, log_n, lr, n_steps):
@@ -786,6 +1097,25 @@ def parse_args():
     parser.add_argument("--reward_scale", type=float, default=100.0)
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
+    
+    # Weights & Biases logging.
+    parser.add_argument("--track_wandb", action="store_true", default=False)
+    parser.add_argument("--wandb_project", type=str, default="mpo-ant")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online",
+                        choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_watch", action="store_true", default=False)
+    parser.add_argument("--history_len", type=int, default=1,
+                    help="Number of past observations stacked into each observation")
+
+    parser.add_argument("--critic_use_gru", action="store_true", default=False,
+                        help="Use GRU encoder inside critic over stacked observation history")
+
+    parser.add_argument("--critic_gru_hidden_dim", type=int, default=128,
+                        help="Hidden size of critic GRU")
+        
 
     return parser.parse_args()
 

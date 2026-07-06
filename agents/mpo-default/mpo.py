@@ -8,6 +8,21 @@ import time
 import random
 import argparse
 import numpy as np
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
 from tqdm import tqdm
 import gymnasium as gym
 from datetime import datetime
@@ -161,6 +176,47 @@ def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     print(f"[√] Created environment with {envs.num_envs} environments.")
     return envs
 
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+
+def get_system_metrics(device):
+    metrics = {}
+
+    if psutil is not None:
+        metrics["system/cpu_percent"] = psutil.cpu_percent(interval=None)
+        metrics["system/ram_used_mb"] = psutil.virtual_memory().used / (1024 ** 2)
+        metrics["system/ram_percent"] = psutil.virtual_memory().percent
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        metrics["system/gpu_memory_allocated_mb"] = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        metrics["system/gpu_memory_reserved_mb"] = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        metrics["system/gpu_max_memory_allocated_mb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+        if pynvml is not None:
+            try:
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+                metrics["system/gpu_util_percent"] = util.gpu
+                metrics["system/gpu_mem_util_percent"] = util.memory
+                metrics["system/gpu_memory_used_mb"] = mem.used / (1024 ** 2)
+                metrics["system/gpu_memory_total_mb"] = mem.total / (1024 ** 2)
+
+                try:
+                    power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
+                    metrics["system/gpu_power_watts"] = power_mw / 1000.0
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+    return metrics
+
 
 class MPO:
     def __init__(self, args, envs, disk_folder='', run_name=None, runs_directory='runs'):
@@ -177,6 +233,26 @@ class MPO:
         os.makedirs(self.weights_folder, exist_ok=True)
         with open(os.path.join(self.weights_folder, "args.json"), 'w') as f:
             json.dump(args.__dict__, f)
+        self.use_wandb = bool(args.track_wandb)
+
+        if self.use_wandb:
+            if wandb is None:
+                raise ImportError(
+                    "You passed --track_wandb, but wandb is not installed. "
+                    "Install it with: pip install wandb"
+                )
+
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name or run_name,
+                group=args.wandb_group,
+                config=vars(args),
+                mode=args.wandb_mode,
+                dir=os.path.join(disk_folder, runs_directory, run_name),
+            )
+        else:
+            self.use_wandb = False
 
         random.seed(args.seed)
         np.random.seed(args.seed)
@@ -203,6 +279,25 @@ class MPO:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.policy_lr)
         self.critic_optimizers = [optim.Adam(c.parameters(), lr=args.q_lr) for c in self.critics]
 
+        self.actor_param_count = count_params(self.actor)
+        self.critic_param_count = sum(count_params(c) for c in self.critics)
+        self.total_train_param_count = self.actor_param_count + self.critic_param_count
+
+        print(f"[model] actor params: {self.actor_param_count}")
+        print(f"[model] critic params: {self.critic_param_count}")
+        print(f"[model] total train params: {self.total_train_param_count}")
+
+        if self.use_wandb:
+            wandb.log({
+                "model/actor_params": self.actor_param_count,
+                "model/critic_params": self.critic_param_count,
+                "model/total_train_params": self.total_train_param_count,
+                "model/ensemble": self.args.ensemble,
+            }, step=0)
+
+            if self.args.wandb_watch:
+                wandb.watch(self.actor, log="gradients", log_freq=max(100, self.args.log_every_n_steps))
+                
         self.policy_learning_starts = args.policy_learning_starts
 
         # Dual variable for E-step temperature (Adam state stored as raw tensors, no autograd).
@@ -253,6 +348,12 @@ class MPO:
             'loss_q', 'loss_p', 'mean_q', 'eta',
             'kl_mu', 'kl_sigma', 'alpha_mu', 'alpha_sigma',
             'utd_ratio', 'SPS', 'average_reward_per_second', 'reward',
+            't_critic', 't_estep', 't_mstep', 't_learn',
+            'actor_params', 'critic_params', 'total_train_params',
+            'gpu_memory_allocated_mb', 'gpu_memory_reserved_mb',
+            'gpu_max_memory_allocated_mb', 'gpu_util_percent',
+            'gpu_memory_used_mb', 'gpu_memory_total_mb', 'gpu_power_watts',
+            'cpu_percent', 'ram_used_mb', 'ram_percent',
         ]
         self.info_log_buffer = []
         self.agent_vars_buffer = []
@@ -325,23 +426,23 @@ class MPO:
 
         data = self.rb.sample_nstep(self.batch_size, self.trajectory_length)
 
-        # t0 = time.time()
+        t0 = time.time()
         loss_q, mean_q = self._update_critic(data)
-        # t_critic = time.time() - t0
+        t_critic = time.time() - t0
 
         loss_p = kl_mu = kl_sigma = 0.0
         eta = self.log_eta.exp()
-        # t_estep = t_mstep = 0.0
+        t_estep = t_mstep = 0.0
 
         # Always run E-step so eta stays calibrated during Q warmup.
-        # t0 = time.time()
+        t0 = time.time()
         action_samples, weights, eta, b_mu, b_sigma = self._e_step(data)
-        # t_estep = time.time() - t0
+        t_estep = time.time() - t0
 
         if not self.args.decouple_q_learning:
-            # t0 = time.time()
+            t0 = time.time()
             loss_p, kl_mu, kl_sigma = self._m_step(data.observations, action_samples, weights, b_mu, b_sigma)
-            # t_mstep = time.time() - t0
+            t_mstep = time.time() - t0
 
         self._update_targets()
 
@@ -354,9 +455,10 @@ class MPO:
             'kl_sigma': kl_sigma,
             'alpha_mu': self.alpha_mu,
             'alpha_sigma': self.alpha_sigma,
-            # 't_critic': t_critic,
-            # 't_estep': t_estep,
-            # 't_mstep': t_mstep,
+            't_critic': t_critic,
+            't_estep': t_estep,
+            't_mstep': t_mstep,
+            't_learn': t_critic + t_estep + t_mstep,
         }
 
     def _update_critic(self, data: NStepReplayBufferSamples) -> Tuple[float, float]:
@@ -594,7 +696,9 @@ class MPO:
         self.info_log_buffer.append(row)
 
         if metrics is not None:
-            self.agent_vars_buffer.append({
+            system_metrics = get_system_metrics(self.device)
+
+            row_agent = {
                 "step": global_step,
                 "loss_q": metrics.get('loss_q'),
                 "loss_p": metrics.get('loss_p'),
@@ -608,7 +712,58 @@ class MPO:
                 "SPS": int(global_step / (time.time() - self.start_time)) if self.start_time else 0,
                 "average_reward_per_second": self.reward_tracker.average_reward_per_second,
                 "reward": rewards[0] if hasattr(rewards, '__len__') else float(rewards),
-            })
+
+                "t_critic": metrics.get('t_critic'),
+                "t_estep": metrics.get('t_estep'),
+                "t_mstep": metrics.get('t_mstep'),
+                "t_learn": metrics.get('t_learn'),
+
+                "actor_params": self.actor_param_count,
+                "critic_params": self.critic_param_count,
+                "total_train_params": self.total_train_param_count,
+
+                "gpu_memory_allocated_mb": system_metrics.get("system/gpu_memory_allocated_mb"),
+                "gpu_memory_reserved_mb": system_metrics.get("system/gpu_memory_reserved_mb"),
+                "gpu_max_memory_allocated_mb": system_metrics.get("system/gpu_max_memory_allocated_mb"),
+                "gpu_util_percent": system_metrics.get("system/gpu_util_percent"),
+                "gpu_memory_used_mb": system_metrics.get("system/gpu_memory_used_mb"),
+                "gpu_memory_total_mb": system_metrics.get("system/gpu_memory_total_mb"),
+                "gpu_power_watts": system_metrics.get("system/gpu_power_watts"),
+                "cpu_percent": system_metrics.get("system/cpu_percent"),
+                "ram_used_mb": system_metrics.get("system/ram_used_mb"),
+                "ram_percent": system_metrics.get("system/ram_percent"),
+            }
+
+            self.agent_vars_buffer.append(row_agent)
+
+            if self.use_wandb:
+                wandb_log = {
+                    "train/loss_q": metrics.get('loss_q'),
+                    "train/loss_p": metrics.get('loss_p'),
+                    "train/mean_q": metrics.get('mean_q'),
+                    "train/eta": metrics.get('eta'),
+                    "train/kl_mu": metrics.get('kl_mu'),
+                    "train/kl_sigma": metrics.get('kl_sigma'),
+                    "train/alpha_mu": metrics.get('alpha_mu'),
+                    "train/alpha_sigma": metrics.get('alpha_sigma'),
+                    "train/utd_ratio": metrics.get('utd_ratio'),
+                    "train/SPS": row_agent["SPS"],
+                    "train/average_reward_per_second": self.reward_tracker.average_reward_per_second,
+                    "train/reward": row_agent["reward"],
+
+                    "time/t_critic": metrics.get('t_critic'),
+                    "time/t_estep": metrics.get('t_estep'),
+                    "time/t_mstep": metrics.get('t_mstep'),
+                    "time/t_learn": metrics.get('t_learn'),
+
+                    "model/actor_params": self.actor_param_count,
+                    "model/critic_params": self.critic_param_count,
+                    "model/total_train_params": self.total_train_param_count,
+                    "model/ensemble": self.args.ensemble,
+                }
+
+                wandb_log.update(system_metrics)
+                wandb.log(wandb_log, step=global_step)
 
         if global_step % self.args.save_every_n_steps == 0:
             for row in self.info_log_buffer:
@@ -688,6 +843,8 @@ class MPO:
             self.csv_file_agent_vars.close()
         if self.envs:
             self.envs.close()
+        if getattr(self, "use_wandb", False):
+            wandb.finish()
 
 @torch.compile
 def _run_dual_optim(log_eta, m, v, beta1_pow, beta2_pow, q, dual_constraint, log_n, lr, n_steps):
@@ -786,7 +943,15 @@ def parse_args():
     parser.add_argument("--reward_scale", type=float, default=100.0)
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
-
+    # Weights & Biases logging.
+    parser.add_argument("--track_wandb", action="store_true", default=False)
+    parser.add_argument("--wandb_project", type=str, default="mpo-ant")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online",
+                        choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_watch", action="store_true", default=False)
     return parser.parse_args()
 
 

@@ -270,12 +270,32 @@ class MPO:
 
         if self.obs is None:
             self.obs = obs
-            rand_actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)]) #Gymnasium uses uniform sampling for box --> if other than change logprob formula
+
+            if self.args.warm_start or evaluate:
+                with torch.no_grad():
+                    obs_t = torch.as_tensor(self.obs, dtype=torch.float32, device=self.device)
+                    d = self.actor.forward(obs_t)
+                    action = d.mean if evaluate else d.rsample()
+                    actions = torch.clamp(action, self.actor.action_low, self.actor.action_high)
+                    actions = actions.squeeze(1)
+                    log_probs = d.log_prob(actions).unsqueeze(-1)
+
+                    self.last_actions = actions.cpu().numpy()
+                    self.last_log_probs = log_probs.cpu().numpy()
+                    return actions.cpu().numpy()
+
+            rand_actions = np.array([self.envs.single_action_space.sample() for _ in range(self.envs.num_envs)])
             self.last_actions = rand_actions.copy()
             self.last_log_probs = np.full((self.envs.num_envs, 1), self._uniform_log_prob, dtype=np.float32)
             return rand_actions
 
-        if evaluate or self.global_step > self.args.learning_starts:
+        use_policy_action = (
+            evaluate
+            or self.global_step > self.args.learning_starts
+            or (self.args.warm_start and self.global_step <= self.args.learning_starts)
+        )
+
+        if use_policy_action:
             with torch.no_grad():
                 obs_t = torch.as_tensor(self.obs, dtype=torch.float32, device=self.device)
                 d = self.actor.forward(obs_t)
@@ -366,9 +386,8 @@ class MPO:
 
         with torch.no_grad():
             # Fixed critic subset for the entire Retrace computation — consistent targets.
-            subset_size = min(2, len(self.critics))
-            subset_idx = torch.randperm(len(self.critics), device=self.device)[:subset_size]
-            subset_size=subset_size
+            subset_idx = torch.randperm(len(self.critics), device=self.device)[:2]
+
             s_k_flat = data.all_observations.reshape(B*n, self.obs_dim)
             a_k_flat = data.all_actions.reshape(B*n,self.act_dim)
             q_traj_stack = self.aggregation_operator(state=s_k_flat, action=a_k_flat, critics=self.target_critics,
@@ -642,7 +661,7 @@ class MPO:
         if global_step % (10 * self.args.save_every_n_steps) == 0:
             self.rb.save(os.path.join(self.weights_folder, "replay_buffer.npz"))
 
-    def load_checkpoint(self, weights_path):
+    def load_checkpoint(self, weights_path, load_replay_buffer: bool = True):
         checkpoint_files = [f for f in os.listdir(weights_path) if f.endswith(".pth")]
         checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
         checkpoint = torch.load(os.path.join(weights_path, checkpoint_files[-1]), map_location=self.device)
@@ -669,9 +688,11 @@ class MPO:
         print(f"[√] Loaded checkpoint from {weights_path}, global_step={self.global_step}")
 
         buffer_path = os.path.join(weights_path, "replay_buffer.npz")
-        if os.path.exists(buffer_path):
+        if load_replay_buffer and os.path.exists(buffer_path):
             self.rb.load(buffer_path, self.device)
             print(f"[√] Loaded replay buffer.")
+        elif not load_replay_buffer:
+            print("[warm_start] Skipping Sim1 replay buffer load. Fresh online buffer will be collected.")
 
     def cleanup(self):
         if self.writer_info is not None and self.info_log_buffer:
@@ -787,6 +808,12 @@ def parse_args():
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
+    parser.add_argument(
+        "--warm_start",
+        action="store_true",
+        default=False,
+        help="For continual learning: load Sim1 networks, skip Sim1 replay buffer, reset global_step to 0, collect fresh online data with pi0 before updates."
+    )
     return parser.parse_args()
 
 
@@ -814,9 +841,19 @@ if __name__ == "__main__":
     agent = MPO(args, envs, disk_folder=disk_folder, run_name=run_name, runs_directory=args.runs_directory)
 
     if args.weights_path is not None:
-        agent.load_checkpoint(args.weights_path)
+        agent.load_checkpoint(
+            args.weights_path,
+            load_replay_buffer=not args.warm_start,
+        )
+
         if args.eval:
             agent.global_step = 0
+        elif args.warm_start:
+            agent.global_step = 0
+            print(
+                f"[warm_start] Reset global_step to 0. "
+                f"No critic/policy updates until learning_starts={args.learning_starts}."
+            )
 
     obs, info = envs.reset(seed=args.seed)
     agent.initialize_logging(info)
