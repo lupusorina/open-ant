@@ -72,6 +72,7 @@ class NStepReplayBufferSamples(NamedTuple):
     all_next_observations: th.Tensor 
     all_actions: th.Tensor            
     behavior_log_probs: th.Tensor     # (B, n_step, 1)
+    ep_bounds: th.Tensor              # (B, n_step, 1)
 
 
 def get_action_dim(action_space: spaces.Space) -> int:
@@ -359,6 +360,7 @@ class ReplayBuffer(BaseBuffer):
         done: np.ndarray,
         infos: list[dict[str, Any]],
         behavior_log_prob: np.ndarray | None = None,
+        truncation: np.ndarray | None = None,
     ) -> None:
         # Reshape needed when using multiple envs with discrete observations
         # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
@@ -385,6 +387,9 @@ class ReplayBuffer(BaseBuffer):
 
         if self.handle_timeout_termination:
             self.timeouts[self.pos] = np.array([info.get("TimeLimit.truncated", False) for info in infos])
+
+        if truncation is not None:
+            self.timeouts[self.pos] = np.asarray(truncation, dtype=np.float32).reshape(self.n_envs)
 
         self.pos += 1
         if self.pos == self.buffer_size:
@@ -447,14 +452,14 @@ class ReplayBuffer(BaseBuffer):
         return self._get_nstep_samples(batch_inds, env_inds, n_step)
 
     def _get_nstep_samples(self, batch_inds: np.ndarray, env_inds: np.ndarray, n_step: int) -> "NStepReplayBufferSamples":
-        offsets = np.arange(n_step)[None, :]                              # (1, n_step)
+        offsets = np.arange(n_step)[None, :]                             # (1, n_step)
         all_inds = (batch_inds[:, None] + offsets) % self.buffer_size    # (B, n_step)
 
         rewards = self.rewards[all_inds, env_inds[:, None]]              # (B, n_step)
-        dones = (
-            self.dones[all_inds, env_inds[:, None]]
-            * (1 - self.timeouts[all_inds, env_inds[:, None]])
-        )                                                                  # (B, n_step)
+        terminations = self.dones[all_inds, env_inds[:, None]]           # (B, n_step)
+        truncations = self.timeouts[all_inds, env_inds[:, None]]         # (B, n_step)
+        dones = terminations * (1 - truncations)                         # (B, n_step)
+        ep_bounds = np.maximum(terminations, truncations)                # (B, n_step)
 
         obs = self.observations[batch_inds, env_inds]
         actions = self.actions[batch_inds, env_inds]
@@ -476,6 +481,7 @@ class ReplayBuffer(BaseBuffer):
             all_next_observations=self.to_torch(all_next_obs),
             all_actions=self.to_torch(all_acts),
             behavior_log_probs=self.to_torch(all_lp),
+            ep_bounds=self.to_torch(ep_bounds[..., None]),
         )
 
     def save(self, filepath: str) -> None:

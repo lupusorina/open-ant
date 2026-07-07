@@ -293,7 +293,8 @@ class MPO:
 
         self.rb.add(self.obs, real_next_obs, actions, rewards, terminations,
                     [{}] * self.envs.num_envs,
-                    behavior_log_prob=self.last_log_probs)
+                    behavior_log_prob=self.last_log_probs,
+                    truncation=truncations)
         self.global_step += 1
         self.obs = next_obs
 
@@ -387,13 +388,14 @@ class MPO:
 
             c_prod = torch.ones_like(y)   # running IS product (B, 1)
             alive = torch.ones_like(y)   # episode-still-alive mask (B, 1)
-            prev_done = None
+            prev_ep_bounds = None
 
             for k in range(n):
                 q_kp1 = q_kp1_traj[:,k:k+1]
                 q_k = q_traj[:,k:k+1]
                 r_k = data.rewards[:, k, :]                # (B, 1)
-                done_k = data.dones[:, k, :]                  # (B, 1)
+                done_k = data.dones[:, k, :]               # (B, 1)
+                ep_bound_k = data.ep_bounds[:, k, :]       # (B, 1)
                 # s_kp1 = data.all_next_observations[:, k, :]  # (B, obs_dim)
 
                 # a_kp1, _, _ = self.actor_target.get_action(s_kp1)
@@ -411,11 +413,11 @@ class MPO:
                 delta_k = r_k * self.dt + gamma_dt * (1.0 - done_k) * q_kp1 - q_k
 
                 if k > 0:
-                    alive  = alive * (1.0 - prev_done)
+                    alive  = alive * (1.0 - prev_ep_bounds)
                     c_prod = c_prod * c_all[:,k-1:k]
 
                 y = y + (gamma_dt ** k) * c_prod * alive * delta_k
-                prev_done = done_k
+                prev_ep_bounds = ep_bound_k
 
         losses = []
         q_preds = torch.stack([c(data.observations, data.actions) for c in self.critics], dim=0)
