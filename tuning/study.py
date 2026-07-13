@@ -27,7 +27,7 @@ def create_study(
         n_warmup_steps=pruner_warmup_steps,
     )
     return optuna.create_study(
-        name=name,
+        study_name=name,
         storage=storage,
         direction=optuna.study.StudyDirection.MAXIMIZE,
         sampler=sampler,

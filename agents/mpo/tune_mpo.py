@@ -1,5 +1,13 @@
-from ...tuning.cfg import TuningConfig
-from ...tuning.search_space import Cat, Float, Int
+"""
+python3 -m tuning.runner --entry agents.mpo.tune_mpo --name mpo_search --storage-dir runs/tuning --workers 16 --n-trials 2048
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+from tuning.cfg import TuningConfig
+from tuning.search_space import Cat, Float, Int
 
 from .mpo_default import parse_args as mpo_parse_args, train as mpo_train
 
@@ -25,12 +33,13 @@ MPO_SPACE = {
     "utd_ratio": Int(1, 4),
 }
 FIXED_CONFIG = {
-    "total_timesteps": 40_000,
+    "total_timesteps": 50_000,
     "learning_starts": 2000,
     "exp_name": "mpo_trial",
     "runs_directory": "runs/tuning_trials",
-    "save_every_n_steps": 40_000,
+    "save_every_n_steps": 50_000,
     "log_every_n_steps": 100,
+    "cuda": True,
     "base_seed": 1000,  # used by tuning.objective
 }
 IGNORED_CONFIG_KEYS = {"base_seed"}
@@ -38,7 +47,7 @@ IGNORED_CONFIG_KEYS = {"base_seed"}
 
 def get_tuning_setup():
     def build_args(config):
-        args = mpo_parse_args()
+        args = mpo_parse_args([])
         for key, value in config.items():
             if key in IGNORED_CONFIG_KEYS:
                 continue

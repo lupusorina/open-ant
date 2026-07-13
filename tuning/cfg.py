@@ -8,7 +8,7 @@ from .search_space import SpaceSpec
 class TuningConfig:
     space: SpaceSpec
     trainable: Any
-    fixed_config: Dict[str, Any] = {}
+    fixed_config: Dict[str, Any]
     env_factory: Any | None = None
     last_fraction: float = 0.25
     pruner_warmup_fraction: float = 0.3

@@ -11,7 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import gymnasium as gym
 from datetime import datetime
-from typing import Callable, List, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -728,7 +728,7 @@ def _str2bool(value: str | bool) -> bool:
         return False
     raise argparse.ArgumentTypeError(f"Unknown boolean value: {repr(value)}")
 
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser()
 
     # General.
@@ -797,7 +797,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 
