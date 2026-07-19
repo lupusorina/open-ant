@@ -215,7 +215,7 @@ class AntEnv(gym.Env):
         if seed is not None:
             self.np_random, _ = gym.utils.seeding.np_random(seed)
 
-        self.step(np.zeros(self.action_space.shape[0]))
+       # self.step(np.zeros(self.action_space.shape[0]))
 
         if self._previous_yaw is None:
             self._previous_yaw = self.np_random.uniform(-np.pi, np.pi)
