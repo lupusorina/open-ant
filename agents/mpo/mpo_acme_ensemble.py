@@ -493,8 +493,8 @@ class MPO:
         self.writer_info = None
         self.writer_agent_vars = None
         self.keys_info = None
-        self.keys_agent_vars = [
-            "critic_loss","policy_loss","dual_alpha_mean","dual_alpha_stddev",
+        self.keys_agent_vars = ["critic_loss",*[f"critic_loss_{idx}" for idx in range(self.args.ensemble)],
+            "policy_loss","dual_alpha_mean","dual_alpha_stddev",
             "dual_temperature","loss_alpha","loss_temperature","loss_policy_cross_entropy",
             "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","kl_mean_rel_min",
             "kl_mean_rel_max","kl_stddev_rel_min","kl_stddev_rel_max","q_min",
@@ -741,7 +741,15 @@ class MPO:
         # updates separately! gives critic loss shape [E,B]
         critic_loss_each, target, td_error = td_learning(online_q_each, r_t, pcont_t, averaged_q_t)
         
-        critic_loss = (critic_loss_each.mean(dim=1).sum())
+        # [E]: one batch-mean loss per critic
+        critic_loss_per_critic = critic_loss_each.mean(dim=1)
+
+        # Scalar objective used for backward()
+        critic_loss = critic_loss_per_critic.sum()
+
+        # Aggregate metric comparable across ensemble sizes
+        critic_loss_logged = critic_loss_per_critic.mean()
+
         scalar_dtype = sampled_q_t.dtype
         dual_variable_shape = D
 
@@ -845,7 +853,7 @@ class MPO:
             "dual_temperature": temperature.detach().mean().item(),
 
             # ACME's loss_policy statistic is the complete MPO loss.
-            "loss_policy": total_mpo_loss.detach().mean().item(),
+            "policy_loss": total_mpo_loss.detach().mean().item(),
             "loss_alpha": (
                 loss_alpha_mean.detach() + loss_alpha_stddev.detach()).mean().item(),
             "loss_temperature": loss_temperature.detach().mean().item(),
@@ -919,11 +927,15 @@ class MPO:
 
         # Losses to track.
         fetches = {
-            'critic_loss': critic_loss.detach().item(),
+            'critic_loss': critic_loss_logged.detach().item(),
             'policy_loss': total_mpo_loss.detach().item(),
 
             **policy_stats,
         }
+        for idx, loss_i in enumerate(critic_loss_per_critic):
+            fetches[f"critic_loss_{idx}"] = (
+                loss_i.detach().item()
+            )
         return fetches
 
     def initialize_logging(self, info):

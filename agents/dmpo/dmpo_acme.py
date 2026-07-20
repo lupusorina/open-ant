@@ -941,7 +941,7 @@ class MPO:
             "dual_temperature": temperature.detach().mean().item(),
 
             # ACME's loss_policy statistic is the complete MPO loss.
-            "loss_policy": total_mpo_loss.detach().mean().item(),
+            "policy_loss": total_mpo_loss.detach().mean().item(),
             "loss_alpha": (
                 loss_alpha_mean.detach() + loss_alpha_stddev.detach()).mean().item(),
             "loss_temperature": loss_temperature.detach().mean().item(),
