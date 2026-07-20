@@ -10,10 +10,10 @@ set -euo pipefail
 # Seeds run in this exact order.
 SEEDS=(10 1 2 3 8 7 6 5 4 9 0)
 
-SCRIPT="mpo_acme.py"
+SCRIPT="mpo_acme_ensemble.py"
 
 # Sim1 and Sim2 both save under this same parent directory.
-RUNS_DIR="runs/spi1536_gamma92"
+RUNS_DIR="runs/ensemble_spi1536_gamma92"
 
 # Sim1 output folders:
 #   runs-ant/dmpo_retrace_YYYYMMDD-HHMMSS_seed_3

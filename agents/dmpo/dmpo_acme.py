@@ -380,7 +380,6 @@ class MultivariateNormalDiagHead(nn.Module):
 
         return dist.MultivariateNormal(loc=mean,scale_tril=torch.diag_embed(scale))
   
-
 class AcmeActor(nn.Module):
     def __init__(
         self,
@@ -389,8 +388,8 @@ class AcmeActor(nn.Module):
         act_low: np.ndarray,
         act_high: np.ndarray,
         layer_sizes: Sequence[int] = (256, 256, 256),
-        init_scale: float = 0.7,   
-        min_scale: float = 1e-4,    # originally 1e-6
+        init_scale: float = 0.3,   # originally 0.3
+        min_scale: float = 1e-6,    # originally 1e-6
     ) -> None:
         super().__init__()
         if len(layer_sizes) == 0:
@@ -430,6 +429,7 @@ class AcmeCritic(nn.Module):
         num_atoms: int = 101,
     ) -> None:
         super().__init__()
+
         self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
         self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
         
@@ -515,8 +515,8 @@ class MPO:
             act_low=self.action_low,
             act_high=self.action_high,
             layer_sizes=policy_layer_sizes,
-            init_scale=0.3,
-            min_scale=1e-6,
+            init_scale=args.policy_init_scale,
+            min_scale=args.policy_min_scale,
         ).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         for p in self.actor_target.parameters():
@@ -567,7 +567,6 @@ class MPO:
             ],
             lr=args.dual_lr,
         )
-
         # self.dual_temp_optimizer = optim.Adam([self.log_eta], lr=args.dual_lr)
 
         # Scalar Lagrange multipliers for M-step KL constraints.
@@ -666,7 +665,7 @@ class MPO:
                 self.last_log_probs = log_probs
                 return actions
         return self._random_action()
-    
+
     def agent_step(self, next_obs, actions, rewards, terminations, truncations, infos):
         terminations = terminations.bool()
         truncations = truncations.bool()
@@ -941,7 +940,7 @@ class MPO:
             "dual_temperature": temperature.detach().mean().item(),
 
             # ACME's loss_policy statistic is the complete MPO loss.
-            "policy_loss": total_mpo_loss.detach().mean().item(),
+            "total_mpo_loss": total_mpo_loss.detach().mean().item(),
             "loss_alpha": (
                 loss_alpha_mean.detach() + loss_alpha_stddev.detach()).mean().item(),
             "loss_temperature": loss_temperature.detach().mean().item(),
@@ -1418,6 +1417,15 @@ def parse_args():
     parser.add_argument("--epsilon_penalty",type=float,default=1e-3,
                         help="KL constraint for action penalization")
 
+    # actor and critic network initializations
+    parser.add_argument("--policy_init_scale", type=float, default=0.3)
+    parser.add_argument("--policy_min_scale", type=float, default=1e-6)
+
+    # parser.add_argument("--policy_torso_init_scale", type=float, default=0.333)
+    # parser.add_argument("--policy_head_init_scale", type=float, default=1e-4)
+
+    # parser.add_argument("--critic_torso_init_scale", type=float, default=0.333)
+    # parser.add_argument("--critic_head_init_scale", type=float, default=1e-4)
     return parser.parse_args()
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):

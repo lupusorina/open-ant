@@ -13,7 +13,7 @@ SEEDS=(10 1 2 3 8 7 6 5 4 9 0)
 SCRIPT="dmpo_acme.py"
 
 # Sim1 and Sim2 both save under this same parent directory.
-RUNS_DIR="runs/spi1536_gamma92"
+RUNS_DIR="runs/spi1536_gamma92_init_min"
 
 # Sim1 output folders:
 #   runs-ant/dmpo_retrace_YYYYMMDD-HHMMSS_seed_3
