@@ -505,8 +505,8 @@ class MPO:
             act_low=self.action_low,
             act_high=self.action_high,
             layer_sizes=policy_layer_sizes,
-            init_scale=0.3,  # min_scale, 
-            min_scale=1e-6,
+            init_scale=args.policy_init_scale,
+            min_scale=args.policy_min_scale,
         ).to(self.device)
 
         self.actor_target = AcmeActor(
@@ -1418,8 +1418,8 @@ def parse_args():
                         help="KL constraint for action penalization")
 
     # actor and critic network initializations
-    parser.add_argument("--policy_init_scale", type=float, default=0.3)
-    parser.add_argument("--policy_min_scale", type=float, default=1e-6)
+    parser.add_argument("--policy_init_scale", type=float, default=0.7)
+    parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
     # parser.add_argument("--policy_torso_init_scale", type=float, default=0.333)
     # parser.add_argument("--policy_head_init_scale", type=float, default=1e-4)
