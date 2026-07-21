@@ -11,7 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import gymnasium as gym
 from datetime import datetime
-from typing import List, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -152,6 +152,15 @@ def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     print(f"[√] Created environment with {envs.num_envs} environments.")
     return envs
 
+def make_default_ant_envs(args: argparse.Namespace, disk_folder: str, run_name: str, runs_directory: str) -> gym.vector.VectorEnv:
+    if args.task_type == "forward":
+        task = ForwardTask()
+    elif args.task_type == "back_and_forth":
+        task = BackAndForthTask(radius=args.radius_back_and_forth, origin=np.array(args.origin_back_and_forth))
+    else:
+        raise ValueError(f"Invalid task: {args.task_type}")
+    return make_ant_envs(args, task, disk_folder, run_name, runs_directory=runs_directory)
+
 
 class MPO:
     def __init__(self, args, envs, disk_folder='', run_name=None, runs_directory='runs'):
@@ -216,7 +225,7 @@ class MPO:
         self._uniform_log_prob = -float(np.sum(np.log(self.action_high - self.action_low)))
 
         self.rb = ReplayBuffer(
-            args.buffer_size,
+            min(args.buffer_size, args.total_timesteps + 1),
             envs.single_observation_space,
             envs.single_action_space,
             self.device,
@@ -710,15 +719,23 @@ def _run_dual_optim(log_eta, m, v, beta1_pow, beta2_pow, q, dual_constraint, log
 
     return log_eta, m, v, beta1_pow, beta2_pow
 
+def _str2bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ("true", "1"):
+        return True
+    if value.lower() in ("false", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"Unknown boolean value: {repr(value)}")
 
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser()
 
     # General.
     parser.add_argument("--exp_name", type=str, default="mpo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--torch_deterministic", type=bool, default=True)
+    parser.add_argument("--torch_deterministic", type=_str2bool, default=True)
     parser.add_argument("--cuda", action="store_true", default=False)
     parser.add_argument("--capture_video", action="store_true")
     parser.add_argument("--eval", action="store_true", default=False)
@@ -736,7 +753,7 @@ def parse_args():
     parser.add_argument("--policy_lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.92)
-    parser.add_argument("--use_layer_norm", type=bool, default=True)
+    parser.add_argument("--use_layer_norm", type=_str2bool, default=True)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--n_hidden_layers", type=int, default=3)
     parser.add_argument("--utd_ratio", type=int, default=1)
@@ -770,7 +787,7 @@ def parse_args():
     parser.add_argument("--dt", type=float, default=0.15)
     parser.add_argument("--hw_config", type=str, default=None)
     parser.add_argument("--render_mode", type=str, default=None)
-    parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
+    parser.add_argument("--terminate_on_upside_down", type=_str2bool, default=True)
     parser.add_argument("--weights_path", type=str, default=None)
     parser.add_argument("--task_type", type=str, default="back_and_forth",
                         choices=["forward", "back_and_forth"])
@@ -780,11 +797,13 @@ def parse_args():
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-if __name__ == "__main__":
-    args = parse_args()
+
+def train(args, env_factory: Callable | None = None, on_report: Callable | None = None) -> float:
+    if env_factory is None:
+        env_factory = make_default_ant_envs
 
     date = datetime.now().strftime("%Y%m%d-%H%M%S")
     disk_folder = ''
@@ -792,17 +811,7 @@ if __name__ == "__main__":
     run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
     os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
-    if args.task_type == "forward":
-        task = ForwardTask()
-    elif args.task_type == "back_and_forth":
-        RADIUS = args.radius_back_and_forth
-        ORIGIN = np.array(args.origin_back_and_forth)
-        task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
-        print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
-    else:
-        raise ValueError(f"Invalid task type: {args.task_type}")
-
-    envs = make_ant_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
+    envs = env_factory(args, disk_folder, run_name, args.runs_directory)
 
     agent = MPO(args, envs, disk_folder=disk_folder, run_name=run_name, runs_directory=args.runs_directory)
 
@@ -815,6 +824,7 @@ if __name__ == "__main__":
     agent.initialize_logging(info)
 
     time_start_learning = time.time()
+    tracked_rewards = []
     
     for step in tqdm(range(agent.global_step, args.total_timesteps)):
         t0 = time.time()
@@ -827,15 +837,28 @@ if __name__ == "__main__":
         else:
             metrics = agent.agent_step(next_obs, selected_actions, rewards, terminations, truncations, infos)
 
-        
+        obs = next_obs
 
         if step % args.save_every_n_steps == 0:
             agent.save_checkpoint(step)
         
         t_step = time.time() - t0
         agent.log_step(step, infos, rewards, metrics, t_step)
-    
+
+        if step % args.log_every_n_steps == 0:
+            avg = agent.reward_tracker.average_reward_per_second if agent.reward_tracker else None
+            if avg is not None:
+                if step >= int(0.75 * args.total_timesteps):
+                    tracked_rewards.append(float(avg))
+                if on_report is not None and on_report(step, float(avg)):
+                    break
+
     time_end_learning = time.time()
     print(f"Learning time: {time_end_learning - time_start_learning} seconds")
-
     agent.cleanup()
+
+    return sum(tracked_rewards) / len(tracked_rewards) if tracked_rewards else float("nan")
+
+
+if __name__ == "__main__":
+    train(parse_args())
