@@ -497,9 +497,10 @@ class MPO:
         for _ in range(self.args.mstep_iteration_num):
             curr_d = self.actor.forward(obs)
 
-            # Weighted log-likelihood under current policy.
-            log_probs = dist.Normal(curr_d.base_dist.loc.unsqueeze(1), curr_d.base_dist.scale.unsqueeze(1)).log_prob(action_samples)
-            nll = -(weights.detach() * log_probs.sum(-1)).sum(-1).mean()
+            # Decoupled weighted log-likelihood (https://arxiv.org/pdf/1812.02256)
+            lp_mean = dist.Normal(curr_d.base_dist.loc.unsqueeze(1), b_sigma.unsqueeze(1).detach()).log_prob(action_samples).sum(-1)
+            lp_std = dist.Normal(b_mu.unsqueeze(1).detach(), curr_d.base_dist.scale.unsqueeze(1)).log_prob(action_samples).sum(-1)
+            nll = -(weights.detach() * (lp_mean + lp_std)).sum(-1).mean()
 
             # Decoupled KL: stop-gradient on sigma for mean term, on mu for covariance term.
             kl_mu = dist.kl_divergence(
