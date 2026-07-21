@@ -408,7 +408,7 @@ class MPO:
                 #     mode='min_subset', subset_size=2, subset_idx=subset_idx,
                 # )
 
-                delta_k = r_k * self.dt + gamma_dt * (1.0 - done_k) * q_kp1 - q_k
+                delta_k = r_k + gamma_dt * (1.0 - done_k) * q_kp1 - q_k
 
                 if k > 0:
                     alive  = alive * (1.0 - prev_done)
@@ -776,7 +776,7 @@ def parse_args():
                         choices=["forward", "back_and_forth"])
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3)
     parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3])
-    parser.add_argument("--reward_scale", type=float, default=100.0)
+    parser.add_argument("--reward_scale", type=float, default=12.0)
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
