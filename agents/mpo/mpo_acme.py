@@ -392,8 +392,8 @@ class MPO:
             act_low=self.action_low,
             act_high=self.action_high,
             layer_sizes=policy_layer_sizes,
-            init_scale=0.7,  #0.3
-            min_scale=1e-4,  # 1e-6
+            init_scale=args.policy_init_scale,
+            min_scale=args.policy_min_scale,
         ).to(self.device)
 
         self.actor_target = AcmeActor(
@@ -402,8 +402,8 @@ class MPO:
             act_low=self.action_low,
             act_high=self.action_high,
             layer_sizes=policy_layer_sizes,
-            init_scale=0.7, # 0.3
-            min_scale=1e-4, # 1e-6
+            init_scale=args.policy_init_scale,
+            min_scale=args.policy_min_scale,
         ).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         for p in self.actor_target.parameters():
@@ -463,7 +463,6 @@ class MPO:
             envs.single_action_space,
             self.device,
             n_envs=args.num_envs,
-            handle_timeout_termination=False,
         )
 
         self.batch_size = self.args.batch_size
@@ -472,6 +471,7 @@ class MPO:
 
         self.samples_per_insert = self.args.samples_per_insert
         self.learner_update_budget = 0.0
+
         self.global_step = 0
         self.learner_step = 0
         self.target_policy_update_period = self.args.target_policy_update_period
@@ -514,12 +514,13 @@ class MPO:
         self._epsilon = args.epsilon_eta
         self._epsilon_mean = args.epsilon_mu_kl
         self._epsilon_stddev = args.epsilon_sigma_kl
-                
-        # a variable that tracks when reset happens - the transition after done = true is
+        
+        # a variable that tracks when reset happens - the transition after boundary = true is
         # when transitioning from terminal state to reset state - this is when pending_autoreset=1,
         # to inform agent to not use this transition during training.
         self.pending_autoreset = torch.zeros(self.envs.num_envs,dtype=torch.bool,device=self.device)
         print("Agent initialized and compiled")
+    
     def _random_action(self):
         low, high = self.actor.action_low, self.actor.action_high
         rand_actions = low + (high - low) * torch.rand(self.envs.num_envs, self.act_dim, device=self.device)
@@ -553,12 +554,10 @@ class MPO:
         terminations = terminations.bool()
         truncations = truncations.bool()
 
-        # Episode boundary: true termination OR time-limit truncation
-        dones = terminations | truncations
+        # either flag will end the sampled trajectory
+        # only terminations disable bootstrapping in the replay buffer though
+        boundaries = terminations | truncations
 
-        # timeout/truncation, this should NOT kill bootstrapping
-        timeouts = truncations & (~terminations)
-        
         if "autoreset" in infos:
             autoreset_now = torch.as_tensor(infos["autoreset"],dtype=torch.bool,device=self.device)
         else:
@@ -567,21 +566,20 @@ class MPO:
 
         num_inserts = int(valid.sum().item())
         self.rb.add(
-            self.obs,
-            next_obs,
-            actions,
-            rewards,
-            dones,
-            [{}] * self.envs.num_envs,
-           # behavior_log_prob=self.last_log_probs,
-            truncation=timeouts,
-            valid=valid) 
+            obs=self.obs,
+            next_obs=next_obs,
+            action=actions,
+            reward=rewards,
+            terminated=terminations,
+            truncated=truncations,
+            valid=valid,
+        )
         #___________________________________________________________________________________________________
         self.global_step += 1
         self.obs = next_obs
-        self.pending_autoreset = dones.detach().clone()
+        self.pending_autoreset = boundaries.detach().clone()
         metrics = None
-        
+
         if self.global_step > self.args.learning_starts and self.rb.size() >= self.batch_size:
             # Count actual environment transitions inserted.
             # Reset-only rows have valid=False and should not count.
@@ -608,25 +606,30 @@ class MPO:
         terminations = terminations.bool()
         truncations = truncations.bool()
 
-        dones = terminations | truncations
-        timeouts = truncations & (~terminations)
+        boundaries = terminations | truncations
 
         if "autoreset" in infos:
             autoreset_now = torch.as_tensor(infos["autoreset"],dtype=torch.bool,device=self.device)
         else:
             autoreset_now = self.pending_autoreset
+        #  autoreset_now indicate whether the PREV transition is a boundary
+        # autoreset_now = 0, means the previous transition was NOT boundary / ending,
+        # so that means this current transition is valid entry in replay buffer
+        # if autoreset_now = 1, means previous transition was the end of an episode, 
+        # so this current transition is going from "ending episode" to "reset episode"
+        # this is not a valid transition, so mark it.
         valid = ~autoreset_now
+
         self.rb.add(
-            self.obs,
-            next_obs,
-            actions,
-            rewards,
-            dones,
-            [{}] * self.envs.num_envs,
-            #behavior_log_prob=self.last_log_probs,
-            truncation=timeouts,
-            valid=valid)
-        self.pending_autoreset = dones.detach().clone()
+            obs=self.obs,
+            next_obs=next_obs,
+            action=actions,
+            reward=rewards,
+            terminated=terminations,
+            truncated=truncations,
+            valid=valid,
+        )
+        self.pending_autoreset = boundaries.detach().clone()
         self.global_step += 1
         self.obs = next_obs
     
@@ -813,7 +816,7 @@ class MPO:
             "dual_temperature": temperature.detach().mean().item(),
 
             # ACME's loss_policy statistic is the complete MPO loss.
-            "loss_policy": total_mpo_loss.detach().mean().item(),
+            "total_mpo_loss": total_mpo_loss.detach().mean().item(),
             "loss_alpha": (
                 loss_alpha_mean.detach() + loss_alpha_stddev.detach()).mean().item(),
             "loss_temperature": loss_temperature.detach().mean().item(),
@@ -890,7 +893,7 @@ class MPO:
             **policy_stats,
         }
         return fetches
-
+    
     def initialize_logging(self, info):
         self.start_time = time.time()
 
@@ -1062,7 +1065,7 @@ class MPO:
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self.dual_optimizer.load_state_dict(checkpoint["dual_optimizer"])
-    
+      
         with torch.no_grad():
             if "log_eta" in checkpoint:
                 self.log_eta.copy_(torch.as_tensor(checkpoint["log_eta"],dtype=self.log_eta.dtype,device=self.device).reshape_as(self.log_eta))
@@ -1098,103 +1101,103 @@ class MPO:
             self.envs.close()
 
 def compute_weights_and_temperature_loss(q_values: torch.Tensor, epsilon: float, temperature: nn.Parameter,) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Computes normalized importance weights for the policy optimization.
+  """Computes normalized importance weights for the policy optimization.
 
-    Args:
-        q_values: Q-values associated with the actions sampled from the target
-        policy; expected shape [N, B].
-        epsilon: Desired constraint on the KL between the target and non-parametric
-        policies.
-        temperature: Scalar used to temper the Q-values before computing normalized
-        importance weights from them. This is really the Lagrange dual variable
-        in the constrained optimization problem, the solution of which is the
-        non-parametric policy targeted by the policy loss.
-    Returns:
-        Normalized importance weights, used for policy optimization.
-        Temperature loss, used to adapt the temperature.
-    """
+  Args:
+    q_values: Q-values associated with the actions sampled from the target
+      policy; expected shape [N, B].
+    epsilon: Desired constraint on the KL between the target and non-parametric
+      policies.
+    temperature: Scalar used to temper the Q-values before computing normalized
+      importance weights from them. This is really the Lagrange dual variable
+      in the constrained optimization problem, the solution of which is the
+      non-parametric policy targeted by the policy loss.
+  Returns:
+    Normalized importance weights, used for policy optimization.
+    Temperature loss, used to adapt the temperature.
+  """
 
-    # Temper the given Q-values using the current temperature.
-    tempered_q_values = q_values.detach() / temperature
+  # Temper the given Q-values using the current temperature.
+  tempered_q_values = q_values.detach() / temperature
 
-    # Compute the normalized importance weights used to compute expectations with
-    # respect to the non-parametric policy.
-    normalized_weights = F.softmax(tempered_q_values, dim=0).detach()
+  # Compute the normalized importance weights used to compute expectations with
+  # respect to the non-parametric policy.
+  normalized_weights = F.softmax(tempered_q_values, dim=0).detach()
 
-    # Compute the temperature loss (dual of the E-step optimization problem).
-    q_logsumexp = torch.logsumexp(tempered_q_values, dim=0)
-    log_num_actions = torch.log(
-            torch.tensor(
-                q_values.shape[0],
-                dtype=q_values.dtype,
-                device=q_values.device,
-            )
+  # Compute the temperature loss (dual of the E-step optimization problem).
+  q_logsumexp = torch.logsumexp(tempered_q_values, dim=0)
+  log_num_actions = torch.log(
+        torch.tensor(
+            q_values.shape[0],
+            dtype=q_values.dtype,
+            device=q_values.device,
         )
-    loss_temperature = epsilon + q_logsumexp.mean() - log_num_actions
-    loss_temperature = temperature * loss_temperature
+    )
+  loss_temperature = epsilon + q_logsumexp.mean() - log_num_actions
+  loss_temperature = temperature * loss_temperature
 
-    return normalized_weights, loss_temperature
+  return normalized_weights, loss_temperature
 
 def compute_cross_entropy_loss(
-        sampled_actions: torch.Tensor,
-        normalized_weights: torch.Tensor,
-        online_policy: dist.Distribution,) -> torch.Tensor:
-    """Compute cross-entropy online and the reweighted target policy.
+    sampled_actions: torch.Tensor,
+    normalized_weights: torch.Tensor,
+    online_policy: dist.Distribution,) -> torch.Tensor:
+  """Compute cross-entropy online and the reweighted target policy.
 
-    Args:
-        sampled_actions: samples used in the Monte Carlo integration in the policy
-        loss. Expected shape is [N, B, ...], where N is the number of sampled
-        actions and B is the number of sampled states.
-        normalized_weights: target policy multiplied by the exponentiated Q values
-        and normalized; expected shape is [N, B].
-        online_action_distribution: policy to be optimized.
+  Args:
+    sampled_actions: samples used in the Monte Carlo integration in the policy
+      loss. Expected shape is [N, B, ...], where N is the number of sampled
+      actions and B is the number of sampled states.
+    normalized_weights: target policy multiplied by the exponentiated Q values
+      and normalized; expected shape is [N, B].
+    online_action_distribution: policy to be optimized.
 
-    Returns:
-        loss_policy_gradient: the cross-entropy loss that, when differentiated,
-        produces the policy gradient.
-    """
+  Returns:
+    loss_policy_gradient: the cross-entropy loss that, when differentiated,
+      produces the policy gradient.
+  """
 
-    # Compute the M-step loss.
-    log_prob = online_policy.log_prob(sampled_actions)
+  # Compute the M-step loss.
+  log_prob = online_policy.log_prob(sampled_actions)
 
-    # Compute the weighted average log-prob using the normalized weights.
-    loss_policy_gradient = -torch.sum(log_prob * normalized_weights, dim=0,) #(B,)
+  # Compute the weighted average log-prob using the normalized weights.
+  loss_policy_gradient = -torch.sum(log_prob * normalized_weights, dim=0,) #(B,)
 
-    # Return the mean loss over the batch of states.
-    return loss_policy_gradient.mean(dim=0)
+  # Return the mean loss over the batch of states.
+  return loss_policy_gradient.mean(dim=0)
 
 def compute_parametric_kl_penalty_and_dual_loss(
-        kl: torch.Tensor,
-        alpha: nn.Parameter,
-        epsilon: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Computes the KL cost to be added to the Lagragian and its dual loss.
+    kl: torch.Tensor,
+    alpha: nn.Parameter,
+    epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+  """Computes the KL cost to be added to the Lagragian and its dual loss.
 
-    The KL cost is simply the alpha-weighted KL divergence and it is added as a
-    regularizer to the policy loss. The dual variable alpha itself has a loss that
-    can be minimized to adapt the strength of the regularizer to keep the KL
-    between consecutive updates at the desired target value of epsilon.
+  The KL cost is simply the alpha-weighted KL divergence and it is added as a
+  regularizer to the policy loss. The dual variable alpha itself has a loss that
+  can be minimized to adapt the strength of the regularizer to keep the KL
+  between consecutive updates at the desired target value of epsilon.
 
-    Args:
-        kl: KL divergence between the target and online policies.
-        alpha: Lagrange multipliers (dual variables) for the KL constraints.
-        epsilon: Desired value for the KL.
+  Args:
+    kl: KL divergence between the target and online policies.
+    alpha: Lagrange multipliers (dual variables) for the KL constraints.
+    epsilon: Desired value for the KL.
 
-    Returns:
-        loss_kl: alpha-weighted KL regularization to be added to the policy loss.
-        loss_alpha: The Lagrange dual loss minimized to adapt alpha.
-    """
+  Returns:
+    loss_kl: alpha-weighted KL regularization to be added to the policy loss.
+    loss_alpha: The Lagrange dual loss minimized to adapt alpha.
+  """
 
-    # Compute the mean KL over the batch.
-    mean_kl = kl.mean(dim=0)  # (D,)
+  # Compute the mean KL over the batch.
+  mean_kl = kl.mean(dim=0)  # (D,)
 
-    # actor sees gradients through KL, not alpha
-    loss_kl = torch.sum(alpha.detach() * mean_kl)
+  # actor sees gradients through KL, not alpha
+  loss_kl = torch.sum(alpha.detach() * mean_kl)
 
-    # Compute the dual loss.
-    loss_alpha = torch.sum(alpha * (epsilon - mean_kl.detach()))
+  # Compute the dual loss.
+  loss_alpha = torch.sum(alpha * (epsilon - mean_kl.detach()))
 
-    return loss_kl, loss_alpha
+  return loss_kl, loss_alpha
 
 def compute_nonparametric_kl_from_normalized_weights(
     normalized_weights: torch.Tensor) -> torch.Tensor:
@@ -1237,12 +1240,12 @@ def parse_args():
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
     parser.add_argument("--batch_size", type=int, default=512)
 
-    parser.add_argument("--vmin", type=float, default=-500,
-                    help="Minimum atom value for distributional critic")
-    parser.add_argument("--vmax", type=float, default=20,
-                        help="Maximum atom value for distributional critic")
-    parser.add_argument("--num_atoms", type=int, default=101,
-                        help="Number of categorical atoms for distributional critic")
+    # parser.add_argument("--vmin", type=float, default=-500,
+    #                 help="Minimum atom value for distributional critic")
+    # parser.add_argument("--vmax", type=float, default=20,
+    #                     help="Maximum atom value for distributional critic")
+    # parser.add_argument("--num_atoms", type=int, default=101,
+    #                     help="Number of categorical atoms for distributional critic")
     # parser.add_argument("--critic_num_samples", type=int, default=32,
     #                     help="Number of next-action samples used to build target critic distribution")
     parser.add_argument("--log_interval", type=int, default=100,
@@ -1263,19 +1266,23 @@ def parse_args():
    
     parser.add_argument("--max_grad_norm", type=float, default=40.0)
 
-    parser.add_argument("--ensemble", type=int, default=1)
+    parser.add_argument("--ensemble", type=int, default=1) #doesn't matter in this script
+    # true learning start = learning start // num_envs (floor division)
     parser.add_argument("--learning_starts", type=int, default=200)
     parser.add_argument("--policy_lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=1e-3)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--use_layer_norm", type=bool, default=True)
+    parser.add_argument("--gamma", type=float, default=0.92)
+    # layer norm arg is only effective if old Actor class is used rather than AcmeActo
+    parser.add_argument("--use_layer_norm", action=argparse.BooleanOptionalAction, default=True) 
 
     parser.add_argument("--policy_layer_sizes",type=int,nargs="+",default=[256, 256, 256])
     parser.add_argument("--critic_layer_sizes",type=int,nargs="+",default=[512, 512, 256])
     parser.add_argument("--utd", type=int, default=32)
     parser.add_argument("--td_horizon", type=int, default=5,
                         help="number of steps collapsed into each replay transition")
-    parser.add_argument("--decouple_q_learning", action='store_true', default=True)
+    # this decouple q learning currently doesn't work. but training seems fine regardless
+    # parser.add_argument("--decouple_q_learning", action=argparse.BooleanOptionalAction, default=True,
+    #                     help="use --decouple_q_learning or --no-decouple_q_learning")
     parser.add_argument("--policy_learning_starts", type=int, default=500,
                         help="steps of Q-only warmup after learning_starts when --decouple_q_learning is set")
     
@@ -1312,6 +1319,15 @@ def parse_args():
     parser.add_argument("--epsilon_penalty",type=float,default=1e-3,
                         help="KL constraint for action penalization")
 
+    # actor and critic network initializations
+    parser.add_argument("--policy_init_scale", type=float, default=0.7)
+    parser.add_argument("--policy_min_scale", type=float, default=1e-4)
+
+    # parser.add_argument("--policy_torso_init_scale", type=float, default=0.333)
+    # parser.add_argument("--policy_head_init_scale", type=float, default=1e-4)
+
+    # parser.add_argument("--critic_torso_init_scale", type=float, default=0.333)
+    # parser.add_argument("--critic_head_init_scale", type=float, default=1e-4)
     return parser.parse_args()
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
