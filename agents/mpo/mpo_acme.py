@@ -1129,7 +1129,7 @@ def parse_args():
     parser.add_argument("--capture_video", action="store_true")
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
-    parser.add_argument("--log_every_n_steps", type=int, default=100)
+    parser.add_argument("--log_every_n_steps", type=int, default=4000)
 
     parser.add_argument("--env_id", type=str, default="EAnt")
     parser.add_argument("--total_timesteps", type=int, default=60_000)
