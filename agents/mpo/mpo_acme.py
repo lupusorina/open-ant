@@ -757,12 +757,6 @@ class MPO:
             "kl_mean_rel": (kl_mean.detach().mean() / self._epsilon_mean).item(),
             "kl_stddev_rel": (kl_stddev.detach().mean() / self._epsilon_stddev).item(),
 
-            # Per-dimension constraint range.
-            # "kl_mean_rel_min": (mean_kl_mean_per_dim.detach().min() / self._epsilon_mean).item(),
-            # "kl_mean_rel_max": (mean_kl_mean_per_dim.detach().max() / self._epsilon_mean).item(),
-            # "kl_stddev_rel_min": (mean_kl_stddev_per_dim.detach().min()/ self._epsilon_stddev).item(),
-            # "kl_stddev_rel_max": (mean_kl_stddev_per_dim.detach().max()/ self._epsilon_stddev).item(),
-
             # Q-values: min/max over actions for each state, then average states.
             "q_min": (q_values.detach().min(dim=0).values.mean()).item(),
 
@@ -844,8 +838,7 @@ class MPO:
             return
 
         self.reward_tracker.update(infos['original_reward'][0])
-        self.reward_tracker.log()
-
+        
         if global_step % self.args.log_every_n_steps != 0:
             return
 
@@ -894,6 +887,7 @@ class MPO:
             self.agent_vars_buffer.append(agent_vars_row)
 
         if global_step % self.args.save_every_n_steps == 0:
+            self.reward_tracker.log()
             for row in self.info_log_buffer:
                 self.writer_info.writerow(row)
             self.csv_file_info.flush()
@@ -1022,11 +1016,10 @@ def compute_weights_and_temperature_loss(q_values: torch.Tensor, epsilon: float,
     Temperature loss, used to adapt the temperature.
   """
 
-  # Temper the given Q-values using the current temperature.
+  # divide Q-values by temp
   tempered_q_values = q_values.detach() / temperature
 
-  # Compute the normalized importance weights used to compute expectations with
-  # respect to the non-parametric policy.
+  # Compute the normalized importance weights (weights of actions that online policy should update toward)
   normalized_weights = F.softmax(tempered_q_values, dim=0).detach()
 
   # Compute the temperature loss (dual of the E-step optimization problem).
@@ -1068,7 +1061,7 @@ def compute_cross_entropy_loss(
   # Compute the weighted average log-prob using the normalized weights.
   loss_policy_gradient = -torch.sum(log_prob * normalized_weights, dim=0,) #(B,)
 
-  # Return the mean loss over the batch of states.
+  # return the mean loss over batch of states = b
   return loss_policy_gradient.mean(dim=0)
 
 def compute_parametric_kl_penalty_and_dual_loss(
@@ -1128,7 +1121,7 @@ def td_learning(v_tm1, r_t, pcont_t, v_t):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp_name", type=str, default="dmpo_ant")
+    parser.add_argument("--exp_name", type=str, default="mpo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--torch_deterministic", type=bool, default=True)
@@ -1203,7 +1196,7 @@ def parse_args():
     parser.add_argument("--init_log_alpha_stddev", type=float, default=1000.0)
 
     # Environment.
-    parser.add_argument("--dt", type=float, default=0.15)
+    parser.add_argument("--dt", type=float, default=0.12)
     parser.add_argument("--hw_config", type=str, default=None)
     parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
@@ -1352,13 +1345,14 @@ def main():
     obs, info = envs.reset()
     agent.initialize_logging(info)
 
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-        os.makedirs(agent.log_dir, exist_ok=True)
-        writer = SummaryWriter(agent.log_dir)
-    except ImportError:
-        writer = None
-        print("[!] tensorboard not available, printing only")
+    # try:
+    #     from torch.utils.tensorboard import SummaryWriter
+    #     os.makedirs(agent.log_dir, exist_ok=True)
+    #     writer = SummaryWriter(agent.log_dir)
+    # except ImportError:
+    #     writer = None
+    #     print("[!] tensorboard not available, printing only")
+    writer = None
 
     #time_start_learning = time.time()
     step_times = []
@@ -1379,18 +1373,19 @@ def main():
             current_step = agent.global_step
             agent.log_step(current_step, infos, rewards, metrics)
 
-            if writer is not None and current_step % args.log_interval == 0:
-                writer.add_scalar("reward/mean", float(rewards.mean()), current_step)
-                if "benchmark_reward" in infos:
-                    writer.add_scalar("reward/benchmark",
-                                        float(np.asarray(infos["benchmark_reward"]).mean()), current_step)
-                writer.add_scalar("perf/buffer_size", agent.rb.size(), current_step)
-            if metrics is not None:
-                for k, v in metrics.items():
-                    if isinstance(v, (int, float)):
-                        writer.add_scalar(f"agent/{k}", v, agent.learner_step)
+            # TENSORBOARD THINGS
+            # if writer is not None and current_step % args.log_interval == 0:
+            #     writer.add_scalar("reward/mean", float(rewards.mean()), current_step)
+            #     if "benchmark_reward" in infos:
+            #         writer.add_scalar("reward/benchmark",
+            #                             float(np.asarray(infos["benchmark_reward"]).mean()), current_step)
+            #     writer.add_scalar("perf/buffer_size", agent.rb.size(), current_step)
+            # if metrics is not None:
+            #     for k, v in metrics.items():
+            #         if isinstance(v, (int, float)):
+            #             writer.add_scalar(f"agent/{k}", v, agent.learner_step)
     
-            # ---- checkpoints (<run_dir>/weights_and_args) ----
+            # checkpoints (<run_dir>/weights_and_args) 
             if (not args.eval and current_step % args.save_every_n_steps == 0):
                 agent.save_checkpoint()
                 if writer is not None:
