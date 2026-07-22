@@ -173,7 +173,6 @@ class MultivariateNormalDiagHead(nn.Module):
         super().__init__()
         self._init_scale = float(init_scale)
         self._min_scale = float(min_scale)
-        self._tanh_mean = tanh_mean
         self._fixed_scale = fixed_scale
         self._use_independent = use_independent
 
@@ -182,6 +181,7 @@ class MultivariateNormalDiagHead(nn.Module):
         if not fixed_scale:
             self._scale_layer = nn.Linear(in_features=input_size, out_features=num_dimensions)
             self._initialize_linear(self._scale_layer)
+
     @staticmethod
     def _initialize_linear(linear: nn.Linear) -> None:
         variance_scaling_init_(linear.weight,scale=1e-4,mode="fan_in",distribution="truncated_normal")
@@ -199,8 +199,6 @@ class MultivariateNormalDiagHead(nn.Module):
                 / softplus_zero
                 + self._min_scale
             )
-        if self._tanh_mean:
-            mean = torch.tanh(mean)
         if self._use_independent:
             return dist.Independent(dist.Normal(loc=mean, scale=scale),reinterpreted_batch_ndims=1)
 
@@ -233,7 +231,6 @@ class AcmeActor(nn.Module):
             num_dimensions=act_dim,
             init_scale=init_scale,
             min_scale=min_scale,
-            tanh_mean=False,
             fixed_scale=False,
             use_independent=True,
         )
