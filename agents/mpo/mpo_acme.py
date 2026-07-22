@@ -43,75 +43,7 @@ def arr_to_str(x):
 # from crane import tile_images, save_video
 _MPO_FLOAT_EPSILON = 1e-8
 
-class Actor(nn.Module):
-    def __init__(self,
-                 obs_dim: int,
-                 act_dim: int,
-                 act_low: np.ndarray,
-                 act_high: np.ndarray,
-                 hidden_dims: List[int] = [256, 256, 256],
-                 use_layer_norm: bool = False,
-                 min_scale: float = 1e-6,
-                 init_scale: float = 0.3):
-        super().__init__()
-        self.min_scale = min_scale
-        self.init_scale = init_scale
 
-        self.register_buffer("action_low",torch.as_tensor(act_low, dtype=torch.float32))
-        self.register_buffer("action_high",torch.as_tensor(act_high, dtype=torch.float32))
-        
-        layers = []
-        prev = obs_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(prev, h))
-            if use_layer_norm:
-                layers.append(nn.LayerNorm(h))
-            layers.append(nn.ReLU())
-            prev = h
-        self.net = nn.Sequential(*layers)
-        self.mu_head = nn.Linear(prev, act_dim)
-        self.log_sigma_head = nn.Linear(prev, act_dim)
-
-       # self._softplus_bias = float(np.log(np.exp(init_scale - min_scale) - 1.0))
-
-        self.apply(self._init_weights)
-        small_std = math.sqrt(1e-4 / prev)
-        with torch.no_grad():
-            nn.init.normal_(
-                self.mu_head.weight,
-                mean=0.0,
-                std=small_std
-            )
-            nn.init.zeros_(self.mu_head.bias)
-            nn.init.normal_(
-                self.log_sigma_head.weight,
-                mean=0.0,
-                std=small_std,
-            )
-            nn.init.zeros_(self.log_sigma_head.bias)
-            #self.log_sigma_head.bias.fill_(self._softplus_bias)
-
-    @staticmethod
-    def _init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, x: torch.Tensor) -> dist.Independent:
-        logits = self.net(x)
-        mu = self.action_low + (self.action_high - self.action_low) * torch.sigmoid(self.mu_head(logits))
-        #sigma = F.softplus(self.log_sigma_head(logits)) + self.min_scale
-        
-        raw_scale = self.log_sigma_head(logits)
-        softplus_zero = F.softplus(
-        torch.zeros((), dtype=raw_scale.dtype, device=raw_scale.device)
-        )
-        sigma = (
-            F.softplus(raw_scale)
-            * self.init_scale
-            / softplus_zero
-            + self.min_scale
-        )
-        return dist.Independent(dist.Normal(mu, sigma), 1)
 def variance_scaling_init_(
     tensor: torch.Tensor,
     scale: float = 1.0,
@@ -492,8 +424,7 @@ class MPO:
         self.keys_agent_vars = [
             "critic_loss","policy_loss","dual_alpha_mean","dual_alpha_stddev",
             "dual_temperature","loss_alpha","loss_temperature","loss_policy_cross_entropy",
-            "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","kl_mean_rel_min",
-            "kl_mean_rel_max","kl_stddev_rel_min","kl_stddev_rel_max","q_min",
+            "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","q_min",
             "q_max","pi_stddev_min","pi_stddev_max","pi_stddev_cond","utd",
             "SPS","average_reward_per_second","reward"]
 
@@ -502,8 +433,6 @@ class MPO:
                 [
                     f"dual_alpha_mean_{idx}",
                     f"dual_alpha_stddev_{idx}",
-                    f"kl_mean_rel_{idx}",
-                    f"kl_stddev_rel_{idx}",
                     f"pi_stddev_{idx}",
                 ]
             )
@@ -829,10 +758,10 @@ class MPO:
             "kl_stddev_rel": (kl_stddev.detach().mean() / self._epsilon_stddev).item(),
 
             # Per-dimension constraint range.
-            "kl_mean_rel_min": (mean_kl_mean_per_dim.detach().min() / self._epsilon_mean).item(),
-            "kl_mean_rel_max": (mean_kl_mean_per_dim.detach().max() / self._epsilon_mean).item(),
-            "kl_stddev_rel_min": (mean_kl_stddev_per_dim.detach().min()/ self._epsilon_stddev).item(),
-            "kl_stddev_rel_max": (mean_kl_stddev_per_dim.detach().max()/ self._epsilon_stddev).item(),
+            # "kl_mean_rel_min": (mean_kl_mean_per_dim.detach().min() / self._epsilon_mean).item(),
+            # "kl_mean_rel_max": (mean_kl_mean_per_dim.detach().max() / self._epsilon_mean).item(),
+            # "kl_stddev_rel_min": (mean_kl_stddev_per_dim.detach().min()/ self._epsilon_stddev).item(),
+            # "kl_stddev_rel_max": (mean_kl_stddev_per_dim.detach().max()/ self._epsilon_stddev).item(),
 
             # Q-values: min/max over actions for each state, then average states.
             "q_min": (q_values.detach().min(dim=0).values.mean()).item(),
@@ -857,13 +786,6 @@ class MPO:
             policy_stats[f"dual_alpha_stddev_{j}"] = (
                 alpha_stddev[j].detach().item()
             )
-            policy_stats[f"kl_mean_rel_{j}"] = (
-                mean_kl_mean_per_dim[j].detach() / self._epsilon_mean
-            ).item()
-            policy_stats[f"kl_stddev_rel_{j}"] = (
-                mean_kl_stddev_per_dim[j].detach()
-                / self._epsilon_stddev
-            ).item()
             policy_stats[f"pi_stddev_{j}"] = (
                 pi_stddev[:, j].detach().mean().item()
             )
@@ -954,10 +876,6 @@ class MPO:
                 "kl_q_rel": metrics.get("kl_q_rel"),
                 "kl_mean_rel": metrics.get("kl_mean_rel"),
                 "kl_stddev_rel": metrics.get("kl_stddev_rel"),
-                "kl_mean_rel_min": metrics.get("kl_mean_rel_min"),
-                "kl_mean_rel_max": metrics.get("kl_mean_rel_max"),
-                "kl_stddev_rel_min": metrics.get("kl_stddev_rel_min"),
-                "kl_stddev_rel_max": metrics.get("kl_stddev_rel_max"),
                 "q_min": metrics.get("q_min"),
                 "q_max": metrics.get("q_max"),
                 "pi_stddev_min": metrics.get("pi_stddev_min"),
@@ -971,8 +889,6 @@ class MPO:
             for idx in range(self.act_dim):
                 agent_vars_row[f"dual_alpha_mean_{idx}"] = metrics.get(f"dual_alpha_mean_{idx}")
                 agent_vars_row[f"dual_alpha_stddev_{idx}"] = metrics.get(f"dual_alpha_stddev_{idx}")
-                agent_vars_row[f"kl_mean_rel_{idx}"] = metrics.get(f"kl_mean_rel_{idx}")
-                agent_vars_row[f"kl_stddev_rel_{idx}"] = metrics.get(f"kl_stddev_rel_{idx}")
                 agent_vars_row[f"pi_stddev_{idx}"] = metrics.get(f"pi_stddev_{idx}")
             
             self.agent_vars_buffer.append(agent_vars_row)
@@ -1016,24 +932,13 @@ class MPO:
             "dual_optimizer": self.dual_optimizer.state_dict(),
 
             "log_eta": self.log_eta.detach().cpu().clone(),
-            "log_alpha_mean": (
-                self.log_alpha_mean.detach().cpu().clone()
-            ),
-            "log_alpha_stddev": (
-                self.log_alpha_stddev.detach().cpu().clone()
-            ),
+            "log_alpha_mean": (self.log_alpha_mean.detach().cpu().clone()),
+            "log_alpha_stddev": (self.log_alpha_stddev.detach().cpu().clone()),
             "log_penalty_eta": (self.log_penalty_eta.detach().cpu().clone()),
-
             "global_step": self.global_step,
             "learner_step": self.learner_step,
-
-            # Optional, but useful for checking continued-run consistency.
-            "target_policy_update_period": (
-                self.target_policy_update_period
-            ),
-            "target_critic_update_period": (
-                self.target_critic_update_period
-            ),
+            "target_policy_update_period": (self.target_policy_update_period),
+            "target_critic_update_period": (self.target_critic_update_period),
         }
         torch.save(checkpoint, os.path.join(self.weights_folder, f"checkpoint_{self.global_step}.pth"))
         # if global_step % self.args.save_every_n_steps == 0:
