@@ -606,8 +606,6 @@ class MPO:
 
             #the collapsed n-step discounted return
             r_t = data.rewards.squeeze(-1)
-            # bootstrapping coefficient
-            discount_t = self.args.gamma * data.discounts
             
             target_policy = self.actor_target.forward(s_t)
             # Shape: (N, B, D)
@@ -637,6 +635,7 @@ class MPO:
         online_policy = self.actor.forward(s_t)
         online_q = self.critic(s_tm1, a_tm1).squeeze(-1)
 
+        # bootstrapping coefficient
         pcont_t = (self.args.gamma * data.discounts).squeeze(-1)
         
         critic_loss, target, td_error = td_learning(online_q, r_t, pcont_t, averaged_q_t)
@@ -644,7 +643,6 @@ class MPO:
         scalar_dtype = sampled_q_t.dtype
         dual_variable_shape = D
 
-        # Project dual variables to ensure they stay positive.
        
         with torch.no_grad():
             self.log_eta.clamp_(min=-18.0)
@@ -652,7 +650,7 @@ class MPO:
             self.log_alpha_stddev.clamp_(min=-18.0)
 
         # Transform dual variables from log-space.
-        # using softplus instead of exponential for numerical stability.
+        # using softplus instead of exponential for numerical stability
         temperature = F.softplus(self.log_eta) + _MPO_FLOAT_EPSILON
         alpha_mean = F.softplus(self.log_alpha_mean) + _MPO_FLOAT_EPSILON
         alpha_stddev = F.softplus(self.log_alpha_stddev) + _MPO_FLOAT_EPSILON
@@ -669,7 +667,7 @@ class MPO:
         normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
             q_values, self._epsilon, temperature)
         
-        # Only needed for diagnostics: Compute estimated actualized KL between the
+        # Only for diagnostics: Compute estimated actualized KL between the
         # non-parametric and current target policies. 
         kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
             normalized_weights)
@@ -680,8 +678,8 @@ class MPO:
                 self.log_penalty_eta.clamp_(min=-18.0)
             penalty_temperature = F.softplus(self.log_penalty_eta) + _MPO_FLOAT_EPSILON
            
-            # Compute action penalization cost.
-            # Note: the cost is zero in [-1, 1] and quadratic beyond.
+            # Compute action penalization cost
+            # the cost is zero in the specified action range (but NOT quadratic beyond)
             diff_out_of_bound = sampled_actions - torch.clamp(sampled_actions,self.actor_target.action_low,self.actor_target.action_high)
             
             cost_out_of_bound = -torch.linalg.vector_norm(diff_out_of_bound, dim=-1)
@@ -741,7 +739,7 @@ class MPO:
             "dual_alpha_stddev": alpha_stddev.detach().mean().item(),
             "dual_temperature": temperature.detach().mean().item(),
 
-            # ACME's loss_policy statistic is the complete MPO loss.
+            # ACME's loss_policy statistic is the complete MPO loss
             "total_mpo_loss": total_mpo_loss.detach().mean().item(),
             "loss_alpha": (
                 loss_alpha_mean.detach() + loss_alpha_stddev.detach()).mean().item(),
@@ -749,7 +747,7 @@ class MPO:
             "loss_policy_cross_entropy": loss_policy.detach().mean().item(),
             "loss_kl_penalty": loss_kl_penalty.detach().mean().item(),
 
-            # Relative KL measurements.
+            # Relative KL measurements
             "kl_q_rel": (kl_nonparametric.detach().mean() / self._epsilon).item(),
             "kl_mean_rel": (kl_mean.detach().mean() / self._epsilon_mean).item(),
             "kl_stddev_rel": (kl_stddev.detach().mean() / self._epsilon_stddev).item(),
@@ -759,7 +757,7 @@ class MPO:
 
             "q_max": (q_values.detach().max(dim=0).values.mean()).item(),
 
-            # Policy exploration.
+            # Policy exploration
             "pi_stddev_min": pi_stddev_min_per_state.detach().mean().item(),
             "pi_stddev_max": pi_stddev_max_per_state.detach().mean().item(),
 
@@ -782,7 +780,6 @@ class MPO:
             )
 
         # Compute gradients 
-
         self.critic_optimizer.zero_grad()
         self.actor_optimizer.zero_grad()
         self.dual_optimizer.zero_grad()
@@ -894,22 +891,7 @@ class MPO:
                 self.writer_agent_vars.writerow(row)
             self.csv_file_agent_vars.flush()
             self.agent_vars_buffer = []
-    def aggregation_operator(self, state, action, critics, mode='mean', beta=1.0, subset_size=2, subset_idx=None):
-        q_values = torch.stack([c(state, action) for c in critics], dim=0)
-        if mode == 'mean':
-            return q_values.mean(dim=0)
-        elif mode == 'min_subset':
-            if subset_idx is None:
-                subset_idx = torch.randperm(q_values.shape[0], device=self.device)[:subset_size]
-            return q_values[subset_idx].min(dim=0).values
-        elif mode == 'LCB':
-            return q_values.mean(dim=0) - beta * (q_values.std(dim=0) + 1e-6)
-        elif mode == 'UCB':
-            return q_values.mean(dim=0) + beta * (q_values.std(dim=0) + 1e-6)
-        elif mode == 'median':
-            return q_values.median(dim=0).values
-        else:
-            raise ValueError(f"Unknown aggregation mode: {mode}")
+    
     def save_checkpoint(self):
         checkpoint_step = self.global_step
         checkpoint = {
