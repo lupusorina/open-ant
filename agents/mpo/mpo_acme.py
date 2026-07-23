@@ -295,7 +295,7 @@ class MPO:
         self.learner_step += 1
 
         with torch.no_grad():
-            #1. sample 1 replay batch
+            # 1. sample 1 replay batch
             data = self.rb.sample_nstep(
                 batch_size=self.batch_size,
                 n_step=self.trajectory_length,
@@ -303,7 +303,7 @@ class MPO:
             )
             B = self.batch_size
             # the same samples are used to average the target categorical 
-            # critic distirbutions & obtain scalar Q vals for MPO.
+            # critic distributions & obtain scalar Q vals for MPO.
             N = self.args.sample_action_num
             D = self.act_dim
 
@@ -344,12 +344,13 @@ class MPO:
         # bootstrapping coefficient
         pcont_t = (self.args.gamma * data.discounts).squeeze(-1)
         
-        critic_loss, target, td_error = td_learning(online_q, r_t, pcont_t, averaged_q_t)
-        critic_loss = critic_loss.mean()
+        # TD loss: 0.5 * (target - online_q)^2, target = r_t + pcont_t * averaged_q_t
+        target = (r_t + pcont_t * averaged_q_t).detach()
+        td_error = target - online_q
+        critic_loss = (0.5 * td_error.square()).mean()
         scalar_dtype = sampled_q_t.dtype
         dual_variable_shape = D
 
-       
         with torch.no_grad():
             self.log_eta.clamp_(min=-18.0)
             self.log_alpha_mean.clamp_(min=-18.0)
@@ -403,7 +404,7 @@ class MPO:
             loss_temperature += loss_penalty_temperature  # pyrefly: ignore[unsupported-operation]
     
         # Decompose the online policy into fixed-mean & fixed-stddev distributions
-        #  https://arxiv.org/pdf/1812.02256.pdf.
+        # https://arxiv.org/pdf/1812.02256.pdf.
         fixed_stddev_distribution = dist.Independent(dist.Normal(online_mu, target_sigma), 1)
         fixed_mean_distribution = dist.Independent(dist.Normal(target_mu, online_sigma), 1)
 
@@ -425,9 +426,9 @@ class MPO:
             kl_stddev, alpha_stddev, self._epsilon_stddev)
         
         # Combine losses.
-        loss_policy = loss_policy_mean + loss_policy_stddev  # pyrefly: ignore[unsupported-operation]
-        loss_kl_penalty = loss_kl_mean + loss_kl_stddev  # pyrefly: ignore[unsupported-operation]
-        loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature  # pyrefly: ignore[unsupported-operation]
+        loss_policy = loss_policy_mean + loss_policy_stddev
+        loss_kl_penalty = loss_kl_mean + loss_kl_stddev
+        loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature
         total_mpo_loss = (loss_policy + loss_kl_penalty + loss_dual)
             # DO i need to do requires grad=True here or anywhere else..
         # critic_trainable_variables = self.__critic_network.trainable_variables
@@ -792,17 +793,6 @@ def compute_nonparametric_kl_from_normalized_weights(
         num_actions * normalized_weights + _MPO_FLOAT_EPSILON)
     # Return the expectation with respect to the non-parametric policy.
     return torch.sum(normalized_weights * integrand,dim=0,)
-
-def td_learning(v_tm1, r_t, pcont_t, v_t):
-    """ The TD loss is `0.5` times the squared difference between `v_tm1` and
-    the target `r_t + pcont_t * v_t`.
-    See (https://link.springer.com/article/10.1023/A:1022633531479).
-    """
-    target = (r_t + pcont_t * v_t).detach()
-    td_error = target - v_tm1
-    loss = 0.5 * td_error.square()
-
-    return loss, target, td_error
 
 def parse_args():
     parser = argparse.ArgumentParser()
