@@ -124,8 +124,6 @@ class MPO:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.policy_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.q_lr)
 
-        self.policy_learning_starts = args.policy_learning_starts
-
         self._init_log_eta = args.init_log_temperature
         self._init_log_alpha_mean = args.init_log_alpha_mean
         self._init_log_alpha_stddev = args.init_log_alpha_stddev
@@ -341,9 +339,7 @@ class MPO:
             if (self.learner_step % self.target_critic_update_period == 0):
                 self.target_critic.load_state_dict(self.critic.state_dict())
         self.learner_step += 1
-        
-        if self.global_step >= self.args.learning_starts + self.policy_learning_starts:
-            self.args.decouple_q_learning = False
+
         with torch.no_grad():
             #1. sample 1 replay batch
             data = self.rb.sample_nstep(
@@ -905,11 +901,6 @@ def parse_args():
     parser.add_argument("--utd", type=int, default=32)
     parser.add_argument("--td_horizon", type=int, default=5,
                         help="number of steps collapsed into each replay transition")
-    # this decouple q learning currently doesn't work. but training seems fine regardless
-    # parser.add_argument("--decouple_q_learning", action=argparse.BooleanOptionalAction, default=True,
-    #                     help="use --decouple_q_learning or --no-decouple_q_learning")
-    parser.add_argument("--policy_learning_starts", type=int, default=500,
-                        help="steps of Q-only warmup after learning_starts when --decouple_q_learning is set")
     
     parser.add_argument("--checkpoint_step",type=int,default=None,
                             help="Specific checkpoint step to load, e.g. 95000. If omitted, loads latest.")
@@ -1032,7 +1023,6 @@ def main():
     set_seed(args.seed,deterministic=args.torch_deterministic)
     seed = args.seed
     args.learning_starts = args.learning_starts//args.num_envs #integer div takes floor
-    args.policy_learning_starts = args.policy_learning_starts//args.num_envs
 
     date = datetime.now().strftime("%Y%m%d-%H%M%S")
     disk_folder = ''
