@@ -1053,6 +1053,10 @@ def main():
     raw_env, envs = make_ant_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
     agent = MPO(args=args,envs=envs,disk_folder=disk_folder,run_name=run_name,runs_directory=args.runs_directory)
     
+    save_git_info(
+        os.path.join(args.runs_directory, run_name),
+        os.path.dirname(__file__),
+    )
     if args.weights_path is not None:
         agent.load_checkpoint(args.weights_path,
             checkpoint_step=args.checkpoint_step,
