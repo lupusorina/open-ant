@@ -1,0 +1,241 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Callable, Sequence
+import numpy as np
+import torch.distributions as dist
+from torch.distributions import Independent, Normal, MultivariateNormal
+
+def variance_scaling_init_(
+    tensor: torch.Tensor,
+    scale: float = 1.0,
+    mode: str = "fan_in",
+    distribution: str = "truncated_normal"
+) -> torch.Tensor:
+    distribution = distribution.lower()
+    if distribution not in {"truncated_normal","untruncated_normal","uniform"}:
+        raise ValueError("distribution must be 'truncated_normal','untruncated_normal', or 'uniform'")
+    if mode not in {"fan_in", "fan_out", "fan_avg"}:
+        raise ValueError("mode must be 'fan_in', 'fan_out', or 'fan_avg'")
+    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(tensor)
+    if mode == "fan_in":
+        n = fan_in
+    elif mode == "fan_out":
+        n = fan_out
+    else:
+        n = (fan_in + fan_out) / 2.0
+    variance = scale / max(1.0, n)
+    with torch.no_grad():
+        if distribution == "truncated_normal":
+            correction = 0.87962566103423978
+            std = math.sqrt(variance) / correction
+            return nn.init.trunc_normal_(tensor,mean=0.0,std=std,a=-2.0 * std,b=2.0 * std)
+        if distribution == "untruncated_normal":
+            std = math.sqrt(variance)
+            return tensor.normal_(mean=0.0, std=std)
+        if distribution == "uniform":
+            limit = math.sqrt(3.0 * variance)
+            return tensor.uniform_(-limit, limit)
+
+class NearZeroInitializedLinear(nn.Linear):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        scale: float = 1e-4,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__(
+            in_features=input_size,
+            out_features=output_size,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Overrides nn.Linear's default initialization.
+        variance_scaling_init_(
+            self.weight,
+            scale=scale,
+            mode="fan_in",
+            distribution="truncated_normal",
+        )
+
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+    
+
+class AcmeLayerNormMLP(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        layer_sizes: Sequence[int],
+        w_init: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        activation: type[nn.Module] = nn.ELU,
+        activate_final: bool = False,
+    ) -> None:
+        super().__init__()
+
+        if len(layer_sizes) == 0:
+            raise ValueError("layer_sizes must contain at least one size")
+
+        self._w_init = w_init
+        # self._activate_final = activate_final KEEP OR DELETE THSI LINE?
+
+        layers: list[nn.Module] = []
+        first_linear = nn.Linear(in_features=input_size,out_features=layer_sizes[0])
+        self._initialize_linear(first_linear)
+
+        layers.extend([
+            first_linear,
+            nn.LayerNorm(
+                # shape of final dimension being normalized is 512 - output dim of the 1st linear layer
+                normalized_shape=layer_sizes[0],
+                elementwise_affine=True,
+            ),nn.Tanh()])
+        previous_size = layer_sizes[0]
+
+        for index, output_size in enumerate(layer_sizes[1:]):
+            linear = nn.Linear(in_features=previous_size,out_features=output_size)
+            self._initialize_linear(linear)
+            layers.append(linear)
+            is_final_layer = (index == len(layer_sizes[1:]) - 1)
+            
+            if not is_final_layer or activate_final:
+                layers.append(activation())
+            previous_size = output_size
+        self._network = nn.Sequential(*layers)
+
+    def _initialize_linear(self, linear: nn.Linear) -> None:
+        if self._w_init is None:
+            variance_scaling_init_(linear.weight,scale=0.333,mode="fan_out",distribution="uniform")
+        else:
+            self._w_init(linear.weight)
+        nn.init.zeros_(linear.bias)
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self._network(observations)
+
+class MultivariateNormalDiagHead(nn.Module):
+    """Module that produces a multivariate normal distribution."""
+
+    def __init__(
+        self,
+        input_size: int,
+        num_dimensions: int,
+        init_scale: float = 0.3,
+        min_scale: float = 1e-6,
+        tanh_mean: bool = False,
+        fixed_scale: bool = False,
+        use_independent: bool = True,
+    ) -> None:
+        super().__init__()
+        self._init_scale = float(init_scale)
+        self._min_scale = float(min_scale)
+        self._fixed_scale = fixed_scale
+        self._use_independent = use_independent
+
+        self._mean_layer = nn.Linear(in_features=input_size, out_features=num_dimensions)
+        self._initialize_linear(self._mean_layer)
+        if not fixed_scale:
+            self._scale_layer = nn.Linear(in_features=input_size, out_features=num_dimensions)
+            self._initialize_linear(self._scale_layer)
+
+    @staticmethod
+    def _initialize_linear(linear: nn.Linear) -> None:
+        variance_scaling_init_(linear.weight,scale=1e-4,mode="fan_in",distribution="truncated_normal")
+        nn.init.zeros_(linear.bias)
+    def forward(self, inputs: torch.Tensor) -> dist.Distribution:
+        mean = self._mean_layer(inputs)
+        if self._fixed_scale:
+            scale = torch.full_like(mean, self._init_scale)
+        else:
+            raw_scale = self._scale_layer(inputs)
+            softplus_zero = F.softplus(torch.zeros((), dtype=raw_scale.dtype, device=raw_scale.device))
+            scale = (
+                F.softplus(raw_scale)
+                * self._init_scale
+                / softplus_zero
+                + self._min_scale
+            )
+        if self._use_independent:
+            return dist.Independent(dist.Normal(loc=mean, scale=scale),reinterpreted_batch_ndims=1)
+
+        return dist.MultivariateNormal(loc=mean,scale_tril=torch.diag_embed(scale))
+  
+class AcmeActor(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        act_low: np.ndarray,
+        act_high: np.ndarray,
+        layer_sizes: Sequence[int] = (256, 256, 256),
+        init_scale: float = 0.3,   
+        min_scale: float = 1e-6,    # originally 1e-6
+    ) -> None:
+        super().__init__()
+        if len(layer_sizes) == 0:
+            raise ValueError("layer_sizes must contain at least one size")
+        self.register_buffer("action_low",torch.as_tensor(act_low, dtype=torch.float32))
+        self.register_buffer("action_high",torch.as_tensor(act_high, dtype=torch.float32))
+        
+        self.torso = AcmeLayerNormMLP(
+            input_size=obs_dim,
+            layer_sizes=layer_sizes,
+            activate_final=True,
+        )
+        self.policy_head = MultivariateNormalDiagHead(
+            input_size=layer_sizes[-1],
+            num_dimensions=act_dim,
+            init_scale=init_scale,
+            min_scale=min_scale,
+            fixed_scale=False,
+            use_independent=True,
+        )
+    def forward(self, observations: torch.Tensor) -> dist.Distribution:
+        observations = observations.reshape(observations.shape[0],-1)
+        features = self.torso(observations)
+        return self.policy_head(features)
+
+class ScalarAcmeCritic(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        layer_sizes: Sequence[int] = (512, 512, 256),
+    ) -> None:
+        super().__init__()
+
+        self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
+        self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
+        
+        self.torso = AcmeLayerNormMLP(
+            input_size=obs_dim + act_dim,
+            layer_sizes=layer_sizes,
+            activate_final=True)
+
+        self.value_head = NearZeroInitializedLinear(
+            input_size=layer_sizes[-1],
+            output_size=1,
+            scale=1e-4)
+
+    def forward(self,observation: torch.Tensor,action: torch.Tensor) -> torch.Tensor:
+        # Clip action
+        observation = observation.reshape(observation.shape[0],-1)
+        action = action.reshape(action.shape[0],-1)
+
+        action = torch.clamp(action,self.action_low,self.action_high)
+        action = action.to(dtype=observation.dtype,device=observation.device)
+        inputs = torch.cat([observation, action],dim=-1)
+
+        # LayerNormMLP and value head
+        torso_output = self.torso(inputs)  # (B, 256)
+        value = self.value_head(torso_output)
+        return value
