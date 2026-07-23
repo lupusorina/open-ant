@@ -948,11 +948,6 @@ def parse_args():
     parser.add_argument("--policy_init_scale", type=float, default=0.7)
     parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
-    # parser.add_argument("--policy_torso_init_scale", type=float, default=0.333)
-    # parser.add_argument("--policy_head_init_scale", type=float, default=1e-4)
-
-    # parser.add_argument("--critic_torso_init_scale", type=float, default=0.333)
-    # parser.add_argument("--critic_head_init_scale", type=float, default=1e-4)
     return parser.parse_args()
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
