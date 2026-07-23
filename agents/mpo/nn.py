@@ -144,7 +144,7 @@ class MultivariateNormalDiagHead(nn.Module):
         if not fixed_scale:
             self._scale_layer = nn.Linear(in_features=input_size, out_features=num_dimensions)
             self._initialize_linear(self._scale_layer)
-
+    
     @staticmethod
     def _initialize_linear(linear: nn.Linear) -> None:
         variance_scaling_init_(linear.weight,scale=1e-4,mode="fan_in",distribution="truncated_normal")
@@ -166,6 +166,75 @@ class MultivariateNormalDiagHead(nn.Module):
             return dist.Independent(dist.Normal(loc=mean, scale=scale),reinterpreted_batch_ndims=1)
 
         return dist.MultivariateNormal(loc=mean,scale_tril=torch.diag_embed(scale))
+
+class DiscreteValuedDistribution:
+    # categorical distribution. values = fixed return values / atoms ranging from vmin to vmax
+    # logits = raw neural net output for each atom
+    def __init__(self, values: torch.Tensor, logits: torch.Tensor):
+        self.values = values
+        self.logits = logits
+
+# softmax convert logits into probabilities
+    @property
+    def probs(self) -> torch.Tensor:
+        return torch.softmax(self.logits, dim=-1)
+
+    # mean of the distrib = the expected Q value. Q(s, a)= E[Z(s,a)]
+    def mean(self) -> torch.Tensor:
+        return (self.probs * self.values).sum(dim=-1, keepdim=True)
+
+class DiscreteValuedHead(nn.Module):
+    ''' maps hidden features to logits over a fixed support of return atoms,
+    then returns a discretevalueddistribution '''
+    def __init__(
+        self,
+        input_size: int,
+        vmin: float,
+        vmax: float,
+        num_atoms: int,
+        w_init: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        b_init: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    ) -> None:
+        super().__init__()
+
+        if vmax <= vmin:
+            raise ValueError(f"vmax must be greater than vmin, got vmin={vmin}, vmax={vmax}")
+
+        self.num_atoms = num_atoms
+        self.register_buffer("atom_values",torch.linspace(vmin,vmax,num_atoms,dtype=torch.float32))
+        
+        self._distributional_layer = nn.Linear(in_features=input_size,out_features=num_atoms)
+        # edit the weights and biases to match snt.Linear's default: bias = 0. 
+        # weight = truncated random normal values with stddev = 1 / sqrt(input-feature-size)
+        # truncated at: no more than 2 stddevs from the mean.
+        with torch.no_grad():
+            if w_init is None:
+                std = 1.0 / math.sqrt(input_size)
+                nn.init.trunc_normal_(
+                    self._distributional_layer.weight,
+                    mean=0.0,
+                    std=std,
+                    a=-2.0 * std,
+                    b=2.0 * std,
+                )
+            else:
+                w_init(self._distributional_layer.weight)
+
+            if self._distributional_layer.bias is not None:
+                if b_init is None:
+                    nn.init.zeros_(self._distributional_layer.bias)
+                else:
+                    b_init(self._distributional_layer.bias)
+
+    def forward(self,inputs: torch.Tensor) -> DiscreteValuedDistribution:
+        # Input:(B, input_size)
+        # Output logits:(B, num_atoms)
+        logits = self._distributional_layer(inputs)
+
+        # Cast support to match logits, equivalent to:
+        # tf.cast(self._values, logits.dtype)
+        atom_values = self.atom_values.to(dtype=logits.dtype,device=logits.device)
+        return DiscreteValuedDistribution(values=atom_values,logits=logits)
   
 class AcmeActor(nn.Module):
     def __init__(
@@ -239,3 +308,48 @@ class ScalarAcmeCritic(nn.Module):
         torso_output = self.torso(inputs)  # (B, 256)
         value = self.value_head(torso_output)
         return value
+
+class AcmeCritic(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        layer_sizes: Sequence[int] = (512, 512, 256),
+        vmin: float = -500.0,
+        vmax: float = 20.0,
+        num_atoms: int = 101,
+    ) -> None:
+        super().__init__()
+
+        self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
+        self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
+        
+        self.torso = AcmeLayerNormMLP(
+            input_size=obs_dim + act_dim,
+            layer_sizes=layer_sizes,
+            activate_final=True)
+
+        self.distributional_head = DiscreteValuedHead(
+            input_size=layer_sizes[-1],
+            vmin=vmin,
+            vmax=vmax,
+            num_atoms=num_atoms)
+    
+    @property
+    def atom_values(self) -> torch.Tensor:
+        return self.distributional_head.atom_values
+    def forward(self,observation: torch.Tensor,action: torch.Tensor) -> DiscreteValuedDistribution:
+        # Clip action
+        observation = observation.reshape(observation.shape[0],-1)
+        action = action.reshape(action.shape[0],-1)
+
+        action = torch.clamp(action,self.action_low,self.action_high)
+        action = action.to(dtype=observation.dtype,device=observation.device)
+        inputs = torch.cat([observation, action],dim=-1)
+
+        # LayerNormMLP and distribution head
+        torso_output = self.torso(inputs)  # (B, 256)
+        distribution = self.distributional_head(torso_output)
+        return distribution
