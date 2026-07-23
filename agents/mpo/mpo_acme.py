@@ -227,9 +227,8 @@ class MPO:
                 d = self.actor.forward(self.obs)
                 action = d.mean if evaluate else d.sample()
                 actions = action
-                #actions = torch.clamp(action, self.actor.action_low, self.actor.action_high) #mjx clipos internally but overflowed action stored in buffer --> inconsistency
-                actions = actions.squeeze(1)     # (n_envs, act_dim)
-                
+                actions = actions.squeeze(1) # (n_envs, act_dim)
+
                 log_probs = d.log_prob(actions).unsqueeze(-1)
                 self.last_actions = actions
                 self.last_log_probs = log_probs
@@ -260,7 +259,7 @@ class MPO:
             truncated=truncations,
             valid=valid,
         )
-        #___________________________________________________________________________________________________
+
         self.global_step += 1
         self.obs = next_obs
         self.pending_autoreset = boundaries.detach().clone()
@@ -285,51 +284,6 @@ class MPO:
     def agent_step_eval(self, next_obs):
         self.global_step += 1
         self.obs = next_obs
-
-    def agent_step_no_learn(self, next_obs, actions, rewards, terminations, truncations, infos):
-        """Buffer add + step count only. Call learn_step() from a separate timer."""
-        #___________________________________________________________________________________________________
-        terminations = terminations.bool()
-        truncations = truncations.bool()
-
-        boundaries = terminations | truncations
-
-        if "autoreset" in infos:
-            autoreset_now = torch.as_tensor(infos["autoreset"],dtype=torch.bool,device=self.device)
-        else:
-            autoreset_now = self.pending_autoreset
-        #  autoreset_now indicate whether the PREV transition is a boundary
-        # autoreset_now = 0, means the previous transition was NOT boundary / ending,
-        # so that means this current transition is valid entry in replay buffer
-        # if autoreset_now = 1, means previous transition was the end of an episode, 
-        # so this current transition is going from "ending episode" to "reset episode"
-        # this is not a valid transition, so mark it.
-        valid = ~autoreset_now
-
-        self.rb.add(
-            obs=self.obs,
-            next_obs=next_obs,
-            action=actions,
-            reward=rewards,
-            terminated=terminations,
-            truncated=truncations,
-            valid=valid,
-        )
-        self.pending_autoreset = boundaries.detach().clone()
-        self.global_step += 1
-        self.obs = next_obs
-    
-    def learn_step(self):
-        """Run one round of UTD critic/actor updates. Returns metrics dict or None."""
-        if self.global_step <= self.args.learning_starts:
-            return None
-        if self.rb.size() < self.batch_size:
-            return None
-        results = [self._learn() for _ in range(self.args.utd)]
-        keys = results[0].keys()
-        metrics = {k: sum(r[k] for r in results) / len(results) for k in keys}
-        metrics['utd'] = self.args.utd
-        return metrics
 
     def _learn(self):
         with torch.no_grad():
@@ -453,7 +407,7 @@ class MPO:
         fixed_stddev_distribution = dist.Independent(dist.Normal(online_mu, target_sigma), 1)
         fixed_mean_distribution = dist.Independent(dist.Normal(target_mu, online_sigma), 1)
 
-            # Compute the decomposed policy losses.
+        # Compute the decomposed policy losses.
         loss_policy_mean = compute_cross_entropy_loss(
             sampled_actions, normalized_weights, fixed_stddev_distribution)
         loss_policy_stddev = compute_cross_entropy_loss(
