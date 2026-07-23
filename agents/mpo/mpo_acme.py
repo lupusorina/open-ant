@@ -881,7 +881,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
-    parser.add_argument("--samples_per_insert",type=float,default=512.0,
+    parser.add_argument("--samples_per_insert",type=float,default=1536.0,
                         help="Replay samples consumed per valid environment transition")
 
     parser.add_argument("--action_penalization",action=argparse.BooleanOptionalAction,default=True,
