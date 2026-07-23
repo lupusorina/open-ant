@@ -104,11 +104,11 @@ class MPO:
             layer_sizes=policy_layer_sizes,
             init_scale=args.policy_init_scale,
             min_scale=args.policy_min_scale,
-        ).to(self.device)
+        ).to(self.device) # q(a|s) in the main MPO paper.
         self.actor_target.load_state_dict(self.actor.state_dict())
         for p in self.actor_target.parameters():
             p.requires_grad = False
-        
+
         self.critic = ScalarAcmeCritic(
             obs_dim=self.obs_dim,
             act_dim=self.act_dim,
