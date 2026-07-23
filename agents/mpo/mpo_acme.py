@@ -73,6 +73,8 @@ class MPO:
         #Nvidia cuDNN library uses deterministic convolution algo; if false can use FFT based or Winograd convolutions; slower but mathematically more sound
         torch.backends.cudnn.deterministic = args.torch_deterministic 
         torch.backends.cudnn.benchmark = not args.torch_deterministic #if not deterministic, find and use fastest one
+        print(f"[√] Torch deterministic: {torch.backends.cudnn.deterministic}")
+        print(f"[√] Torch benchmark: {torch.backends.cudnn.benchmark}")
 
         policy_layer_sizes = tuple(args.policy_layer_sizes)
         critic_layer_sizes = tuple(args.critic_layer_sizes)
@@ -857,7 +859,7 @@ def parse_args():
     parser.add_argument("--exp_name", type=str, default="mpo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--torch_deterministic", type=bool, default=True)
+    parser.add_argument("--torch_deterministic", action="store_true", default=False)
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--capture_video", action="store_true")
     parser.add_argument("--eval", action="store_true", default=False)
