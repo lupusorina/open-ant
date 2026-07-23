@@ -811,7 +811,7 @@ def parse_args():
     parser.add_argument("--num_envs", type=int, default=1)
 
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=256)
 
     parser.add_argument("--log_interval", type=int, default=100,
                         help="env steps between TensorBoard scalar writes")
@@ -827,22 +827,20 @@ def parse_args():
                         help="actions sampled per state in E-step")
     # parser.add_argument("--mstep_iteration_num", type=int, default=4,
     #                     help="actor gradient steps per learn() call")
-    parser.add_argument("--dual_lr", type=float, default=1e-3)
+    parser.add_argument("--dual_lr", type=float, default=5e-3)
    
     parser.add_argument("--max_grad_norm", type=float, default=40.0)
 
-    parser.add_argument("--ensemble", type=int, default=1) #doesn't matter in this script
     # true learning start = learning start // num_envs (floor division)
     parser.add_argument("--learning_starts", type=int, default=200)
     parser.add_argument("--policy_lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=1e-3)
-    parser.add_argument("--gamma", type=float, default=0.92)
+    parser.add_argument("--gamma", type=float, default=0.99)
     # layer norm arg is only effective if old Actor class is used rather than AcmeActo
     parser.add_argument("--use_layer_norm", action=argparse.BooleanOptionalAction, default=True) 
 
     parser.add_argument("--policy_layer_sizes",type=int,nargs="+",default=[256, 256, 256])
-    parser.add_argument("--critic_layer_sizes",type=int,nargs="+",default=[512, 512, 256])
-    parser.add_argument("--utd", type=int, default=32)
+    parser.add_argument("--critic_layer_sizes",type=int,nargs="+",default=[256, 256, 256])
     parser.add_argument("--td_horizon", type=int, default=5,
                         help="number of steps collapsed into each replay transition")
     
@@ -871,7 +869,7 @@ def parse_args():
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
-    parser.add_argument("--samples_per_insert",type=float,default=1536.0,
+    parser.add_argument("--samples_per_insert",type=float,default=64.0,
                         help="Replay samples consumed per valid environment transition")
 
     parser.add_argument("--action_penalization",action=argparse.BooleanOptionalAction,default=True,
@@ -880,7 +878,7 @@ def parse_args():
                         help="KL constraint for action penalization")
 
     # actor and critic network initializations
-    parser.add_argument("--policy_init_scale", type=float, default=0.7)
+    parser.add_argument("--policy_init_scale", type=float, default=0.5)
     parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
     return parser.parse_args()
