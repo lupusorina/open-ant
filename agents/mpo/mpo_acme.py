@@ -149,11 +149,6 @@ class MPO:
             ],
             lr=args.dual_lr,
         )
-        # self.dual_temp_optimizer = optim.Adam([self.log_eta], lr=args.dual_lr)
-
-        # Scalar Lagrange multipliers for M-step KL constraints.
-
-        #self._uniform_log_prob = -float(np.sum(np.log(self.action_high - self.action_low)))
 
         self.rb = ReplayBuffer(
             args.buffer_size,
@@ -165,7 +160,6 @@ class MPO:
 
         self.batch_size = self.args.batch_size
         self.trajectory_length = self.args.td_horizon
-
 
         self.samples_per_insert = self.args.samples_per_insert
         self.learner_update_budget = 0.0
@@ -205,7 +199,6 @@ class MPO:
         self.info_log_buffer = []
         self.agent_vars_buffer = []
 
- 
         self._epsilon = args.epsilon_eta
         self._epsilon_mean = args.epsilon_mu_kl
         self._epsilon_stddev = args.epsilon_sigma_kl
@@ -219,8 +212,6 @@ class MPO:
     def _random_action(self):
         low, high = self.actor.action_low, self.actor.action_high
         rand_actions = low + (high - low) * torch.rand(self.envs.num_envs, self.act_dim, device=self.device)
-        # self.last_actions = rand_actions
-        # self.last_log_probs = torch.full((self.envs.num_envs, 1), self._uniform_log_prob,dtype=torch.float32, device=self.device)
         return rand_actions
     
     def get_action(self, obs, evaluate=False):
@@ -340,8 +331,6 @@ class MPO:
         metrics['utd'] = self.args.utd
         return metrics
 
- 
-
     def _learn(self):
         with torch.no_grad():
             if (self.learner_step % self.target_policy_update_period== 0):
@@ -373,17 +362,13 @@ class MPO:
             # here, the .next_obs being accessed is actually s_t+n
             s_t = data.next_observations
 
-            #the collapsed n-step discounted return
+            # the collapsed n-step discounted return
             r_t = data.rewards.squeeze(-1)
             
             target_policy = self.actor_target.forward(s_t)
             # Shape: (N, B, D)
             sampled_actions = target_policy.sample((N,))
-            # sampled_actions = torch.clamp(
-            #     sampled_actions,
-            #     self.actor_target.action_low,
-            #     self.actor_target.action_high,
-            # )
+
             tiled_states = (
                 s_t.unsqueeze(0)
                 .expand(N, -1, -1)
@@ -886,17 +871,9 @@ def parse_args():
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
     parser.add_argument("--batch_size", type=int, default=512)
 
-    # parser.add_argument("--vmin", type=float, default=-500,
-    #                 help="Minimum atom value for distributional critic")
-    # parser.add_argument("--vmax", type=float, default=20,
-    #                     help="Maximum atom value for distributional critic")
-    # parser.add_argument("--num_atoms", type=int, default=101,
-    #                     help="Number of categorical atoms for distributional critic")
-    # parser.add_argument("--critic_num_samples", type=int, default=32,
-    #                     help="Number of next-action samples used to build target critic distribution")
     parser.add_argument("--log_interval", type=int, default=100,
                         help="env steps between TensorBoard scalar writes")
-    #MPO
+    # MPO
     parser.add_argument("--epsilon_eta", type=float, default=1e-1,
                         help="epsilon for E-step temperature dual")
     parser.add_argument("--epsilon_mu_kl", type=float, default=2.5e-3,
