@@ -70,7 +70,7 @@ class MPO:
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
-        #Nvidia cuDNN library uses deterministic convolution algo; if false can use FFT based or Winograd convolutions; slower but mathematically more sound
+        # NVIDIA cuDNN library uses deterministic convolution algo; if false can use FFT based or Winograd convolutions; slower but mathematically more sound
         torch.backends.cudnn.deterministic = args.torch_deterministic 
         torch.backends.cudnn.benchmark = not args.torch_deterministic #if not deterministic, find and use fastest one
         print(f"[√] Torch deterministic: {torch.backends.cudnn.deterministic}")
