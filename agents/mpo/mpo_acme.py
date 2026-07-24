@@ -19,19 +19,18 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as dist
 
-from skrl.envs.wrappers.torch import wrap_env
 from skrl.utils import set_seed
 try:
     from .buffer_acme import NStepReplayBufferSamples, ReplayBuffer  # imported as package
 except ImportError:
     from buffer_acme import NStepReplayBufferSamples, ReplayBuffer   # run standalone
+try:
+    from .envs import is_gymnasium_env, make_envs
+except ImportError:
+    from envs import is_gymnasium_env, make_envs
 
-import gymnasium as gym
-from gymnasium.vector import AutoresetMode
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../sim')))
-from ant_mujoco import AntEnv
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../embodied_ant_env')))
-from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
+from embodied_ant_env import ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
 
@@ -186,7 +185,7 @@ class MPO:
             "dual_temperature","loss_alpha","loss_temperature","loss_policy_cross_entropy",
             "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","q_min",
             "q_max","pi_stddev_min","pi_stddev_max","pi_stddev_cond","utd",
-            "SPS","average_reward_per_second","reward"]
+            "SPS","average_reward_per_second","reward","mean_return"]
 
         for idx in range(self.act_dim):
             self.keys_agent_vars.extend(
@@ -207,6 +206,7 @@ class MPO:
         # when transitioning from terminal state to reset state - this is when pending_autoreset=1,
         # to inform agent to not use this transition during training.
         self.pending_autoreset = torch.zeros(self.envs.num_envs,dtype=torch.bool,device=self.device)
+        self._ep_returns = np.zeros(self.envs.num_envs, dtype=np.float64)
         print("Agent initialized and compiled")
     
     def _random_action(self):
@@ -235,6 +235,28 @@ class MPO:
                 return actions
         return self._random_action()
 
+    def _step_rewards_np(self, infos, rewards):
+        if "original_reward" in infos:
+            return np.asarray(infos["original_reward"], dtype=np.float64).reshape(-1)
+        if isinstance(rewards, torch.Tensor):
+            return rewards.detach().cpu().numpy().reshape(-1).astype(np.float64)
+        return np.asarray(rewards, dtype=np.float64).reshape(-1)
+
+    def _update_episode_returns(self, infos, rewards, boundaries, autoreset_now):
+        if self.reward_tracker is None:
+            return
+        step_rewards = self._step_rewards_np(infos, rewards)
+        done_np = boundaries.detach().cpu().numpy().reshape(-1).astype(bool)
+        autoreset_np = autoreset_now.detach().cpu().numpy().reshape(-1).astype(bool)
+        n = min(self.envs.num_envs, len(step_rewards))
+        for i in range(n):
+            if autoreset_np[i]:
+                self._ep_returns[i] = step_rewards[i]
+            else:
+                self._ep_returns[i] += step_rewards[i]
+                if done_np[i]:
+                    self.reward_tracker.record_episode_return(self._ep_returns[i])
+
     def agent_step(self, next_obs, actions, rewards, terminations, truncations, infos):
         terminations = terminations.bool()
         truncations = truncations.bool()
@@ -248,6 +270,8 @@ class MPO:
         else:
             autoreset_now = self.pending_autoreset
         valid = ~autoreset_now
+
+        self._update_episode_returns(infos, rewards, boundaries, autoreset_now)
 
         num_inserts = int(valid.sum().item())
         self.rb.add(
@@ -538,7 +562,11 @@ class MPO:
         if self.writer_info is None:
             return
 
-        self.reward_tracker.update(infos['original_reward'][0])
+        if "original_reward" in infos:
+            tracked_reward = infos["original_reward"][0]
+        else:
+            tracked_reward = float(rewards.reshape(-1)[0].item())
+        self.reward_tracker.update(tracked_reward)
         
         if global_step % self.args.log_every_n_steps != 0:
             return
@@ -579,6 +607,7 @@ class MPO:
                 "SPS": sps,
                 "average_reward_per_second": (self.reward_tracker.average_reward_per_second),
                 "reward": reward_value,
+                "mean_return": self.reward_tracker.mean_return,
             }
             for idx in range(self.act_dim):
                 agent_vars_row[f"dual_alpha_mean_{idx}"] = metrics.get(f"dual_alpha_mean_{idx}")
@@ -806,7 +835,13 @@ def parse_args():
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
     parser.add_argument("--log_every_n_steps", type=int, default=4000)
 
-    parser.add_argument("--env_id", type=str, default="EAnt")
+    parser.add_argument(
+        "--env_id",
+        type=str,
+        default="EAnt",
+        help="Embodied Ant id (EAnt / SimEmbodiedAnt / HwEmbodiedAnt) or Gymnasium "
+             "MuJoCo id (Hopper-v5, Walker2d-v5, Humanoid-v5, Ant-v5, ...)",
+    )
     parser.add_argument("--total_timesteps", type=int, default=60_000)
     parser.add_argument("--num_envs", type=int, default=1)
 
@@ -865,7 +900,12 @@ def parse_args():
                         choices=["forward", "back_and_forth"])
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3)
     parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3])
-    parser.add_argument("--reward_scale", type=float, default=100.0)
+    parser.add_argument(
+        "--reward_scale",
+        type=float,
+        default=None,
+        help="Reward multiplier (default: 100 for embodied Ant, 1 for Gymnasium envs)",
+    )
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
@@ -882,51 +922,6 @@ def parse_args():
     parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
     return parser.parse_args()
-
-def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
-    def make_env(seed, idx, capture_video, run_name):
-        def _init():
-            joint_config = {
-                'hip_zero': 0,
-                'knee_zero': -np.radians(50),
-                'hip_range': np.radians(30),
-                'knee_range': np.radians(20),
-            }
-            if args.hw_config is None:
-                env = AntEnv(
-                    control_dt=args.dt,
-                    render_mode=args.render_mode,
-                    terminate_on_upside_down=args.terminate_on_upside_down,
-                    task=task,
-                    joint_config=joint_config,
-                    model_path=os.path.join(os.path.dirname(__file__), args.model_path),
-                )
-            else:
-                with open(args.hw_config, 'r') as f:
-                    cfg = json.load(f)
-                env = make_ant_env(cfg, render_mode=args.render_mode,
-                                   dt=args.dt, joint_config=joint_config, task=task)
-            if capture_video and idx == 0:
-                env = gym.wrappers.RecordVideo(
-                    env,
-                    os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
-                    step_trigger=lambda x: x % args.save_every_n_steps == 0,
-                    video_length=args.save_every_n_steps,
-                )
-            env.action_space.seed(seed)
-            env = gym.wrappers.TransformReward(env, lambda r: r * args.reward_scale)
-            return env
-        return _init
-
-    env_raw = gym.vector.SyncVectorEnv(
-        [make_env(args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)],autoreset_mode=AutoresetMode.NEXT_STEP)
-    assert isinstance(env_raw.single_action_space, gym.spaces.Box), "[!] Only continuous action space is supported."
-    
-    # wrap the env using skrl, gymnasium
-    envs = wrap_env(env_raw, wrapper="gymnasium")
-    print(f"[√] Created environment with {envs.num_envs} environments.")
-    
-    return env_raw, envs
 
 def _try_run_git_command(args, cwd):
     try:
@@ -972,17 +967,19 @@ def main():
     run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
     os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
-    if args.task_type == "forward":
-        task = ForwardTask()
-    elif args.task_type == "back_and_forth":
-        RADIUS = args.radius_back_and_forth
-        ORIGIN = np.array(args.origin_back_and_forth)
-        task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
-        print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
-    else:
-        raise ValueError(f"Invalid task type: {args.task_type}")
+    task = None
+    if not is_gymnasium_env(args.env_id):
+        if args.task_type == "forward":
+            task = ForwardTask()
+        elif args.task_type == "back_and_forth":
+            RADIUS = args.radius_back_and_forth
+            ORIGIN = np.array(args.origin_back_and_forth)
+            task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
+            print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
+        else:
+            raise ValueError(f"Invalid task type: {args.task_type}")
 
-    raw_env, envs = make_ant_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
+    raw_env, envs = make_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
     agent = MPO(args=args,envs=envs,disk_folder=disk_folder,run_name=run_name,runs_directory=args.runs_directory)
     
     save_git_info(
