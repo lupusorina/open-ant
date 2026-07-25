@@ -980,6 +980,25 @@ def main():
             raise ValueError(f"Invalid task type: {args.task_type}")
 
     raw_env, envs = make_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
+    
+    model = raw_env.envs[0].unwrapped.model
+    print("\n========== LOADED MUJOCO MODEL ==========")
+    print("env_id:", args.env_id)
+    print("requested model_path:", args.model_path)
+    print("nbody:", model.nbody)
+    print("nu:", model.nu)
+    print("action space:", raw_env.single_action_space)
+    print("body masses:", model.body_mass)
+    print("geom friction:")
+    print(model.geom_friction)
+    print("actuator ctrlrange:")
+    print(model.actuator_ctrlrange)
+    print("actuator dyntype:")
+    print(model.actuator_dyntype)
+    print("first actuator dynprm:")
+    print(model.actuator_dynprm[:, 0])
+    print("=========================================\n")
+
     agent = MPO(args=args,envs=envs,disk_folder=disk_folder,run_name=run_name,runs_directory=args.runs_directory)
     
     save_git_info(

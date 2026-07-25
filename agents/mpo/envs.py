@@ -71,7 +71,7 @@ def _make_gymnasium_env(args, seed, idx, disk_folder, run_name, runs_directory, 
     if args.capture_video and idx == 0 and render_mode is None:
         render_mode = "rgb_array"
 
-    env = gym.make(args.env_id, render_mode=render_mode)
+    env = gym.make(args.env_id, render_mode=render_mode, xml_file=args.model_path)
     # Gymnasium MuJoCo often returns float64 obs while declaring float32 spaces.
     float32_obs_space = gym.spaces.Box(
         low=env.observation_space.low.astype(np.float32),
