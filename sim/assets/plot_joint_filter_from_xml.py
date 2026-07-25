@@ -1,14 +1,16 @@
 import mujoco
 import matplotlib.pyplot as plt
 
-XML = "walker2d_sim2.xml"
-JOINT = "thigh_joint"
+XML = "humanoid_sim2.xml"  # or "humanoid_sim2.xml"
+JOINT = "abdomen_y"
 
 model = mujoco.MjModel.from_xml_path(XML)
 data = mujoco.MjData(model)
 
 joint_id = mujoco.mj_name2id(
-    model, mujoco.mjtObj.mjOBJ_JOINT, JOINT
+    model,
+    mujoco.mjtObj.mjOBJ_JOINT,
+    JOINT,
 )
 
 actuator_id = next(
@@ -16,30 +18,48 @@ actuator_id = next(
     if model.actuator_trnid[i, 0] == joint_id
 )
 
-act_id = model.actuator_actadr[actuator_id]
+# Read the actuator's upper control limit directly from the XML.
+u_on = model.actuator_ctrlrange[actuator_id, 1]
 
-times, commands, actual = [], [], []
+print("Actuator:", actuator_id)
+print("Control range:", model.actuator_ctrlrange[actuator_id])
+print("Dynamic type:", model.actuator_dyntype[actuator_id])
+print("Time constant:", model.actuator_dynprm[actuator_id, 0])
 
-while data.time < 12:
-    u = 1.0 if 1 <= data.time < 7 else 0.0
+times = []
+commands = []
+actual_outputs = []
 
-    data.ctrl[:] = 0
+while data.time < 12.0:
+    u = u_on if 1.0 <= data.time < 7.0 else 0.0
+
+    data.ctrl[:] = 0.0
     data.ctrl[actuator_id] = u
-    mujoco.mj_step(model, data)
 
-    # filterexact: read filtered activation.
-    # normal motor: actual command equals ctrl.
-    ua = data.act[act_id] if act_id >= 0 else data.ctrl[actuator_id]
+    mujoco.mj_step(model, data)
 
     times.append(data.time)
     commands.append(u)
-    actual.append(ua)
 
-plt.step(times, commands, where="post",
-         linestyle="--", label=r"Command $u(t)$")
-plt.plot(times, actual, label=r"Actual $u_a(t)$")
+    # MuJoCo-computed actuator output for both motor and filterexact.
+    actual_outputs.append(data.actuator_force[actuator_id])
+
+plt.step(
+    times,
+    commands,
+    where="post",
+    linestyle="--",
+    label=r"Command $u(t)$",
+)
+
+plt.plot(
+    times,
+    actual_outputs,
+    label="Actual actuator output",
+)
+
 plt.xlabel("Time [s]")
-plt.ylabel("Actuator command")
+plt.ylabel("Actuator output")
 plt.legend()
 plt.tight_layout()
 plt.savefig(f"{JOINT}_{XML}.png", dpi=300, bbox_inches="tight")
