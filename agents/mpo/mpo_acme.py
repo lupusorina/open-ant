@@ -535,14 +535,23 @@ class MPO:
         }
         return fetches
     
-    def initialize_logging(self, info):
+    def initialize_logging(self, info, append=False):
         self.start_time = time.time()
 
         log_dir = os.path.join(self.disk_folder, self.runs_directory, self.run_name)
-        self.csv_file_info = open(os.path.join(log_dir, "info_logs.csv"), "w", newline="")
+        
+        mode = "a" if append else "w"
+        info_path = os.path.join(log_dir, "info_logs.csv")
+        info_has_header = (
+            append
+            and os.path.exists(info_path)
+            and os.path.getsize(info_path) > 0
+        )
+        self.csv_file_info = open(os.path.join(log_dir, "info_logs.csv"), mode, newline="")
         self.keys_info = [k for k in info.keys() if not (k.startswith("bodies") or k.startswith("_"))]
         self.writer_info = csv.DictWriter(self.csv_file_info, fieldnames=["step"] + self.keys_info)
-        self.writer_info.writeheader()
+        if not info_has_header:
+            self.writer_info.writeheader()
 
         self.reward_tracker = RewardTracker(
             env_dt=self.args.dt,
@@ -550,10 +559,16 @@ class MPO:
             log_folder=log_dir,
             time_window=120.0,
         )
-
-        self.csv_file_agent_vars = open(os.path.join(log_dir, "performance_variables.csv"), "w", newline="")
+        performance_path = os.path.join(log_dir,"performance_variables.csv")
+        performance_has_header = (
+            append
+            and os.path.exists(performance_path)
+            and os.path.getsize(performance_path) > 0
+        )
+        self.csv_file_agent_vars = open(performance_path, mode, newline="")
         self.writer_agent_vars = csv.DictWriter(self.csv_file_agent_vars, fieldnames=["step"] + self.keys_agent_vars)
-        self.writer_agent_vars.writeheader()
+        if not performance_has_header:
+            self.writer_agent_vars.writeheader()
 
         self.info_log_buffer = []
         self.agent_vars_buffer = []
@@ -896,6 +911,7 @@ def parse_args():
     parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
     parser.add_argument("--weights_path", type=str, default=None)
+    parser.add_argument("--resume_in_place", action="store_true", default=False)
     parser.add_argument("--task_type", type=str, default="back_and_forth",
                         choices=["forward", "back_and_forth"])
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3)
@@ -962,10 +978,24 @@ def main():
     args.learning_starts = args.learning_starts//args.num_envs #integer div takes floor
 
     date = datetime.now().strftime("%Y%m%d-%H%M%S")
-    disk_folder = ''
-    os.makedirs(args.runs_directory, exist_ok=True)
-    run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
-    os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
+    disk_folder = ""
+    if args.resume_in_place:
+        if args.weights_path is None:
+            raise ValueError("--resume_in_place requires --weights_path")
+
+        weights_path = os.path.abspath(args.weights_path.rstrip("/"))
+        if os.path.basename(weights_path) != "weights_and_args":
+            raise ValueError("--weights_path must point to the weights_and_args directory ")
+        run_dir = os.path.dirname(weights_path)
+
+        args.runs_directory = os.path.dirname(run_dir)
+        run_name = os.path.basename(run_dir)
+
+        print(f"[√] Resuming in existing run directory: {run_dir}")
+    else:
+        os.makedirs(args.runs_directory, exist_ok=True)
+        run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
+        os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
     task = None
     if not is_gymnasium_env(args.env_id):
@@ -1017,7 +1047,11 @@ def main():
     print(f"num_envs: {envs.num_envs}")
 
     obs, info = envs.reset()
-    agent.initialize_logging(info)
+    agent.initialize_logging(info, append=args.resume_in_place)
+    
+    if args.resume_in_place:
+        # RewardTracker has its own counter, so continue it from the checkpoint.
+        agent.reward_tracker.step = agent.global_step
 
     # try:
     #     from torch.utils.tensorboard import SummaryWriter
@@ -1066,10 +1100,12 @@ def main():
                     writer.flush()
             step_times.append(f"{current_step},{time.time() - time_now}\n")
 
-        with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
-            f.writelines(step_times)
+        # with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
+        #     f.writelines(step_times)
     finally:
-        with open(os.path.join(args.runs_directory,run_name,"step_times.csv"),"w") as f:
+        step_times_mode = "a" if args.resume_in_place else "w"
+
+        with open(os.path.join(args.runs_directory,run_name,"step_times.csv"),step_times_mode) as f:
             f.writelines(step_times)
 
         if not args.eval:
