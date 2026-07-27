@@ -1,7 +1,7 @@
 import mujoco
 
 # Load and compile the Hopper XML model file
-model = mujoco.MjModel.from_xml_path("walker2d_sim2.xml")
+model = mujoco.MjModel.from_xml_path("humanoid_sim2.xml")
 
 # Sum the mass of all bodies in the compiled model
 total_mass = model.body_mass.sum()

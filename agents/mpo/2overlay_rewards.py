@@ -4,18 +4,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 RUNS1_DIR = "/data2/sorina_data/runs_July_24"
-RUNS2_DIR = "/data2/serenaliu_data/"
-
-SEEDS_TO_PLOT = list(range(10))
+RUNS2_DIR = "/data2/serenaliu_data/continual_mpo_hopper"
+NAME = "hopper"
+OUTPUTNAME = "hopper"
+ENV = "Hopper-v5"
+SEEDS_TO_PLOT = [0, 1,2,3,4,5,6,7,8,9,10]
+#SEEDS_TO_PLOT = [0]
 
 AVG_REWARD_OUTPUT = (
     "/home/serenaliu/caltech_linc_home/open-ant/agents/mpo/"
-    "hopper_average_reward_per_second.png"
+    f"{OUTPUTNAME}_average_reward_per_second.png"
 )
 
 EPISODE_RETURN_OUTPUT = (
     "/home/serenaliu/caltech_linc_home/open-ant/agents/mpo/"
-    "hopper_mean_episode_return.png"
+    f"{OUTPUTNAME}_mean_episode_return.png"
 )
 
 
@@ -23,12 +26,12 @@ def load_continual_data(seed):
     """Load Sim1 and Sim2 CSVs and join their step axes."""
 
     sim1_dirs = sorted(
-        glob.glob(f"{RUNS1_DIR}/mpo_hopper_*_seed_{seed}"),
+        glob.glob(f"{RUNS1_DIR}/mpo_{NAME}_*_seed_{seed}"),
         reverse=True,
     )
 
     sim2_dirs = sorted(
-        glob.glob(f"{RUNS2_DIR}/continual_mpo_hopper_*_seed_{seed}"),
+        glob.glob(f"{RUNS2_DIR}/continual_mpo_{NAME}_*_seed_{seed}"),
         reverse=True,
     )
 
@@ -38,12 +41,12 @@ def load_continual_data(seed):
 
     sim1_csv = os.path.join(
         sim1_dirs[0],
-        "Hopper-v5_average_rewards.csv",
+        f"{ENV}_average_rewards.csv",
     )
 
     sim2_csv = os.path.join(
         sim2_dirs[0],
-        "Hopper-v5_average_rewards.csv",
+        f"{ENV}_average_rewards.csv",
     )
 
     if not os.path.exists(sim1_csv) or not os.path.exists(sim2_csv):
@@ -94,7 +97,7 @@ for seed in SEEDS_TO_PLOT:
 
 plt.xlabel("Total environment steps")
 plt.ylabel("Average reward per second")
-plt.title("Hopper: Average Reward per Second")
+plt.title(f"{OUTPUTNAME}: Average Reward per Second")
 plt.legend(fontsize=8)
 plt.grid(True)
 plt.tight_layout()
@@ -137,7 +140,7 @@ for seed in SEEDS_TO_PLOT:
 
 plt.xlabel("Total environment steps")
 plt.ylabel("Mean episodic return")
-plt.title("Hopper: Mean Episodic Return over Last 100 Episodes")
+plt.title(f"{OUTPUTNAME}: Mean Episodic Return over Last 100 Episodes")
 plt.legend(fontsize=8)
 plt.grid(True)
 plt.tight_layout()

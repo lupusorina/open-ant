@@ -8,12 +8,12 @@ set -euo pipefail
 #   bash run-dmpo-ant.sh hw
 
 # Seeds run in this exact order.
-SEEDS=(10 1 2 3 8 7 6 5 4 9 0)
+SEEDS=(10)
 
-SCRIPT="mpo_acme_ensemble.py"
+SCRIPT="mpo_acme.py"
 
 # Sim1 and Sim2 both save under this same parent directory.
-RUNS_DIR="runs/ensemble_spi1536_gamma92"
+RUNS_DIR="runs/spi1536_gamma92"
 
 # Sim1 output folders:
 #   runs-ant/dmpo_retrace_YYYYMMDD-HHMMSS_seed_3
@@ -53,9 +53,12 @@ run_sim () {
         --env_id SimEmbodiedAnt \
         --runs_directory "${RUNS_DIR}" \
         --exp_name "${SIM_EXP_NAME}" \
+        --policy_init_scale 0.7 \
         --samples_per_insert 1536 \
-        --seed "${seed}" \
         --gamma 0.92 \
+        --dual_lr 1e-3 \
+        --batch_size 512 \
+        --seed "${seed}" \
         --cuda \
         $(video_flag)
 
@@ -145,13 +148,16 @@ run_continual () {
         --dt 0.12 \
         --env_id SimEmbodiedAnt \
         --runs_directory "${RUNS_DIR}" \
+        --policy_init_scale 0.7 \
         --samples_per_insert 1536 \
+        --gamma 0.92 \
+        --dual_lr 1e-3 \
+        --batch_size 512 \
         --seed "${seed}" \
         --cuda \
         --exp_name "${CONT_EXP_NAME}" \
         --weights_path "${weights_path}" \
         --model_path ../../sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml \
-        --gamma 0.92 \
         --cuda \
         $(video_flag)
 
