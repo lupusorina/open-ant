@@ -22,16 +22,16 @@ modified by @saran_t
       <joint armature="0" axis="1 0 0" damping="0" limited="false" name="rootx" pos="0 0 -1.25" stiffness="0" type="slide"/>
       <joint armature="0" axis="0 0 1" damping="0" limited="false" name="rootz" pos="0 0 -1.25" ref="1.25" stiffness="0" type="slide"/>
       <joint armature="0" axis="0 1 0" damping="0" limited="false" name="rooty" pos="0 0 0" stiffness="0" type="hinge"/>
-      <geom friction="0.9" name="torso_geom" size="0.05 0.19999999999999996" type="capsule"/>
+      <geom friction="1.2" name="torso_geom" size="0.05 0.19999999999999996" type="capsule" density="1200"/>
       <body name="thigh" pos="0 0 -0.19999999999999996">
         <joint axis="0 -1 0" name="thigh_joint" pos="0 0 0" range="-150 0" type="hinge"/>
-        <geom friction="0.9" pos="0 0 -0.22500000000000009" name="thigh_geom" size="0.05 0.22500000000000003" type="capsule"/>
+        <geom friction="1.2" pos="0 0 -0.22500000000000009" name="thigh_geom" size="0.05 0.22500000000000003" type="capsule" density="1200"/>
         <body name="leg" pos="0 0 -0.70000000000000007">
           <joint axis="0 -1 0" name="leg_joint" pos="0 0 0.25" range="-150 0" type="hinge"/>
-          <geom friction="0.9" name="leg_geom" size="0.04 0.25" type="capsule"/>
+          <geom friction="1.2" name="leg_geom" size="0.04 0.25" type="capsule" density="1200"/>
           <body name="foot" pos="0.13 0 -0.35">
             <joint axis="0 -1 0" name="foot_joint" pos="-0.13 0 0.1" range="-45 45" type="hinge"/>
-            <geom friction="2.0" pos="-0.065 0 0.1" quat="0.70710678118654757 0 -0.70710678118654746 0" name="foot_geom" size="0.06 0.195" type="capsule"/>
+            <geom friction="2.66" pos="-0.065 0 0.1" quat="0.70710678118654757 0 -0.70710678118654746 0" name="foot_geom" size="0.06 0.195" type="capsule" density="1200"/>
           </body>
         </body>
       </body>
