@@ -8,12 +8,12 @@ set -euo pipefail
 #   bash run-dmpo-ant.sh hw
 
 # Seeds run in this exact order.
-SEEDS=(0 7 4 5 6 1 2 3 8 10)
+SEEDS=(9)
 
-SCRIPT="mpo_acme_ensemble.py"
+SCRIPT="mpo_acme_ensemble_morelogs.py"
 
 # Sim1 and Sim2 bot h save under this same parent directory.
-RUNS_DIR="runs/ensemble_spi1536_gamma92"
+RUNS_DIR="runs/long_ensemble_spi1536_gamma92"
 
 # Sim1 output folders:
 #   runs-ant/dmpo_retrace_YYYYMMDD-HHMMSS_seed_3
@@ -158,7 +158,6 @@ run_continual () {
         --exp_name "${CONT_EXP_NAME}" \
         --weights_path "${weights_path}" \
         --model_path ../../sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml \
-        --resume_in_place \
         $(video_flag)
 
     echo "Continual learning complete for seed ${seed}."
@@ -170,26 +169,31 @@ if [ "$1" == "sim" ]; then
     done
 
 elif [ "$1" == "sim_continual_learning" ]; then
+    # for seed in "${SEEDS[@]}"; do
+    #     sim2_run_dir=$(
+    #         find "${RUNS_DIR}" \
+    #             -maxdepth 1 \
+    #             -type d \
+    #             -name "${CONT_EXP_NAME}_*_seed_${seed}" \
+    #             -printf "%T@ %p\n" 2>/dev/null \
+    #         | sort -nr \
+    #         | head -n 1 \
+    #         | cut -d' ' -f2-
+    #     )
+
+    #     if [ -z "${sim2_run_dir}" ]; then
+    #         echo "ERROR: No existing Sim2 run found for seed ${seed}"
+    #         exit 1
+    #     fi
+
+    #     weights_path="${sim2_run_dir}/weights_and_args"
+    #     run_continual "${seed}" "${weights_path}"
+    # done
     for seed in "${SEEDS[@]}"; do
-        sim2_run_dir=$(
-            find "${RUNS_DIR}" \
-                -maxdepth 1 \
-                -type d \
-                -name "${CONT_EXP_NAME}_*_seed_${seed}" \
-                -printf "%T@ %p\n" 2>/dev/null \
-            | sort -nr \
-            | head -n 1 \
-            | cut -d' ' -f2-
-        )
-
-        if [ -z "${sim2_run_dir}" ]; then
-            echo "ERROR: No existing Sim2 run found for seed ${seed}"
-            exit 1
-        fi
-
-        weights_path="${sim2_run_dir}/weights_and_args"
+        weights_path=$(find_latest_sim_weights_for_seed "${seed}")
         run_continual "${seed}" "${weights_path}"
     done
+
 
 elif [ "$1" == "sim_then_continual" ]; then
     for seed in "${SEEDS[@]}"; do

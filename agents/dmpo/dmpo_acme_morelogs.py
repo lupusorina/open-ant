@@ -34,7 +34,7 @@ from embodied_ant_env import ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
 
-from nn import AcmeActor, ScalarAcmeCritic
+from nn import AcmeActor, AcmeCritic, DiscreteValuedDistribution
 
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -42,7 +42,77 @@ def arr_to_str(x):
     return x
 # import crane
 # from crane import tile_images, save_video
+
 _MPO_FLOAT_EPSILON = 1e-8
+
+# critic is only allowed to output probabilities on fixed grid of return vals
+# Z = [logit(return =vmin), logit(return = vmax)], bins = num atoms 
+def l2_project(Zp: torch.Tensor, P: torch.Tensor, Zq: torch.Tensor) -> torch.Tensor:
+    """Project distribution (Zp, P) onto support Zq under the L2 metric over CDFs.
+
+    Zp: (B, Kp) source support
+    P:  (B, Kp) source probabilities
+    Zq: (Kq,) target support
+    returns: (B, Kq)
+    """
+    #Extracts vmin and vmax and construct helper tensors from Zq
+    vmin, vmax = Zq[0], Zq[-1]
+    d_pos = torch.cat([Zq, vmin[None]], dim=0)[1:]
+    d_neg = torch.cat([vmax[None], Zq], dim=0)[:-1]
+
+    # Clips Zp to be in new support range (vmin, vmax).
+    clipped_zp = torch.clamp(Zp, vmin, vmax)[:, None, :]
+    clipped_zq = Zq[None, :, None]
+
+    # Gets the distance between atom values in support
+    d_pos = (d_pos - Zq)[None, :, None]
+    d_neg = (Zq - d_neg)[None, :, None]
+
+    delta_qp = clipped_zp - clipped_zq
+    d_sign = (delta_qp >= 0.0).to(P.dtype)
+
+    delta_hat = (
+        d_sign * delta_qp / d_pos
+        - (1.0 - d_sign) * delta_qp / d_neg
+    )
+    P = P[:, None, :]
+    # returns the L2 projection of (Zp, P) onto Zq. --> note it's Zq!! not Zp!!
+
+    return torch.sum(torch.clamp(1.0 - delta_hat, 0.0, 1.0) * P, dim=2)
+
+
+# computes categorical distributional loss
+# q_t.values = the target atoms (the return bins, i.e. -150, -145, .. +150)
+# target for current = Z_target_t = r_t + gamma * Z_target(S_{t+1}, a'), where a' is from target policy
+# p_t is the probabilities for the logit values, which here, each logit val correspond to a target atom from q_t
+def categorical(
+    q_tm1: DiscreteValuedDistribution,
+    r_t: torch.Tensor,
+    d_t: torch.Tensor,
+    q_t: DiscreteValuedDistribution,
+) -> torch.Tensor:
+    """Categorical distributional loss. Returns per-sample loss (B,)."""
+    values = q_t.values
+
+    # r_t.reshape change reward shape from (B,) to (B,1)
+    # since values have shape (k,), where k = num atoms
+    # this makes every atom get the reward and d_t bellman shift.
+    z_t = r_t.reshape(-1, 1) + d_t.reshape(-1, 1) * values  # shape (B,K)
+    # in order to do l2_project, the atoms need probability mass p_t attached
+    # to each atom, not logits. 
+    p_t = torch.softmax(q_t.logits, dim=-1)
+
+    # need to project shifted distrib back onto atom values
+    target = l2_project(z_t, p_t, values).detach()
+
+    # pytorch equivalent of tf.nn.softmax_cross_entropy_with_logits
+    # loss = (-labels * torch.nn.functional.log_softmax(logits, dim=-1)).sum(dim=-1)
+    log_p_tm1 = torch.log_softmax(q_tm1.logits, dim=-1)
+    
+    # target = the projected (Zp, P) onto Zq - Z_w'(St, At)
+    # q_tm1 logits = online critic's prediction.
+    # cross entropy formula
+    return -(target * log_p_tm1).sum(dim=-1)
 
 
 class MPO:
@@ -69,7 +139,7 @@ class MPO:
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
-        # NVIDIA cuDNN library uses deterministic convolution algo; if false can use FFT based or Winograd convolutions; slower but mathematically more sound
+        #Nvidia cuDNN library uses deterministic convolution algo; if false can use FFT based or Winograd convolutions; slower but mathematically more sound
         torch.backends.cudnn.deterministic = args.torch_deterministic 
         torch.backends.cudnn.benchmark = not args.torch_deterministic #if not deterministic, find and use fastest one
         print(f"[√] Torch deterministic: {torch.backends.cudnn.deterministic}")
@@ -108,25 +178,23 @@ class MPO:
         for p in self.actor_target.parameters():
             p.requires_grad = False
         
-        self.critics = nn.ModuleList([
-            ScalarAcmeCritic(
+        self.critic = AcmeCritic(
             obs_dim=self.obs_dim,
             act_dim=self.act_dim,
             action_low=self.action_low,
             action_high=self.action_high,
             layer_sizes=critic_layer_sizes,
-        ) for _ in range(self.args.ensemble)
-        ]).to(self.device)
+            vmin=args.vmin,
+            vmax=args.vmax,
+            num_atoms=args.num_atoms,
+        ).to(self.device)
 
-        self.target_critics = copy.deepcopy(self.critics)
-        for p in self.target_critics.parameters():
+        self.target_critic = copy.deepcopy(self.critic)
+        for p in self.target_critic.parameters():
             p.requires_grad = False
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.policy_lr)
-        self.critic_optimizers = [
-            optim.Adam(critic.parameters(), lr=args.q_lr)
-            for critic in self.critics]
-
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.q_lr)
 
         self._init_log_eta = args.init_log_temperature
         self._init_log_alpha_mean = args.init_log_alpha_mean
@@ -188,8 +256,8 @@ class MPO:
         self.writer_info = None
         self.writer_agent_vars = None
         self.keys_info = None
-        self.keys_agent_vars = ["critic_loss",*[f"critic_loss_{idx}" for idx in range(self.args.ensemble)],
-            "policy_loss","dual_alpha_mean","dual_alpha_stddev",
+        self.keys_agent_vars = [
+            "critic_loss","policy_loss","dual_alpha_mean","dual_alpha_stddev",
             "dual_temperature","loss_alpha","loss_temperature","loss_policy_cross_entropy",
             "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","q_min",
             "q_max","pi_stddev_min","pi_stddev_max","pi_stddev_cond","utd",
@@ -322,19 +390,12 @@ class MPO:
             if (self.learner_step % self.target_policy_update_period== 0):
                 self.actor_target.load_state_dict(self.actor.state_dict())
 
-            # load each online critic in ensemble into corresponding target critic in ensemble
-            if self.learner_step % self.target_critic_update_period == 0:
-                for critic, target_critic in zip(self.critics, self.target_critics):
-                    target_critic.load_state_dict(critic.state_dict())
-
+            if (self.learner_step % self.target_critic_update_period == 0):
+                self.target_critic.load_state_dict(self.critic.state_dict())
         self.learner_step += 1
 
         with torch.no_grad():
-            # Fixed critic subset for the entire computation — consistent targets.
-            subset_size = min(2, len(self.critics))
-            subset_idx = torch.randperm(len(self.critics), device=self.device)[:subset_size]
-
-            #1. sample 1 replay batch
+            # 1. sample 1 replay batch
             data = self.rb.sample_nstep(
                 batch_size=self.batch_size,
                 n_step=self.trajectory_length,
@@ -342,7 +403,7 @@ class MPO:
             )
             B = self.batch_size
             # the same samples are used to average the target categorical 
-            # critic distributions & obtain scalar Q vals for MPO.
+            # critic distirbutions & obtain scalar Q vals for MPO.
             N = self.args.sample_action_num
             D = self.act_dim
 
@@ -354,7 +415,9 @@ class MPO:
             s_t = data.next_observations
 
             # the collapsed n-step discounted return
-            r_t = data.rewards.squeeze(-1)
+            r_t = data.rewards
+            # bootstrapping coefficient
+            discount_t = self.args.gamma * data.discounts
             
             target_policy = self.actor_target.forward(s_t)
             # Shape: (N, B, D)
@@ -367,45 +430,31 @@ class MPO:
             )
 
             flat_actions = sampled_actions.reshape(N * B, D)
-            
-          
-            # all Q(s_t+n, a_t+n) for each target critic in the ensemble. shape [E,N,B]
-            sampled_q_t = torch.stack([critic(tiled_states,flat_actions).squeeze(-1).reshape(N,B)
-                             for critic in self.target_critics], dim=0)
-            
-            # the q_values used as bootstrapped state for target calculation - take min out of subset
-            q_values_target_calc = (sampled_q_t[subset_idx].min(dim=0).values) #[N,B]
 
-            # the q values used to construct w in E-step - the mean across all critics in ensemble
-            q_values_estep = sampled_q_t.mean(dim=0)
-            
-            # compute average Q value across N sampled actions
-            averaged_q_t = q_values_target_calc.mean(dim=0)
-        
+            # Distributional target critic for every sampled action.
+            sampled_q_t_distribution = self.target_critic(
+                tiled_states,
+                flat_actions,
+            )
+            num_atoms = sampled_q_t_distribution.logits.shape[-1]
+            sampled_q_logits = sampled_q_t_distribution.logits.reshape(N,B,num_atoms,)
+            sampled_q_logprobs = torch.log_softmax(sampled_q_logits,dim=-1)
+            averaged_target_logits = torch.logsumexp(sampled_q_logprobs, dim=0)
+
+            target_q_distribution = DiscreteValuedDistribution(
+                values=self.target_critic.atom_values,
+                logits=averaged_target_logits,
+            )
+            q_values = (sampled_q_t_distribution.mean().reshape(N, B))
+
         online_policy = self.actor.forward(s_t)
-        
-        # find Q(s_t, a_t) for EACH online critic in ensemble
-        online_q_each = torch.stack([c(s_tm1, a_tm1).squeeze(-1) 
-                                    for c in self.critics], dim=0)
+        online_q_distribution = self.critic(s_tm1, a_tm1)
+        critic_loss = categorical(
+            q_tm1=online_q_distribution,r_t=r_t,d_t=discount_t,q_t=target_q_distribution
+        ).mean()
 
-
-        pcont_t = (self.args.gamma * data.discounts).squeeze(-1)
-        
-        # get a loss term for each critic ? so then later when stepping through
-        # gradient, the separate optimizers for each critic means each critic 
-        # updates separately! gives critic loss shape [E,B]
-        critic_loss_each, target, td_error = td_learning(online_q_each, r_t, pcont_t, averaged_q_t)
-        
-        # [E]: one batch-mean loss per critic
-        critic_loss_per_critic = critic_loss_each.mean(dim=1)
-
-        # Scalar objective used for backward()
-        critic_loss = critic_loss_per_critic.sum()
-
-        # Aggregate metric comparable across ensemble sizes
-        critic_loss_logged = critic_loss_per_critic.mean()
-
-        scalar_dtype = sampled_q_t.dtype
+        # compute MPO policy-related losses
+        scalar_dtype = q_values.dtype
         dual_variable_shape = D
 
        
@@ -430,7 +479,7 @@ class MPO:
         # respect to the non-parametric policy; and the temperature loss, used to
         # adapt the tempering of Q-values.
         normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
-            q_values_estep, self._epsilon, temperature)
+            q_values, self._epsilon, temperature)
         
         # Only for diagnostics: Compute estimated actualized KL between the
         # non-parametric and current target policies. 
@@ -462,7 +511,7 @@ class MPO:
             loss_temperature += loss_penalty_temperature  # pyrefly: ignore[unsupported-operation]
     
         # Decompose the online policy into fixed-mean & fixed-stddev distributions
-        # https://arxiv.org/pdf/1812.02256.pdf.
+        #  https://arxiv.org/pdf/1812.02256.pdf.
         fixed_stddev_distribution = dist.Independent(dist.Normal(online_mu, target_sigma), 1)
         fixed_mean_distribution = dist.Independent(dist.Normal(target_mu, online_sigma), 1)
 
@@ -518,9 +567,9 @@ class MPO:
             "kl_stddev_rel": (kl_stddev.detach().mean() / self._epsilon_stddev).item(),
 
             # Q-values: min/max over actions for each state, then average states.
-            "q_min": (q_values_estep.detach().min(dim=0).values.mean()).item(),
+            "q_min": (q_values.detach().min(dim=0).values.mean()).item(),
 
-            "q_max": (q_values_estep.detach().max(dim=0).values.mean()).item(),
+            "q_max": (q_values.detach().max(dim=0).values.mean()).item(),
 
             # Policy exploration
             "pi_stddev_min": pi_stddev_min_per_state.detach().mean().item(),
@@ -545,9 +594,7 @@ class MPO:
             )
 
         # Compute gradients 
-
-        for optimizer in self.critic_optimizers:
-            optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
         self.actor_optimizer.zero_grad()
         self.dual_optimizer.zero_grad()
 
@@ -555,26 +602,20 @@ class MPO:
         total_mpo_loss.backward()               # policy + KL penalty + dual, one backward
 
         # clip
-        for critic, optimizer in zip(self.critics,self.critic_optimizers):
-            nn.utils.clip_grad_norm_(critic.parameters(),self.args.max_grad_norm)
-            optimizer.step()
-
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.args.max_grad_norm)
         nn.utils.clip_grad_norm_(self.actor.parameters(), self.args.max_grad_norm)
 
+        self.critic_optimizer.step()
         self.actor_optimizer.step()
         self.dual_optimizer.step()
 
         # Losses to track.
         fetches = {
-            'critic_loss': critic_loss_logged.detach().item(),
+            'critic_loss': critic_loss.detach().item(),
             'policy_loss': total_mpo_loss.detach().item(),
 
             **policy_stats,
         }
-        for idx, loss_i in enumerate(critic_loss_per_critic):
-            fetches[f"critic_loss_{idx}"] = (
-                loss_i.detach().item()
-            )
         return fetches
     
     def initialize_logging(self, info, append=False):
@@ -718,10 +759,11 @@ class MPO:
         checkpoint = {
             "actor": self.actor.state_dict(),
             "actor_target": self.actor_target.state_dict(),
-            "critics": [critic.state_dict() for critic in self.critics],
-            "target_critics": [critic.state_dict() for critic in self.target_critics],
+            "critic": self.critic.state_dict(),
+            "target_critic": self.target_critic.state_dict(),
+
             "actor_optimizer": self.actor_optimizer.state_dict(),
-            "critic_optimizers": [optimizer.state_dict() for optimizer in self.critic_optimizers],
+            "critic_optimizer": self.critic_optimizer.state_dict(),
             "dual_optimizer": self.dual_optimizer.state_dict(),
 
             "log_eta": self.log_eta.detach().cpu().clone(),
@@ -758,13 +800,10 @@ class MPO:
         
         self.actor.load_state_dict(checkpoint["actor"])
         self.actor_target.load_state_dict(checkpoint["actor_target"])
-        for critic, state_dict in zip(self.critics,checkpoint["critics"]):
-            critic.load_state_dict(state_dict)
-        for target_critic, state_dict in zip(self.target_critics,checkpoint["target_critics"]):
-            target_critic.load_state_dict(state_dict)
+        self.critic.load_state_dict(checkpoint["critic"])
+        self.target_critic.load_state_dict(checkpoint["target_critic"])
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
-        for optimizer, state_dict in zip(self.critic_optimizers,checkpoint["critic_optimizers"]):
-            optimizer.load_state_dict(state_dict)
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self.dual_optimizer.load_state_dict(checkpoint["dual_optimizer"])
       
         with torch.no_grad():
@@ -916,19 +955,9 @@ def compute_nonparametric_kl_from_normalized_weights(
     # Return the expectation with respect to the non-parametric policy.
     return torch.sum(normalized_weights * integrand,dim=0,)
 
-def td_learning(v_tm1, r_t, pcont_t, v_t):
-    """ The TD loss is `0.5` times the squared difference between `v_tm1` and
-    the target `r_t + pcont_t * v_t`.
-    See (https://link.springer.com/article/10.1023/A:1022633531479).
-    """
-    target = (r_t + pcont_t * v_t).detach()
-    td_error = target - v_tm1
-    loss = 0.5 * td_error.square()
-
-    return loss, target, td_error
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp_name", type=str, default="empo_ant")
+    parser.add_argument("--exp_name", type=str, default="dmpo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--torch_deterministic", action="store_true", default=False)
@@ -951,6 +980,16 @@ def parse_args():
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
     parser.add_argument("--batch_size", type=int, default=512)
 
+    parser.add_argument("--vmin", type=float, default=-500,
+                    help="Minimum atom value for distributional critic")
+    parser.add_argument("--vmax", type=float, default=20,
+                        help="Maximum atom value for distributional critic")
+    parser.add_argument("--num_atoms", type=int, default=101,
+                        help="Number of categorical atoms for distributional critic")
+    # parser.add_argument("--critic_num_samples", type=int, default=32,
+    #                     help="Number of next-action samples used to build target critic distribution")
+
+    #Logging
     parser.add_argument("--log_interval", type=int, default=100,
                         help="env steps between TensorBoard scalar writes")
     # MPO
@@ -969,7 +1008,8 @@ def parse_args():
    
     parser.add_argument("--max_grad_norm", type=float, default=40.0)
 
-    parser.add_argument("--ensemble", type=int, default=3)
+    parser.add_argument("--ensemble", type=int, default=1) #doesn't matter in this script
+    # true learning start = learning start // num_envs (floor division)
     parser.add_argument("--learning_starts", type=int, default=200)
     parser.add_argument("--policy_lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=1e-3)
