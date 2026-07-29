@@ -3,22 +3,22 @@ import glob
 import pandas as pd
 import matplotlib.pyplot as plt
 
-RUNS1_DIR = "/data2/sorina_data/runs_July_24"
+RUNS1_DIR = "/data2/serenaliu_data/mpo_hopper_newparam"
 RUNS2_DIR = "/data2/serenaliu_data/continual_mpo_hopper"
 NAME = "hopper"
 OUTPUTNAME = "hopper"
 ENV = "Hopper-v5"
-SEEDS_TO_PLOT = [0, 1,2,3,4,5,6,7,8,9,10]
+SEEDS_TO_PLOT = [10]
 #SEEDS_TO_PLOT = [0]
 
 AVG_REWARD_OUTPUT = (
     "/home/serenaliu/caltech_linc_home/open-ant/agents/mpo/"
-    f"{OUTPUTNAME}_average_reward_per_second.png"
+    f"{OUTPUTNAME}_paramaverage_reward_per_second.png"
 )
 
 EPISODE_RETURN_OUTPUT = (
     "/home/serenaliu/caltech_linc_home/open-ant/agents/mpo/"
-    f"{OUTPUTNAME}_mean_episode_return.png"
+    f"{OUTPUTNAME}_parammean_episode_return.png"
 )
 
 

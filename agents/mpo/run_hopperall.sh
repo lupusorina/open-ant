@@ -7,17 +7,18 @@ cd "$(dirname "$0")"
 
 SCRIPT="mpo_acme.py"
 
-GPU_LIST=(2)
+GPU_LIST=(1)
 
 SEEDS=(10)
-
+RUN_MODE="${1:-both}"
 SIM1_EXP_NAME="mpo_hopper"
 SIM1_TOTAL_TIMESTEPS="2_000_000"
 SIM2_TOTAL_TIMESTEPS="5_000_000"
 
-RUNS_DIR="/data2/serenaliu_data/mpo_hopper_newparam"
+RUNS_DIR="/data2/serenaliu_data/mpo_hopper_newparam_gamma92"
 
-MODEL_PATH="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/hopper_sim2.xml"
+MODEL1_PATH="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/hopper.xml"
+MODEL2_PATH="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/hopper_sim2.xml"
 
 CONT_EXP_NAME="continual_mpo_hopper"
 
@@ -26,77 +27,90 @@ CONT_EXP_NAME="continual_mpo_hopper"
 run_seed_pipeline() {
     local seed="$1"
     local physical_gpu="$2"
+    local sim1_run_dir=""
+    local weights_path=""
 
-    echo
-    echo "Seed ${seed}: starting Sim1 on physical GPU ${physical_gpu}"
+    # -------------------------------------------------------------------------
+    # Sim1
+    # -------------------------------------------------------------------------
+    if [[ "${RUN_MODE}" != "sim2" ]]; then
+        echo
+        echo "Seed ${seed}: starting Sim1 on physical GPU ${physical_gpu}"
 
-    # Allows us to find the exact run directory created by this invocation,
-    # instead of accidentally loading an older run for the same seed.
-    local marker
-    marker="$(mktemp)"
-    touch "${marker}"
-    #SIM 1
-    CUDA_VISIBLE_DEVICES="${physical_gpu}" python3 "${SCRIPT}" \
-        --env_id Hopper-v5 \
-        --exp_name "${SIM1_EXP_NAME}" \
-        --total_timesteps "${SIM1_TOTAL_TIMESTEPS}" \
-        --seed "${seed}" \
-        --runs_directory "${RUNS_DIR}" \
-        --cuda \
-        --policy_init_scale 0.7 \
-        --samples_per_insert 1536 \
-        --gamma 0.92 \
-        --dual_lr 1e-3 \
-        --batch_size 512 \
+        local marker
+        marker="$(mktemp)"
+        touch "${marker}"
 
-    local sim1_run_dir
-    sim1_run_dir="$(
-        find "${RUNS_DIR}" \
-            -maxdepth 1 \
-            -type d \
-            -name "${SIM1_EXP_NAME}_*_seed_${seed}" \
-            -newer "${marker}" \
-            -printf '%T@ %p\n' 2>/dev/null |
-        sort -nr |
-        head -n 1 |
-        cut -d' ' -f2-
-    )"
+        CUDA_VISIBLE_DEVICES="${physical_gpu}" python3 "${SCRIPT}" \
+            --env_id Hopper-v5 \
+            --exp_name "${SIM1_EXP_NAME}" \
+            --total_timesteps "${SIM1_TOTAL_TIMESTEPS}" \
+            --seed "${seed}" \
+            --runs_directory "${RUNS_DIR}" \
+            --cuda \
+            --policy_init_scale 0.7 \
+            --samples_per_insert 1536 \
+            --gamma 0.92 \
+            --dual_lr 1e-3 \
+            --model_path "${MODEL1_PATH}" \
+            --batch_size 512
 
-    rm -f "${marker}"
+        sim1_run_dir="$(
+            find "${RUNS_DIR}" \
+                -maxdepth 1 \
+                -type d \
+                -name "${SIM1_EXP_NAME}_*_seed_${seed}" \
+                -newer "${marker}" \
+                -printf '%T@ %p\n' 2>/dev/null |
+            sort -nr |
+            head -n 1 |
+            cut -d' ' -f2-
+        )"
 
-    local weights_path="${sim1_run_dir}/weights_and_args"
+        rm -f "${marker}"
+
+        echo "Seed ${seed}: Sim1 finished."
+        echo "Sim1 run: ${sim1_run_dir}"
+
+        # Stop here for Sim1-only mode.
+        if [[ "${RUN_MODE}" == "sim1" ]]; then
+            return
+        fi
+    fi
+
+    # -------------------------------------------------------------------------
+    # Find existing Sim1 run for Sim2-only mode
+    # -------------------------------------------------------------------------
+    if [[ "${RUN_MODE}" == "sim2" ]]; then
+        sim1_run_dir="$(
+            find "${RUNS_DIR}" \
+                -maxdepth 1 \
+                -type d \
+                -name "${SIM1_EXP_NAME}_*_seed_${seed}" \
+                -printf '%T@ %p\n' 2>/dev/null |
+            sort -nr |
+            head -n 1 |
+            cut -d' ' -f2-
+        )"
+
+        echo "Seed ${seed}: using existing Sim1 run:"
+        echo "  ${sim1_run_dir}"
+    fi
+
+    weights_path="${sim1_run_dir}/weights_and_args"
 
     if [[ ! -d "${weights_path}" ]]; then
-        echo "ERROR: Missing weights directory:" >&2
-        echo "  ${weights_path}" >&2
+        echo "ERROR: Missing weights directory: ${weights_path}" >&2
         return 1
     fi
-
-    if ! find "${weights_path}" \
-        -maxdepth 1 \
-        -type f \
-        -name 'checkpoint_*.pth' \
-        -print -quit |
-        grep -q .
-    then
-        echo "ERROR: No checkpoint_*.pth found in:" >&2
-        echo "  ${weights_path}" >&2
-        return 1
-    fi
-    echo
-    echo "Seed ${seed}: Sim1 finished."
-    echo "Sim1 run: ${sim1_run_dir}"
 
     # -------------------------------------------------------------------------
     # Sim2
     # -------------------------------------------------------------------------
-
     echo
-    echo "Seed ${seed}: immediately starting Sim2"
-    echo "Physical GPU: ${physical_gpu}"
-    echo "Sim2 output: ${RUNS_DIR}"
-    echo "Sim2 model:  ${MODEL_PATH}"
-    echo "Loading:     ${weights_path}"
+    echo "Seed ${seed}: starting Sim2"
+    echo "Loading: ${weights_path}"
+    echo "Loading: ${MODEL2_PATH}"
 
     CUDA_VISIBLE_DEVICES="${physical_gpu}" python3 "${SCRIPT}" \
         --env_id Hopper-v5 \
@@ -105,17 +119,19 @@ run_seed_pipeline() {
         --seed "${seed}" \
         --runs_directory "${RUNS_DIR}" \
         --weights_path "${weights_path}" \
-        --model_path "${MODEL_PATH}" \
+        --model_path "${MODEL2_PATH}" \
         --cuda \
         --policy_init_scale 0.7 \
         --samples_per_insert 1536 \
         --gamma 0.92 \
         --dual_lr 1e-3 \
-        --batch_size 512 \
-
+        --batch_size 512
     echo
     echo "Seed ${seed}: Sim1 and Sim2 both finished on GPU ${physical_gpu}."
-}
+
+} 
+
+    
 
 
 run_gpu_worker() {

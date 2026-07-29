@@ -7,14 +7,14 @@ cd "$(dirname "$0")"
 SCRIPT="mpo_acme.py"
 GPU_ID="${GPU_ID:-2}"
 # gets overwritten in case of resuming
-OUTPUT_DIR="/data2/serenaliu_data/continual_mpo_hopper_massfric"
-MODEL_PATH="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/hopper_sim2_massfric.xml"
+OUTPUT_DIR="/data2/serenaliu_data/continual_mpo_hopper_newparam"
+MODEL_PATH="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/hopper_sim2.xml"
 
 #exp name also get overwritten in case of resume-from-checkpoint
 CONT_EXP_NAME="continual_mpo_hopper"
 #RUNS_ROOT="/data2/serenaliu_data/continual_mpo_hopper"
 RUNS_ROOT="/data2/sorina_data/runs_July_24"
-for seed in $(seq 1 3); do
+for seed in $(seq 0 0); do
     seed_dir="$(
         find "${RUNS_ROOT}" \
             -maxdepth 1 \

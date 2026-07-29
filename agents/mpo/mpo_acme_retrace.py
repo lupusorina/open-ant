@@ -355,22 +355,15 @@ class MPO:
                     batch_size=B,
                     sequence_length=self.trajectory_length,
                 )
-                # s_t, ..., s_{t+K-1}
-                s_seq = data.observations
-
-                # s_t+1, ..., s_t+k
-                next_s_seq = data.next_observations
-
-                # a_t, ..., a_{t+K-1}
-                a_seq = data.actions
-
-                # r_t+1, ..., r_t+K
-                rewards = data.rewards
+                s_seq = data.observations    # s_t, ..., s_{t+K-1}
+                next_s_seq = data.next_observations     # s_t+1, ..., s_t+k
+                a_seq = data.actions       # a_t, ..., a_{t+K-1}
+                rewards = data.rewards     # r_t+1, ..., r_t+K
                 terminations = data.terminations.bool()
-                behavior_log_probs = (data.behavior_log_probs.squeeze(-1))
+                behavior_log_probs = (data.behavior_log_probs.squeeze(-1)) # μ_t,...,μ_{t+k-1}
                 K = s_seq.shape[1]
 
-                # build all k+1 states: s_0,..s_K
+                # build all k+1 states: s_0,..s_K.   s_seq = [B, K, obs_dim]
                 all_states = torch.cat([s_seq[:, :1, :],next_s_seq],dim=1)
                 policy_states = all_states.reshape(
                     B * (K + 1),self.obs_dim)
