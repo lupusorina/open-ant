@@ -11,6 +11,7 @@ import random
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
+
 from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
@@ -18,21 +19,22 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as dist
 
-from skrl.envs.wrappers.torch import wrap_env
 from skrl.utils import set_seed
 try:
     from .buffer_acme import NStepReplayBufferSamples, ReplayBuffer  # imported as package
 except ImportError:
     from buffer_acme import NStepReplayBufferSamples, ReplayBuffer   # run standalone
+try:
+    from .envs import is_gymnasium_env, make_envs
+except ImportError:
+    from envs import is_gymnasium_env, make_envs
 
-import gymnasium as gym
-from gymnasium.vector import AutoresetMode
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../sim')))
-from ant_mujoco import AntEnv
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../embodied_ant_env')))
-from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
+from embodied_ant_env import ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
+
+from nn import AcmeActor, AcmeCritic, DiscreteValuedDistribution
 
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -42,76 +44,6 @@ def arr_to_str(x):
 # from crane import tile_images, save_video
 
 _MPO_FLOAT_EPSILON = 1e-8
-
-class Actor(nn.Module):
-    def __init__(self,
-                 obs_dim: int,
-                 act_dim: int,
-                 act_low: np.ndarray,
-                 act_high: np.ndarray,
-                 hidden_dims: List[int] = [256, 256, 256],
-                 use_layer_norm: bool = False,
-                 min_scale: float = 1e-6,
-                 init_scale: float = 0.3):
-        super().__init__()
-        self.min_scale = min_scale
-        self.init_scale = init_scale
-
-        self.register_buffer("action_low",torch.as_tensor(act_low, dtype=torch.float32))
-        self.register_buffer("action_high",torch.as_tensor(act_high, dtype=torch.float32))
-        
-        layers = []
-        prev = obs_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(prev, h))
-            if use_layer_norm:
-                layers.append(nn.LayerNorm(h))
-            layers.append(nn.ReLU())
-            prev = h
-        self.net = nn.Sequential(*layers)
-        self.mu_head = nn.Linear(prev, act_dim)
-        self.log_sigma_head = nn.Linear(prev, act_dim)
-
-       # self._softplus_bias = float(np.log(np.exp(init_scale - min_scale) - 1.0))
-
-        self.apply(self._init_weights)
-        small_std = math.sqrt(1e-4 / prev)
-        with torch.no_grad():
-            nn.init.normal_(
-                self.mu_head.weight,
-                mean=0.0,
-                std=small_std
-            )
-            nn.init.zeros_(self.mu_head.bias)
-            nn.init.normal_(
-                self.log_sigma_head.weight,
-                mean=0.0,
-                std=small_std,
-            )
-            nn.init.zeros_(self.log_sigma_head.bias)
-            #self.log_sigma_head.bias.fill_(self._softplus_bias)
-
-    @staticmethod
-    def _init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, x: torch.Tensor) -> dist.Independent:
-        logits = self.net(x)
-        mu = self.action_low + (self.action_high - self.action_low) * torch.sigmoid(self.mu_head(logits))
-        #sigma = F.softplus(self.log_sigma_head(logits)) + self.min_scale
-        
-        raw_scale = self.log_sigma_head(logits)
-        softplus_zero = F.softplus(
-        torch.zeros((), dtype=raw_scale.dtype, device=raw_scale.device)
-        )
-        sigma = (
-            F.softplus(raw_scale)
-            * self.init_scale
-            / softplus_zero
-            + self.min_scale
-        )
-        return dist.Independent(dist.Normal(mu, sigma), 1)
 
 # critic is only allowed to output probabilities on fixed grid of return vals
 # Z = [logit(return =vmin), logit(return = vmax)], bins = num atoms 
@@ -148,22 +80,6 @@ def l2_project(Zp: torch.Tensor, P: torch.Tensor, Zq: torch.Tensor) -> torch.Ten
 
     return torch.sum(torch.clamp(1.0 - delta_hat, 0.0, 1.0) * P, dim=2)
 
-class DiscreteValuedDistribution:
-    # categorical distribution. values = fixed return values / atoms ranging from vmin to vmax
-    # logits = raw neural net output for each atom
-    def __init__(self, values: torch.Tensor, logits: torch.Tensor):
-        self.values = values
-        self.logits = logits
-
-# softmax convert logits into probabilities
-    @property
-    def probs(self) -> torch.Tensor:
-        return torch.softmax(self.logits, dim=-1)
-
-    # mean of the distrib = the expected Q value. Q(s, a)= E[Z(s,a)]
-    def mean(self) -> torch.Tensor:
-        return (self.probs * self.values).sum(dim=-1, keepdim=True)
-
 
 # computes categorical distributional loss
 # q_t.values = the target atoms (the return bins, i.e. -150, -145, .. +150)
@@ -198,268 +114,6 @@ def categorical(
     # cross entropy formula
     return -(target * log_p_tm1).sum(dim=-1)
 
-def variance_scaling_init_(
-    tensor: torch.Tensor,
-    scale: float = 1.0,
-    mode: str = "fan_in",
-    distribution: str = "truncated_normal"
-) -> torch.Tensor:
-    distribution = distribution.lower()
-    if distribution not in {"truncated_normal","untruncated_normal","uniform"}:
-        raise ValueError("distribution must be 'truncated_normal','untruncated_normal', or 'uniform'")
-    if mode not in {"fan_in", "fan_out", "fan_avg"}:
-        raise ValueError("mode must be 'fan_in', 'fan_out', or 'fan_avg'")
-    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(tensor)
-    if mode == "fan_in":
-        n = fan_in
-    elif mode == "fan_out":
-        n = fan_out
-    else:
-        n = (fan_in + fan_out) / 2.0
-    variance = scale / max(1.0, n)
-    with torch.no_grad():
-        if distribution == "truncated_normal":
-            correction = 0.87962566103423978
-            std = math.sqrt(variance) / correction
-            return nn.init.trunc_normal_(tensor,mean=0.0,std=std,a=-2.0 * std,b=2.0 * std)
-        if distribution == "untruncated_normal":
-            std = math.sqrt(variance)
-            return tensor.normal_(mean=0.0, std=std)
-        if distribution == "uniform":
-            limit = math.sqrt(3.0 * variance)
-            return tensor.uniform_(-limit, limit)
-class AcmeLayerNormMLP(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        layer_sizes: Sequence[int],
-        w_init: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        activation: type[nn.Module] = nn.ELU,
-        activate_final: bool = False,
-    ) -> None:
-        super().__init__()
-
-        if len(layer_sizes) == 0:
-            raise ValueError("layer_sizes must contain at least one size")
-
-        self._w_init = w_init
-        # self._activate_final = activate_final KEEP OR DELETE THSI LINE?
-
-        layers: list[nn.Module] = []
-        first_linear = nn.Linear(in_features=input_size,out_features=layer_sizes[0])
-        self._initialize_linear(first_linear)
-
-        layers.extend([
-            first_linear,
-            nn.LayerNorm(
-                # shape of final dimension being normalized is 512 - output dim of the 1st linear layer
-                normalized_shape=layer_sizes[0],
-                elementwise_affine=True,
-            ),nn.Tanh()])
-        previous_size = layer_sizes[0]
-
-        for index, output_size in enumerate(layer_sizes[1:]):
-            linear = nn.Linear(in_features=previous_size,out_features=output_size)
-            self._initialize_linear(linear)
-            layers.append(linear)
-            is_final_layer = (index == len(layer_sizes[1:]) - 1)
-            
-            if not is_final_layer or activate_final:
-                layers.append(activation())
-            previous_size = output_size
-        self._network = nn.Sequential(*layers)
-
-    def _initialize_linear(self, linear: nn.Linear) -> None:
-        if self._w_init is None:
-            variance_scaling_init_(linear.weight,scale=0.333,mode="fan_out",distribution="uniform")
-        else:
-            self._w_init(linear.weight)
-        nn.init.zeros_(linear.bias)
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self._network(observations)
-
-class DiscreteValuedHead(nn.Module):
-    ''' maps hidden features to logits over a fixed support of return atoms,
-    then returns a discretevalueddistribution '''
-    def __init__(
-        self,
-        input_size: int,
-        vmin: float,
-        vmax: float,
-        num_atoms: int,
-        w_init: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        b_init: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
-    ) -> None:
-        super().__init__()
-
-        if vmax <= vmin:
-            raise ValueError(f"vmax must be greater than vmin, got vmin={vmin}, vmax={vmax}")
-
-        self.num_atoms = num_atoms
-        self.register_buffer("atom_values",torch.linspace(vmin,vmax,num_atoms,dtype=torch.float32))
-        
-        self._distributional_layer = nn.Linear(in_features=input_size,out_features=num_atoms)
-        # edit the weights and biases to match snt.Linear's default: bias = 0. 
-        # weight = truncated random normal values with stddev = 1 / sqrt(input-feature-size)
-        # truncated at: no more than 2 stddevs from the mean.
-        with torch.no_grad():
-            if w_init is None:
-                std = 1.0 / math.sqrt(input_size)
-                nn.init.trunc_normal_(
-                    self._distributional_layer.weight,
-                    mean=0.0,
-                    std=std,
-                    a=-2.0 * std,
-                    b=2.0 * std,
-                )
-            else:
-                w_init(self._distributional_layer.weight)
-
-            if self._distributional_layer.bias is not None:
-                if b_init is None:
-                    nn.init.zeros_(self._distributional_layer.bias)
-                else:
-                    b_init(self._distributional_layer.bias)
-
-    def forward(self,inputs: torch.Tensor) -> DiscreteValuedDistribution:
-        # Input:(B, input_size)
-        # Output logits:(B, num_atoms)
-        logits = self._distributional_layer(inputs)
-
-        # Cast support to match logits, equivalent to:
-        # tf.cast(self._values, logits.dtype)
-        atom_values = self.atom_values.to(dtype=logits.dtype,device=logits.device)
-        return DiscreteValuedDistribution(values=atom_values,logits=logits)
-
-class MultivariateNormalDiagHead(nn.Module):
-    """Module that produces a multivariate normal distribution."""
-
-    def __init__(
-        self,
-        input_size: int,
-        num_dimensions: int,
-        init_scale: float = 0.3,
-        min_scale: float = 1e-6,
-        tanh_mean: bool = False,
-        fixed_scale: bool = False,
-        use_independent: bool = True,
-    ) -> None:
-        super().__init__()
-        self._init_scale = float(init_scale)
-        self._min_scale = float(min_scale)
-        self._tanh_mean = tanh_mean
-        self._fixed_scale = fixed_scale
-        self._use_independent = use_independent
-
-        self._mean_layer = nn.Linear(in_features=input_size, out_features=num_dimensions)
-        self._initialize_linear(self._mean_layer)
-        if not fixed_scale:
-            self._scale_layer = nn.Linear(in_features=input_size, out_features=num_dimensions)
-            self._initialize_linear(self._scale_layer)
-    @staticmethod
-    def _initialize_linear(linear: nn.Linear) -> None:
-        variance_scaling_init_(linear.weight,scale=1e-4,mode="fan_in",distribution="truncated_normal")
-        nn.init.zeros_(linear.bias)
-    def forward(self, inputs: torch.Tensor) -> dist.Distribution:
-        mean = self._mean_layer(inputs)
-        if self._fixed_scale:
-            scale = torch.full_like(mean, self._init_scale)
-        else:
-            raw_scale = self._scale_layer(inputs)
-            softplus_zero = F.softplus(torch.zeros((), dtype=raw_scale.dtype, device=raw_scale.device))
-            scale = (
-                F.softplus(raw_scale)
-                * self._init_scale
-                / softplus_zero
-                + self._min_scale
-            )
-        if self._tanh_mean:
-            mean = torch.tanh(mean)
-        if self._use_independent:
-            return dist.Independent(dist.Normal(loc=mean, scale=scale),reinterpreted_batch_ndims=1)
-
-        return dist.MultivariateNormal(loc=mean,scale_tril=torch.diag_embed(scale))
-  
-class AcmeActor(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        act_dim: int,
-        act_low: np.ndarray,
-        act_high: np.ndarray,
-        layer_sizes: Sequence[int] = (256, 256, 256),
-        init_scale: float = 0.3,   # originally 0.3
-        min_scale: float = 1e-6,    # originally 1e-6
-    ) -> None:
-        super().__init__()
-        if len(layer_sizes) == 0:
-            raise ValueError("layer_sizes must contain at least one size")
-        self.register_buffer("action_low",torch.as_tensor(act_low, dtype=torch.float32))
-        self.register_buffer("action_high",torch.as_tensor(act_high, dtype=torch.float32))
-        
-        self.torso = AcmeLayerNormMLP(
-            input_size=obs_dim,
-            layer_sizes=layer_sizes,
-            activate_final=True,
-        )
-        self.policy_head = MultivariateNormalDiagHead(
-            input_size=layer_sizes[-1],
-            num_dimensions=act_dim,
-            init_scale=init_scale,
-            min_scale=min_scale,
-            tanh_mean=False,
-            fixed_scale=False,
-            use_independent=True,
-        )
-    def forward(self, observations: torch.Tensor) -> dist.Distribution:
-        observations = observations.reshape(observations.shape[0],-1)
-        features = self.torso(observations)
-        return self.policy_head(features)
-
-class AcmeCritic(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        act_dim: int,
-        action_low: np.ndarray,
-        action_high: np.ndarray,
-        layer_sizes: Sequence[int] = (512, 512, 256),
-        vmin: float = -500.0,
-        vmax: float = 20.0,
-        num_atoms: int = 101,
-    ) -> None:
-        super().__init__()
-
-        self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
-        self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
-        
-        self.torso = AcmeLayerNormMLP(
-            input_size=obs_dim + act_dim,
-            layer_sizes=layer_sizes,
-            activate_final=True)
-
-        self.distributional_head = DiscreteValuedHead(
-            input_size=layer_sizes[-1],
-            vmin=vmin,
-            vmax=vmax,
-            num_atoms=num_atoms)
-    
-    @property
-    def atom_values(self) -> torch.Tensor:
-        return self.distributional_head.atom_values
-    def forward(self,observation: torch.Tensor,action: torch.Tensor) -> DiscreteValuedDistribution:
-        # Clip action
-        observation = observation.reshape(observation.shape[0],-1)
-        action = action.reshape(action.shape[0],-1)
-
-        action = torch.clamp(action,self.action_low,self.action_high)
-        action = action.to(dtype=observation.dtype,device=observation.device)
-        inputs = torch.cat([observation, action],dim=-1)
-
-        # LayerNormMLP and distribution head
-        torso_output = self.torso(inputs)  # (B, 256)
-        distribution = self.distributional_head(torso_output)
-        return distribution
 
 class MPO:
     def __init__(self, args, envs, disk_folder='', run_name=None, runs_directory='runs'):
@@ -488,6 +142,8 @@ class MPO:
         #Nvidia cuDNN library uses deterministic convolution algo; if false can use FFT based or Winograd convolutions; slower but mathematically more sound
         torch.backends.cudnn.deterministic = args.torch_deterministic 
         torch.backends.cudnn.benchmark = not args.torch_deterministic #if not deterministic, find and use fastest one
+        print(f"[√] Torch deterministic: {torch.backends.cudnn.deterministic}")
+        print(f"[√] Torch benchmark: {torch.backends.cudnn.benchmark}")
 
         policy_layer_sizes = tuple(args.policy_layer_sizes)
         critic_layer_sizes = tuple(args.critic_layer_sizes)
@@ -540,8 +196,6 @@ class MPO:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.policy_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.q_lr)
 
-        self.policy_learning_starts = args.policy_learning_starts
-
         self._init_log_eta = args.init_log_temperature
         self._init_log_alpha_mean = args.init_log_alpha_mean
         self._init_log_alpha_stddev = args.init_log_alpha_stddev
@@ -567,11 +221,6 @@ class MPO:
             ],
             lr=args.dual_lr,
         )
-        # self.dual_temp_optimizer = optim.Adam([self.log_eta], lr=args.dual_lr)
-
-        # Scalar Lagrange multipliers for M-step KL constraints.
-
-        #self._uniform_log_prob = -float(np.sum(np.log(self.action_high - self.action_low)))
 
         self.rb = ReplayBuffer(
             args.buffer_size,
@@ -579,7 +228,6 @@ class MPO:
             envs.single_action_space,
             self.device,
             n_envs=args.num_envs,
-            handle_timeout_termination=False,
         )
 
         self.batch_size = self.args.batch_size
@@ -608,40 +256,35 @@ class MPO:
         self.keys_agent_vars = [
             "critic_loss","policy_loss","dual_alpha_mean","dual_alpha_stddev",
             "dual_temperature","loss_alpha","loss_temperature","loss_policy_cross_entropy",
-            "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","kl_mean_rel_min",
-            "kl_mean_rel_max","kl_stddev_rel_min","kl_stddev_rel_max","q_min",
+            "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","q_min",
             "q_max","pi_stddev_min","pi_stddev_max","pi_stddev_cond","utd",
-            "SPS","average_reward_per_second","reward"]
+            "SPS","average_reward_per_second","reward","mean_return"]
 
         for idx in range(self.act_dim):
             self.keys_agent_vars.extend(
                 [
                     f"dual_alpha_mean_{idx}",
                     f"dual_alpha_stddev_{idx}",
-                    f"kl_mean_rel_{idx}",
-                    f"kl_stddev_rel_{idx}",
                     f"pi_stddev_{idx}",
                 ]
             )
         self.info_log_buffer = []
         self.agent_vars_buffer = []
 
- 
         self._epsilon = args.epsilon_eta
         self._epsilon_mean = args.epsilon_mu_kl
         self._epsilon_stddev = args.epsilon_sigma_kl
         
-        # a variable that tracks when reset happens - the transition after done = true is
+        # a variable that tracks when reset happens - the transition after boundary = true is
         # when transitioning from terminal state to reset state - this is when pending_autoreset=1,
         # to inform agent to not use this transition during training.
         self.pending_autoreset = torch.zeros(self.envs.num_envs,dtype=torch.bool,device=self.device)
+        self._ep_returns = np.zeros(self.envs.num_envs, dtype=np.float64)
         print("Agent initialized and compiled")
     
     def _random_action(self):
         low, high = self.actor.action_low, self.actor.action_high
         rand_actions = low + (high - low) * torch.rand(self.envs.num_envs, self.act_dim, device=self.device)
-        # self.last_actions = rand_actions
-        # self.last_log_probs = torch.full((self.envs.num_envs, 1), self._uniform_log_prob,dtype=torch.float32, device=self.device)
         return rand_actions
     
     def get_action(self, obs, evaluate=False):
@@ -657,47 +300,66 @@ class MPO:
                 d = self.actor.forward(self.obs)
                 action = d.mean if evaluate else d.sample()
                 actions = action
-                #actions = torch.clamp(action, self.actor.action_low, self.actor.action_high) #mjx clipos internally but overflowed action stored in buffer --> inconsistency
-                actions = actions.squeeze(1)     # (n_envs, act_dim)
-                
+                actions = actions.squeeze(1) # (n_envs, act_dim)
+
                 log_probs = d.log_prob(actions).unsqueeze(-1)
                 self.last_actions = actions
                 self.last_log_probs = log_probs
                 return actions
         return self._random_action()
 
+    def _step_rewards_np(self, infos, rewards):
+        if "original_reward" in infos:
+            return np.asarray(infos["original_reward"], dtype=np.float64).reshape(-1)
+        if isinstance(rewards, torch.Tensor):
+            return rewards.detach().cpu().numpy().reshape(-1).astype(np.float64)
+        return np.asarray(rewards, dtype=np.float64).reshape(-1)
+
+    def _update_episode_returns(self, infos, rewards, boundaries, autoreset_now):
+        if self.reward_tracker is None:
+            return
+        step_rewards = self._step_rewards_np(infos, rewards)
+        done_np = boundaries.detach().cpu().numpy().reshape(-1).astype(bool)
+        autoreset_np = autoreset_now.detach().cpu().numpy().reshape(-1).astype(bool)
+        n = min(self.envs.num_envs, len(step_rewards))
+        for i in range(n):
+            if autoreset_np[i]:
+                self._ep_returns[i] = step_rewards[i]
+            else:
+                self._ep_returns[i] += step_rewards[i]
+                if done_np[i]:
+                    self.reward_tracker.record_episode_return(self._ep_returns[i])
+
     def agent_step(self, next_obs, actions, rewards, terminations, truncations, infos):
         terminations = terminations.bool()
         truncations = truncations.bool()
 
-        # Episode boundary: true termination OR time-limit truncation
-        dones = terminations | truncations
+        # either flag will end the sampled trajectory
+        # only terminations disable bootstrapping in the replay buffer though
+        boundaries = terminations | truncations
 
-        # timeout/truncation, this should NOT kill bootstrapping
-        timeouts = truncations & (~terminations)
-        
         if "autoreset" in infos:
             autoreset_now = torch.as_tensor(infos["autoreset"],dtype=torch.bool,device=self.device)
         else:
             autoreset_now = self.pending_autoreset
         valid = ~autoreset_now
 
-        num_inserts = int(valid.sum().item())
+        self._update_episode_returns(infos, rewards, boundaries, autoreset_now)
 
+        num_inserts = int(valid.sum().item())
         self.rb.add(
-            self.obs,
-            next_obs,
-            actions,
-            rewards,
-            dones,
-            [{}] * self.envs.num_envs,
-           # behavior_log_prob=self.last_log_probs,
-            truncation=timeouts,
-            valid=valid)
-        #___________________________________________________________________________________________________
+            obs=self.obs,
+            next_obs=next_obs,
+            action=actions,
+            reward=rewards,
+            terminated=terminations,
+            truncated=truncations,
+            valid=valid,
+        )
+
         self.global_step += 1
         self.obs = next_obs
-        self.pending_autoreset = dones.detach().clone()
+        self.pending_autoreset = boundaries.detach().clone()
         metrics = None
 
         if self.global_step > self.args.learning_starts and self.rb.size() >= self.batch_size:
@@ -715,53 +377,10 @@ class MPO:
                 # Actual learner updates performed during this vector-environment step.
                 metrics["utd"] = num_updates
         return metrics
-    
+
     def agent_step_eval(self, next_obs):
         self.global_step += 1
         self.obs = next_obs
-
-    def agent_step_no_learn(self, next_obs, actions, rewards, terminations, truncations, infos):
-        """Buffer add + step count only. Call learn_step() from a separate timer."""
-        #___________________________________________________________________________________________________
-        terminations = terminations.bool()
-        truncations = truncations.bool()
-
-        dones = terminations | truncations
-        timeouts = truncations & (~terminations)
-
-        if "autoreset" in infos:
-            autoreset_now = torch.as_tensor(infos["autoreset"],dtype=torch.bool,device=self.device)
-        else:
-            autoreset_now = self.pending_autoreset
-        valid = ~autoreset_now
-
-        self.rb.add(
-            self.obs,
-            next_obs,
-            actions,
-            rewards,
-            dones,
-            [{}] * self.envs.num_envs,
-            #behavior_log_prob=self.last_log_probs,
-            truncation=timeouts,
-            valid=valid)
-        self.pending_autoreset = dones.detach().clone()
-        self.global_step += 1
-        self.obs = next_obs
-    
-    def learn_step(self):
-        """Run one round of UTD critic/actor updates. Returns metrics dict or None."""
-        if self.global_step <= self.args.learning_starts:
-            return None
-        if self.rb.size() < self.batch_size:
-            return None
-        results = [self._learn() for _ in range(self.args.utd)]
-        keys = results[0].keys()
-        metrics = {k: sum(r[k] for r in results) / len(results) for k in keys}
-        metrics['utd'] = self.args.utd
-        return metrics
-
- 
 
     def _learn(self):
         with torch.no_grad():
@@ -771,9 +390,7 @@ class MPO:
             if (self.learner_step % self.target_critic_update_period == 0):
                 self.target_critic.load_state_dict(self.critic.state_dict())
         self.learner_step += 1
-        
-        if self.global_step >= self.args.learning_starts + self.policy_learning_starts:
-            self.args.decouple_q_learning = False
+
         with torch.no_grad():
             #1. sample 1 replay batch
             data = self.rb.sample_nstep(
@@ -794,7 +411,7 @@ class MPO:
             # here, the .next_obs being accessed is actually s_t+n
             s_t = data.next_observations
 
-            #the collapsed n-step discounted return
+            # the collapsed n-step discounted return
             r_t = data.rewards
             # bootstrapping coefficient
             discount_t = self.args.gamma * data.discounts
@@ -803,11 +420,6 @@ class MPO:
             # Shape: (N, B, D)
             sampled_actions = target_policy.sample((N,))
 
-            # sampled_actions = torch.clamp(
-            #     sampled_actions,
-            #     self.actor_target.action_low,
-            #     self.actor_target.action_high,
-            # )
             tiled_states = (
                 s_t.unsqueeze(0)
                 .expand(N, -1, -1)
@@ -842,7 +454,6 @@ class MPO:
         scalar_dtype = q_values.dtype
         dual_variable_shape = D
 
-        # Project dual variables to ensure they stay positive.
        
         with torch.no_grad():
             self.log_eta.clamp_(min=-18.0)
@@ -850,7 +461,7 @@ class MPO:
             self.log_alpha_stddev.clamp_(min=-18.0)
 
         # Transform dual variables from log-space.
-        # using softplus instead of exponential for numerical stability.
+        # using softplus instead of exponential for numerical stability
         temperature = F.softplus(self.log_eta) + _MPO_FLOAT_EPSILON
         alpha_mean = F.softplus(self.log_alpha_mean) + _MPO_FLOAT_EPSILON
         alpha_stddev = F.softplus(self.log_alpha_stddev) + _MPO_FLOAT_EPSILON
@@ -867,7 +478,7 @@ class MPO:
         normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
             q_values, self._epsilon, temperature)
         
-        # Only needed for diagnostics: Compute estimated actualized KL between the
+        # Only for diagnostics: Compute estimated actualized KL between the
         # non-parametric and current target policies. 
         kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
             normalized_weights)
@@ -878,8 +489,8 @@ class MPO:
                 self.log_penalty_eta.clamp_(min=-18.0)
             penalty_temperature = F.softplus(self.log_penalty_eta) + _MPO_FLOAT_EPSILON
            
-            # Compute action penalization cost.
-            # Note: the cost is zero in [-1, 1] and quadratic beyond.
+            # Compute action penalization cost
+            # the cost is zero in the specified action range (but NOT quadratic beyond)
             diff_out_of_bound = sampled_actions - torch.clamp(sampled_actions,self.actor_target.action_low,self.actor_target.action_high)
             
             cost_out_of_bound = -torch.linalg.vector_norm(diff_out_of_bound, dim=-1)
@@ -901,7 +512,7 @@ class MPO:
         fixed_stddev_distribution = dist.Independent(dist.Normal(online_mu, target_sigma), 1)
         fixed_mean_distribution = dist.Independent(dist.Normal(target_mu, online_sigma), 1)
 
-            # Compute the decomposed policy losses.
+        # Compute the decomposed policy losses.
         loss_policy_mean = compute_cross_entropy_loss(
             sampled_actions, normalized_weights, fixed_stddev_distribution)
         loss_policy_stddev = compute_cross_entropy_loss(
@@ -919,9 +530,9 @@ class MPO:
             kl_stddev, alpha_stddev, self._epsilon_stddev)
         
         # Combine losses.
-        loss_policy = loss_policy_mean + loss_policy_stddev  # pyrefly: ignore[unsupported-operation]
-        loss_kl_penalty = loss_kl_mean + loss_kl_stddev  # pyrefly: ignore[unsupported-operation]
-        loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature  # pyrefly: ignore[unsupported-operation]
+        loss_policy = loss_policy_mean + loss_policy_stddev
+        loss_kl_penalty = loss_kl_mean + loss_kl_stddev
+        loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature
         total_mpo_loss = (loss_policy + loss_kl_penalty + loss_dual)
             # DO i need to do requires grad=True here or anywhere else..
         # critic_trainable_variables = self.__critic_network.trainable_variables
@@ -939,7 +550,7 @@ class MPO:
             "dual_alpha_stddev": alpha_stddev.detach().mean().item(),
             "dual_temperature": temperature.detach().mean().item(),
 
-            # ACME's loss_policy statistic is the complete MPO loss.
+            # ACME's loss_policy statistic is the complete MPO loss
             "total_mpo_loss": total_mpo_loss.detach().mean().item(),
             "loss_alpha": (
                 loss_alpha_mean.detach() + loss_alpha_stddev.detach()).mean().item(),
@@ -947,23 +558,17 @@ class MPO:
             "loss_policy_cross_entropy": loss_policy.detach().mean().item(),
             "loss_kl_penalty": loss_kl_penalty.detach().mean().item(),
 
-            # Relative KL measurements.
+            # Relative KL measurements
             "kl_q_rel": (kl_nonparametric.detach().mean() / self._epsilon).item(),
             "kl_mean_rel": (kl_mean.detach().mean() / self._epsilon_mean).item(),
             "kl_stddev_rel": (kl_stddev.detach().mean() / self._epsilon_stddev).item(),
-
-            # Per-dimension constraint range.
-            "kl_mean_rel_min": (mean_kl_mean_per_dim.detach().min() / self._epsilon_mean).item(),
-            "kl_mean_rel_max": (mean_kl_mean_per_dim.detach().max() / self._epsilon_mean).item(),
-            "kl_stddev_rel_min": (mean_kl_stddev_per_dim.detach().min()/ self._epsilon_stddev).item(),
-            "kl_stddev_rel_max": (mean_kl_stddev_per_dim.detach().max()/ self._epsilon_stddev).item(),
 
             # Q-values: min/max over actions for each state, then average states.
             "q_min": (q_values.detach().min(dim=0).values.mean()).item(),
 
             "q_max": (q_values.detach().max(dim=0).values.mean()).item(),
 
-            # Policy exploration.
+            # Policy exploration
             "pi_stddev_min": pi_stddev_min_per_state.detach().mean().item(),
             "pi_stddev_max": pi_stddev_max_per_state.detach().mean().item(),
 
@@ -981,19 +586,11 @@ class MPO:
             policy_stats[f"dual_alpha_stddev_{j}"] = (
                 alpha_stddev[j].detach().item()
             )
-            policy_stats[f"kl_mean_rel_{j}"] = (
-                mean_kl_mean_per_dim[j].detach() / self._epsilon_mean
-            ).item()
-            policy_stats[f"kl_stddev_rel_{j}"] = (
-                mean_kl_stddev_per_dim[j].detach()
-                / self._epsilon_stddev
-            ).item()
             policy_stats[f"pi_stddev_{j}"] = (
                 pi_stddev[:, j].detach().mean().item()
             )
 
         # Compute gradients 
-
         self.critic_optimizer.zero_grad()
         self.actor_optimizer.zero_grad()
         self.dual_optimizer.zero_grad()
@@ -1018,14 +615,23 @@ class MPO:
         }
         return fetches
     
-    def initialize_logging(self, info):
+    def initialize_logging(self, info, append=False):
         self.start_time = time.time()
 
         log_dir = os.path.join(self.disk_folder, self.runs_directory, self.run_name)
-        self.csv_file_info = open(os.path.join(log_dir, "info_logs.csv"), "w", newline="")
+        
+        mode = "a" if append else "w"
+        info_path = os.path.join(log_dir, "info_logs.csv")
+        info_has_header = (
+            append
+            and os.path.exists(info_path)
+            and os.path.getsize(info_path) > 0
+        )
+        self.csv_file_info = open(os.path.join(log_dir, "info_logs.csv"), mode, newline="")
         self.keys_info = [k for k in info.keys() if not (k.startswith("bodies") or k.startswith("_"))]
         self.writer_info = csv.DictWriter(self.csv_file_info, fieldnames=["step"] + self.keys_info)
-        self.writer_info.writeheader()
+        if not info_has_header:
+            self.writer_info.writeheader()
 
         self.reward_tracker = RewardTracker(
             env_dt=self.args.dt,
@@ -1033,10 +639,16 @@ class MPO:
             log_folder=log_dir,
             time_window=120.0,
         )
-
-        self.csv_file_agent_vars = open(os.path.join(log_dir, "performance_variables.csv"), "w", newline="")
+        performance_path = os.path.join(log_dir,"performance_variables.csv")
+        performance_has_header = (
+            append
+            and os.path.exists(performance_path)
+            and os.path.getsize(performance_path) > 0
+        )
+        self.csv_file_agent_vars = open(performance_path, mode, newline="")
         self.writer_agent_vars = csv.DictWriter(self.csv_file_agent_vars, fieldnames=["step"] + self.keys_agent_vars)
-        self.writer_agent_vars.writeheader()
+        if not performance_has_header:
+            self.writer_agent_vars.writeheader()
 
         self.info_log_buffer = []
         self.agent_vars_buffer = []
@@ -1045,9 +657,12 @@ class MPO:
         if self.writer_info is None:
             return
 
-        self.reward_tracker.update(infos['original_reward'][0])
-        self.reward_tracker.log()
-
+        if "original_reward" in infos:
+            tracked_reward = infos["original_reward"][0]
+        else:
+            tracked_reward = float(rewards.reshape(-1)[0].item())
+        self.reward_tracker.update(tracked_reward)
+        
         if global_step % self.args.log_every_n_steps != 0:
             return
 
@@ -1078,10 +693,6 @@ class MPO:
                 "kl_q_rel": metrics.get("kl_q_rel"),
                 "kl_mean_rel": metrics.get("kl_mean_rel"),
                 "kl_stddev_rel": metrics.get("kl_stddev_rel"),
-                "kl_mean_rel_min": metrics.get("kl_mean_rel_min"),
-                "kl_mean_rel_max": metrics.get("kl_mean_rel_max"),
-                "kl_stddev_rel_min": metrics.get("kl_stddev_rel_min"),
-                "kl_stddev_rel_max": metrics.get("kl_stddev_rel_max"),
                 "q_min": metrics.get("q_min"),
                 "q_max": metrics.get("q_max"),
                 "pi_stddev_min": metrics.get("pi_stddev_min"),
@@ -1091,17 +702,17 @@ class MPO:
                 "SPS": sps,
                 "average_reward_per_second": (self.reward_tracker.average_reward_per_second),
                 "reward": reward_value,
+                "mean_return": self.reward_tracker.mean_return,
             }
             for idx in range(self.act_dim):
                 agent_vars_row[f"dual_alpha_mean_{idx}"] = metrics.get(f"dual_alpha_mean_{idx}")
                 agent_vars_row[f"dual_alpha_stddev_{idx}"] = metrics.get(f"dual_alpha_stddev_{idx}")
-                agent_vars_row[f"kl_mean_rel_{idx}"] = metrics.get(f"kl_mean_rel_{idx}")
-                agent_vars_row[f"kl_stddev_rel_{idx}"] = metrics.get(f"kl_stddev_rel_{idx}")
                 agent_vars_row[f"pi_stddev_{idx}"] = metrics.get(f"pi_stddev_{idx}")
             
             self.agent_vars_buffer.append(agent_vars_row)
 
         if global_step % self.args.save_every_n_steps == 0:
+            self.reward_tracker.log()
             for row in self.info_log_buffer:
                 self.writer_info.writerow(row)
             self.csv_file_info.flush()
@@ -1111,6 +722,7 @@ class MPO:
                 self.writer_agent_vars.writerow(row)
             self.csv_file_agent_vars.flush()
             self.agent_vars_buffer = []
+    
     def save_checkpoint(self):
         checkpoint_step = self.global_step
         checkpoint = {
@@ -1124,24 +736,13 @@ class MPO:
             "dual_optimizer": self.dual_optimizer.state_dict(),
 
             "log_eta": self.log_eta.detach().cpu().clone(),
-            "log_alpha_mean": (
-                self.log_alpha_mean.detach().cpu().clone()
-            ),
-            "log_alpha_stddev": (
-                self.log_alpha_stddev.detach().cpu().clone()
-            ),
+            "log_alpha_mean": (self.log_alpha_mean.detach().cpu().clone()),
+            "log_alpha_stddev": (self.log_alpha_stddev.detach().cpu().clone()),
             "log_penalty_eta": (self.log_penalty_eta.detach().cpu().clone()),
-
             "global_step": self.global_step,
             "learner_step": self.learner_step,
-
-            # Optional, but useful for checking continued-run consistency.
-            "target_policy_update_period": (
-                self.target_policy_update_period
-            ),
-            "target_critic_update_period": (
-                self.target_critic_update_period
-            ),
+            "target_policy_update_period": (self.target_policy_update_period),
+            "target_critic_update_period": (self.target_critic_update_period),
         }
         torch.save(checkpoint, os.path.join(self.weights_folder, f"checkpoint_{self.global_step}.pth"))
         # if global_step % self.args.save_every_n_steps == 0:
@@ -1225,11 +826,10 @@ def compute_weights_and_temperature_loss(q_values: torch.Tensor, epsilon: float,
     Temperature loss, used to adapt the temperature.
   """
 
-  # Temper the given Q-values using the current temperature.
+  # divide Q-values by temp
   tempered_q_values = q_values.detach() / temperature
 
-  # Compute the normalized importance weights used to compute expectations with
-  # respect to the non-parametric policy.
+  # Compute the normalized importance weights (weights of actions that online policy should update toward)
   normalized_weights = F.softmax(tempered_q_values, dim=0).detach()
 
   # Compute the temperature loss (dual of the E-step optimization problem).
@@ -1271,7 +871,7 @@ def compute_cross_entropy_loss(
   # Compute the weighted average log-prob using the normalized weights.
   loss_policy_gradient = -torch.sum(log_prob * normalized_weights, dim=0,) #(B,)
 
-  # Return the mean loss over the batch of states.
+  # return the mean loss over batch of states = b
   return loss_policy_gradient.mean(dim=0)
 
 def compute_parametric_kl_penalty_and_dual_loss(
@@ -1323,19 +923,24 @@ def parse_args():
     parser.add_argument("--exp_name", type=str, default="dmpo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--torch_deterministic", type=bool, default=True)
+    parser.add_argument("--torch_deterministic", action="store_true", default=False)
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--capture_video", action="store_true")
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
-    parser.add_argument("--log_every_n_steps", type=int, default=100)
+    parser.add_argument("--log_every_n_steps", type=int, default=4000)
 
-    parser.add_argument("--env_id", type=str, default="EAnt")
+    parser.add_argument(
+        "--env_id",
+        type=str,
+        default="EAnt",
+        help="Embodied Ant id (EAnt / SimEmbodiedAnt / HwEmbodiedAnt) or Gymnasium "
+             "MuJoCo id (Hopper-v5, Walker2d-v5, Humanoid-v5, Ant-v5, ...)",
+    )
     parser.add_argument("--total_timesteps", type=int, default=60_000)
     parser.add_argument("--num_envs", type=int, default=1)
 
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
-    #parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--batch_size", type=int, default=512)
 
     parser.add_argument("--vmin", type=float, default=-500,
@@ -1350,7 +955,7 @@ def parse_args():
     #Logging
     parser.add_argument("--log_interval", type=int, default=100,
                         help="env steps between TensorBoard scalar writes")
-    #MPO
+    # MPO
     parser.add_argument("--epsilon_eta", type=float, default=1e-1,
                         help="epsilon for E-step temperature dual")
     parser.add_argument("--epsilon_mu_kl", type=float, default=2.5e-3,
@@ -1371,19 +976,14 @@ def parse_args():
     parser.add_argument("--learning_starts", type=int, default=200)
     parser.add_argument("--policy_lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=1e-3)
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gamma", type=float, default=0.92)
     # layer norm arg is only effective if old Actor class is used rather than AcmeActo
     parser.add_argument("--use_layer_norm", action=argparse.BooleanOptionalAction, default=True) 
 
     parser.add_argument("--policy_layer_sizes",type=int,nargs="+",default=[256, 256, 256])
     parser.add_argument("--critic_layer_sizes",type=int,nargs="+",default=[512, 512, 256])
-    parser.add_argument("--utd", type=int, default=32)
     parser.add_argument("--td_horizon", type=int, default=5,
                         help="number of steps collapsed into each replay transition")
-    parser.add_argument("--decouple_q_learning", action=argparse.BooleanOptionalAction, default=True,
-                        help="use --decouple_q_learning or --no-decouple_q_learning")
-    parser.add_argument("--policy_learning_starts", type=int, default=500,
-                        help="steps of Q-only warmup after learning_starts when --decouple_q_learning is set")
     
     parser.add_argument("--checkpoint_step",type=int,default=None,
                             help="Specific checkpoint step to load, e.g. 95000. If omitted, loads latest.")
@@ -1397,21 +997,28 @@ def parse_args():
     parser.add_argument("--init_log_alpha_stddev", type=float, default=1000.0)
 
     # Environment.
-    parser.add_argument("--dt", type=float, default=0.15)
+    parser.add_argument("--dt", type=float, default=0.12)
     parser.add_argument("--hw_config", type=str, default=None)
     parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
     parser.add_argument("--weights_path", type=str, default=None)
+    parser.add_argument("--resume_in_place", action="store_true", default=False)
     parser.add_argument("--task_type", type=str, default="back_and_forth",
                         choices=["forward", "back_and_forth"])
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3)
     parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3])
-    parser.add_argument("--reward_scale", type=float, default=100.0)
+    parser.add_argument(
+        "--reward_scale",
+        type=float,
+        default=None,
+        help="Reward multiplier (default: 100 for embodied Ant, 1 for Gymnasium envs)",
+    )
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
-    parser.add_argument("--samples_per_insert",type=float,default=512.0,
+    parser.add_argument("--samples_per_insert",type=float,default=1536.0,
                         help="Replay samples consumed per valid environment transition")
+
     parser.add_argument("--action_penalization",action=argparse.BooleanOptionalAction,default=True,
                         help="MO-MPO action penalization for pi-target samples outside bounds")
     parser.add_argument("--epsilon_penalty",type=float,default=1e-3,
@@ -1421,57 +1028,7 @@ def parse_args():
     parser.add_argument("--policy_init_scale", type=float, default=0.7)
     parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
-    # parser.add_argument("--policy_torso_init_scale", type=float, default=0.333)
-    # parser.add_argument("--policy_head_init_scale", type=float, default=1e-4)
-
-    # parser.add_argument("--critic_torso_init_scale", type=float, default=0.333)
-    # parser.add_argument("--critic_head_init_scale", type=float, default=1e-4)
     return parser.parse_args()
-
-def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
-    def make_env(seed, idx, capture_video, run_name):
-        def _init():
-            joint_config = {
-                'hip_zero': 0,
-                'knee_zero': -np.radians(50),
-                'hip_range': np.radians(30),
-                'knee_range': np.radians(20),
-            }
-            if args.hw_config is None:
-                env = AntEnv(
-                    control_dt=args.dt,
-                    render_mode=args.render_mode,
-                    terminate_on_upside_down=args.terminate_on_upside_down,
-                    task=task,
-                    joint_config=joint_config,
-                    model_path=os.path.join(os.path.dirname(__file__), args.model_path),
-                )
-            else:
-                with open(args.hw_config, 'r') as f:
-                    cfg = json.load(f)
-                env = make_ant_env(cfg, render_mode=args.render_mode,
-                                   dt=args.dt, joint_config=joint_config, task=task)
-            if capture_video and idx == 0:
-                env = gym.wrappers.RecordVideo(
-                    env,
-                    os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
-                    step_trigger=lambda x: x % args.save_every_n_steps == 0,
-                    video_length=args.save_every_n_steps,
-                )
-            env.action_space.seed(seed)
-            env = gym.wrappers.TransformReward(env, lambda r: r * args.reward_scale)
-            return env
-        return _init
-
-    env_raw = gym.vector.SyncVectorEnv(
-        [make_env(args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)],autoreset_mode=AutoresetMode.NEXT_STEP)
-    assert isinstance(env_raw.single_action_space, gym.spaces.Box), "[!] Only continuous action space is supported."
-    
-    # wrap the env using skrl, gymnasium
-    envs = wrap_env(env_raw, wrapper="gymnasium")
-    print(f"[√] Created environment with {envs.num_envs} environments.")
-    
-    return env_raw, envs
 
 def _try_run_git_command(args, cwd):
     try:
@@ -1510,27 +1067,65 @@ def main():
     set_seed(args.seed,deterministic=args.torch_deterministic)
     seed = args.seed
     args.learning_starts = args.learning_starts//args.num_envs #integer div takes floor
-    args.policy_learning_starts = args.policy_learning_starts//args.num_envs
 
     date = datetime.now().strftime("%Y%m%d-%H%M%S")
-    disk_folder = ''
-    os.makedirs(args.runs_directory, exist_ok=True)
-    run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
-    os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
+    disk_folder = ""
+    if args.resume_in_place:
+        if args.weights_path is None:
+            raise ValueError("--resume_in_place requires --weights_path")
 
-    if args.task_type == "forward":
-        task = ForwardTask()
-    elif args.task_type == "back_and_forth":
-        RADIUS = args.radius_back_and_forth
-        ORIGIN = np.array(args.origin_back_and_forth)
-        task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
-        print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
+        weights_path = os.path.abspath(args.weights_path.rstrip("/"))
+        if os.path.basename(weights_path) != "weights_and_args":
+            raise ValueError("--weights_path must point to the weights_and_args directory ")
+        run_dir = os.path.dirname(weights_path)
+
+        args.runs_directory = os.path.dirname(run_dir)
+        run_name = os.path.basename(run_dir)
+
+        print(f"[√] Resuming in existing run directory: {run_dir}")
     else:
-        raise ValueError(f"Invalid task type: {args.task_type}")
+        os.makedirs(args.runs_directory, exist_ok=True)
+        run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
+        os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
-    raw_env, envs = make_ant_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
+    task = None
+    if not is_gymnasium_env(args.env_id):
+        if args.task_type == "forward":
+            task = ForwardTask()
+        elif args.task_type == "back_and_forth":
+            RADIUS = args.radius_back_and_forth
+            ORIGIN = np.array(args.origin_back_and_forth)
+            task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
+            print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
+        else:
+            raise ValueError(f"Invalid task type: {args.task_type}")
+
+    raw_env, envs = make_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
+    
+    model = raw_env.envs[0].unwrapped.model
+    print("\n========== LOADED MUJOCO MODEL ==========")
+    print("env_id:", args.env_id)
+    print("requested model_path:", args.model_path)
+    print("nbody:", model.nbody)
+    print("nu:", model.nu)
+    print("action space:", raw_env.single_action_space)
+    print("body masses:", model.body_mass)
+    print("geom friction:")
+    print(model.geom_friction)
+    print("actuator ctrlrange:")
+    print(model.actuator_ctrlrange)
+    print("actuator dyntype:")
+    print(model.actuator_dyntype)
+    print("first actuator dynprm:")
+    print(model.actuator_dynprm[:, 0])
+    print("=========================================\n")
+
     agent = MPO(args=args,envs=envs,disk_folder=disk_folder,run_name=run_name,runs_directory=args.runs_directory)
     
+    save_git_info(
+        os.path.join(args.runs_directory, run_name),
+        os.path.dirname(__file__),
+    )
     if args.weights_path is not None:
         agent.load_checkpoint(args.weights_path,
             checkpoint_step=args.checkpoint_step,
@@ -1543,15 +1138,20 @@ def main():
     print(f"num_envs: {envs.num_envs}")
 
     obs, info = envs.reset()
-    agent.initialize_logging(info)
+    agent.initialize_logging(info, append=args.resume_in_place)
+    
+    if args.resume_in_place:
+        # RewardTracker has its own counter, so continue it from the checkpoint.
+        agent.reward_tracker.step = agent.global_step
 
-    try:
-        from torch.utils.tensorboard import SummaryWriter
-        os.makedirs(agent.log_dir, exist_ok=True)
-        writer = SummaryWriter(agent.log_dir)
-    except ImportError:
-        writer = None
-        print("[!] tensorboard not available, printing only")
+    # try:
+    #     from torch.utils.tensorboard import SummaryWriter
+    #     os.makedirs(agent.log_dir, exist_ok=True)
+    #     writer = SummaryWriter(agent.log_dir)
+    # except ImportError:
+    #     writer = None
+    #     print("[!] tensorboard not available, printing only")
+    writer = None
 
     #time_start_learning = time.time()
     step_times = []
@@ -1572,28 +1172,31 @@ def main():
             current_step = agent.global_step
             agent.log_step(current_step, infos, rewards, metrics)
 
-            if writer is not None and current_step % args.log_interval == 0:
-                writer.add_scalar("reward/mean", float(rewards.mean()), current_step)
-                if "benchmark_reward" in infos:
-                    writer.add_scalar("reward/benchmark",
-                                        float(np.asarray(infos["benchmark_reward"]).mean()), current_step)
-                writer.add_scalar("perf/buffer_size", agent.rb.size(), current_step)
-            if metrics is not None:
-                for k, v in metrics.items():
-                    if isinstance(v, (int, float)):
-                        writer.add_scalar(f"agent/{k}", v, agent.learner_step)
+            # TENSORBOARD THINGS
+            # if writer is not None and current_step % args.log_interval == 0:
+            #     writer.add_scalar("reward/mean", float(rewards.mean()), current_step)
+            #     if "benchmark_reward" in infos:
+            #         writer.add_scalar("reward/benchmark",
+            #                             float(np.asarray(infos["benchmark_reward"]).mean()), current_step)
+            #     writer.add_scalar("perf/buffer_size", agent.rb.size(), current_step)
+            # if metrics is not None:
+            #     for k, v in metrics.items():
+            #         if isinstance(v, (int, float)):
+            #             writer.add_scalar(f"agent/{k}", v, agent.learner_step)
     
-            # ---- checkpoints (<run_dir>/weights_and_args) ----
+            # checkpoints (<run_dir>/weights_and_args) 
             if (not args.eval and current_step % args.save_every_n_steps == 0):
                 agent.save_checkpoint()
                 if writer is not None:
                     writer.flush()
             step_times.append(f"{current_step},{time.time() - time_now}\n")
 
-        with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
-            f.writelines(step_times)
+        # with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
+        #     f.writelines(step_times)
     finally:
-        with open(os.path.join(args.runs_directory,run_name,"step_times.csv"),"w") as f:
+        step_times_mode = "a" if args.resume_in_place else "w"
+
+        with open(os.path.join(args.runs_directory,run_name,"step_times.csv"),step_times_mode) as f:
             f.writelines(step_times)
 
         if not args.eval:

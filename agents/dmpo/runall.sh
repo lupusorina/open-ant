@@ -8,12 +8,12 @@ set -euo pipefail
 #   bash run-dmpo-ant.sh hw
 
 # Seeds run in this exact order.
-SEEDS=(10 1 2 3 8 7 6 5 4 9 0)
+SEEDS=(0 4 5 6 9)
 
 SCRIPT="dmpo_acme.py"
 
 # Sim1 and Sim2 both save under this same parent directory.
-RUNS_DIR="runs/spi1536_gamma92_init_min"
+RUNS_DIR="runs/spi1536_vmax20_51atoms"
 
 # Sim1 output folders:
 #   runs-ant/dmpo_retrace_YYYYMMDD-HHMMSS_seed_3
@@ -57,6 +57,10 @@ run_sim () {
         --seed "${seed}" \
         --gamma 0.92 \
         --cuda \
+        --batch_size 512 \
+        --vmin -500 \
+        --vmax 20 \
+        --num_atoms 51
         $(video_flag)
 
     local sim_run_dir
@@ -141,7 +145,7 @@ run_continual () {
 
     python3 "${SCRIPT}" \
         --render_mode rgb_array \
-        --total_timesteps 120_000 \
+        --total_timesteps 200_000 \
         --dt 0.12 \
         --env_id SimEmbodiedAnt \
         --runs_directory "${RUNS_DIR}" \
@@ -153,6 +157,10 @@ run_continual () {
         --model_path ../../sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml \
         --gamma 0.92 \
         --cuda \
+        --batch_size 512 \
+        --vmin -500 \
+        --vmax 20 \
+        --num_atoms 51
         $(video_flag)
 
     echo "Continual learning complete for seed ${seed}."

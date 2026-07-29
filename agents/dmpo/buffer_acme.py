@@ -46,7 +46,8 @@ class ReplayBufferSamples(NamedTuple):
     observations: th.Tensor
     actions: th.Tensor
     next_observations: th.Tensor
-    dones: th.Tensor
+    terminations: th.Tensor
+    truncations: th.Tensor
     rewards: th.Tensor
 
 class NStepReplayBufferSamples(NamedTuple):
@@ -277,12 +278,12 @@ class ReplayBuffer(BaseBuffer):
         https://github.com/DLR-RM/stable-baselines3/issues/284
     """
 
-    observations: np.ndarray
-    next_observations: np.ndarray
-    actions: np.ndarray
-    rewards: np.ndarray
-    dones: np.ndarray
-    timeouts: np.ndarray
+    observations: th.Tensor
+    next_observations: th.Tensor
+    actions: th.Tensor
+    rewards: th.Tensor
+    terminations: th.Tensor
+    truncations: th.Tensor
 
     def __init__(
         self,
@@ -292,7 +293,6 @@ class ReplayBuffer(BaseBuffer):
         device: th.device | str = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
-        handle_timeout_termination: bool = True,
     ):
         super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
 
@@ -305,11 +305,11 @@ class ReplayBuffer(BaseBuffer):
 
         # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
         # see https://github.com/DLR-RM/stable-baselines3/issues/934
-        if optimize_memory_usage and handle_timeout_termination:
-            raise ValueError(
-                "ReplayBuffer does not support optimize_memory_usage = True "
-                "and handle_timeout_termination = True simultaneously."
-            )
+        # if optimize_memory_usage and handle_timeout_termination:
+        #     raise ValueError(
+        #         "ReplayBuffer does not support optimize_memory_usage = True "
+        #         "and handle_timeout_termination = True simultaneously."
+        #     )
         self.optimize_memory_usage = optimize_memory_usage
 
         self.observations = th.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=th.float32, device=self.device)
@@ -322,20 +322,24 @@ class ReplayBuffer(BaseBuffer):
         #self.behavior_log_probs = th.zeros((self.buffer_size, self.n_envs, 1), dtype=th.float32, device=self.device)
 
         self.rewards = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=self.device)
-        self.dones = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=self.device)
+        self.terminations = th.zeros((self.buffer_size, self.n_envs),
+            dtype=th.bool,
+            device=self.device)
+        self.truncations = th.zeros((self.buffer_size, self.n_envs),
+            dtype=th.bool,
+            device=self.device)
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
-        self.handle_timeout_termination = handle_timeout_termination
-        self.timeouts = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=self.device)
+        # self.handle_timeout_termination = handle_timeout_termination
+        # self.timeouts = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=self.device)
 
-        # Per-row validity: 0 marks a phantom autoreset-boundary transition that
-        # must never be a sampling start index. Defaults to 1 (usable).
-        self.valid = th.ones((self.buffer_size, self.n_envs), dtype=th.float32, device=self.device)
+        # valid = 0 means an autoreset-boundary transition that
+        # should not be sampled
+        self.valid = th.ones((self.buffer_size, self.n_envs), dtype=th.bool, device=self.device)
 
         if psutil is not None:
             total_memory_usage: float = (
-                self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes
-            )
+                self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.terminations.nbytes + self.truncations.nbytes)
 
             if not optimize_memory_usage:
                 total_memory_usage += self.next_observations.nbytes
@@ -355,11 +359,9 @@ class ReplayBuffer(BaseBuffer):
         next_obs: th.Tensor,
         action: th.Tensor,
         reward: th.Tensor,
-        done: th.Tensor,
-        infos: list[dict[str, Any]],
-        #behavior_log_prob: th.Tensor | None = None,
-        truncation: th.Tensor | None = None,
-        valid: th.Tensor | None=None,
+        terminated: th.Tensor,
+        truncated: th.Tensor,
+        valid: th.Tensor | None = None,
     ) -> None:
 
         # Copy to avoid modification by reference
@@ -370,26 +372,35 @@ class ReplayBuffer(BaseBuffer):
         # if behavior_log_prob is not None:
         #     self.behavior_log_probs[self.pos].copy_(behavior_log_prob.view(self.n_envs, 1))
         self.rewards[self.pos].copy_(reward.view(self.n_envs))
-        self.dones[self.pos].copy_(done.view(self.n_envs))
+
+        self.terminations[self.pos].copy_(
+            terminated.to(self.device).bool().view(self.n_envs)
+        )
+        self.truncations[self.pos].copy_(
+            truncated.to(self.device).bool().view(self.n_envs)
+        )
+
         if valid is not None:
-            self.valid[self.pos].copy_(valid.float().view(self.n_envs))
+            self.valid[self.pos].copy_(
+                valid.to(self.device).bool().view(self.n_envs)
+            )
         else:
             self.valid[self.pos].fill_(1.0)
         #_______________________________________________________________________________
-        if self.handle_timeout_termination:
-            if truncation is not None:
-                self.timeouts[self.pos].copy_(
-                    truncation.to(self.device).float().view(self.n_envs)
-                )
-            else:
-                self.timeouts[self.pos].copy_(
-                    th.as_tensor(
-                        [info.get("TimeLimit.truncated", False) for info in infos],
-                        dtype=th.float32,
-                        device=self.device,
-                    ).view(self.n_envs)
-                )
-        #____________________________________________________________________________________
+        # if self.handle_timeout_termination:
+        #     if truncation is not None:
+        #         self.timeouts[self.pos].copy_(
+        #             truncation.to(self.device).float().view(self.n_envs)
+        #         )
+        #     else:
+        #         self.timeouts[self.pos].copy_(
+        #             th.as_tensor(
+        #                 [info.get("TimeLimit.truncated", False) for info in infos],
+        #                 dtype=th.float32,
+        #                 device=self.device,
+        #             ).view(self.n_envs)
+        #         )
+        # #____________________________________________________________________________________
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -424,16 +435,14 @@ class ReplayBuffer(BaseBuffer):
         else:
             next_obs = self.next_observations[batch_inds, env_indices, :]
 
-        data = (
-            self.observations[batch_inds, env_indices, :],
-            self.actions[batch_inds, env_indices, :],
-            next_obs,
-            # set "returned_dones"=0 for endings that are due to timeouts
-            # this makes truncations (endings due to timeouts) bootstrapable in target = r + y*(1-dones)* V(S_t+1)
-            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-            self.rewards[batch_inds, env_indices].reshape(-1, 1),
+        return ReplayBufferSamples(
+            observations=self.observations[batch_inds, env_indices, :],
+            actions=self.actions[batch_inds, env_indices, :],
+            next_observations=next_obs,
+            terminations=self.terminations[batch_inds, env_indices].reshape(-1, 1),
+            truncations=self.truncations[batch_inds, env_indices].reshape(-1, 1),
+            rewards=self.rewards[batch_inds, env_indices].reshape(-1, 1),
         )
-        return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
     def sample_nstep(self, batch_size: int, n_step: int, gamma: float) -> "NStepReplayBufferSamples":
         if n_step < 1:
@@ -487,72 +496,57 @@ class ReplayBuffer(BaseBuffer):
             # unsqueeze(1) turns a row of env ids being sampled into 1 column
         rewards = self.rewards[all_inds, env_inds.unsqueeze(1)]
         
+        terminations = self.terminations[all_inds, env_inds.unsqueeze(1)]
+        truncations = self.truncations[all_inds, env_inds.unsqueeze(1)]
         # constructing each of these requires all_inds[b,k] - which supplies the time-row coordinate
         # and env_inds[b] - which supplies the environment coordinate.
         # Episode boundary = termination or truncation
-        boundaries = self.dones[all_inds, env_inds.unsqueeze(1)]
         
-        # whether episode boundary is a time-limit truncation
-        if self.handle_timeout_termination:
-            timeouts = self.timeouts[all_inds, env_inds.unsqueeze(1)]
-        else:
-            timeouts = th.zeros_like(boundaries)
+        boundaries = terminations | truncations 
+        # environment discount = 1 - termination. no bootstrapping in termination, but have bootstrapping in truncation
+        env_discounts = (~terminations).to(rewards.dtype)       
         
-        #  environment discount: termination = 0, truncation -> 1, ordinary step -> 1
-        terminals = boundaries * (1.0 - timeouts)
-        env_discounts = 1.0 - terminals
-
-        # only include transition at index k if no episode boundary 
-        # occurred before k.
-        # i.e. boundary = [0, 0, 1, ...], then valid = [1, 1, 1, 0, ...]
+        # array that is like the b"boundaries" tensor, but shift eveyrthing 1 position right 
+        # so it would indicate whether the previous transition is a boundary. 
         prior_boundaries = th.cat(
             [th.zeros_like(boundaries[:, :1]), boundaries[:, :-1]], dim=1)
-
-        valid = th.cumprod(
-            1.0 - prior_boundaries,
-            dim=1,
-        )
+        # if the prev transition is reaching an s_t+1 = boundary, this transition is not valid
+        valid = th.cumprod((~prior_boundaries).to(rewards.dtype), dim=1)
 
         # Product of environment discounts before each reward:
         # reward 0 multiplier has no preceding discount
         preceding_env_discount = th.cumprod(
             th.cat(
-                [
-                    th.ones_like(env_discounts[:, :1]),
-                    env_discounts[:, :-1],
-                ],
-                dim=1,
-            ),
-            dim=1,
-        )
+                [th.ones_like(env_discounts[:, :1]),env_discounts[:, :-1]],
+                dim=1), dim=1)
 
         gamma_tensor = th.as_tensor(
             gamma,dtype=rewards.dtype,device=self.device)
 
+        # gamma_powers = [1, gamma, gamma^2, ..., gamma^(n_step-1)]
         gamma_powers = th.pow(
             gamma_tensor,
-            th.arange(
-                n_step,
-                dtype=rewards.dtype,
-                device=self.device,
-            ),
-        ).unsqueeze(0)
+            th.arange(n_step,dtype=rewards.dtype,device=self.device)).unsqueeze(0)
 
         # n-step reward: r_0 + gamma*d_0*r_1 + ...
+        # sum of all the V[b,k] * gamma^k * r[b,k] * preceding-env-discount
+        # note, if preceding_env_discount[b,k] = 0: means termination = true at the last transition
+        # so reward term k and subsequent terms all = 0 (zero bootstrapping)
+        # include rewards up to & including the boundary transition
+        # and exclude rewrds from after the boundary 
         collapsed_rewards = (
             valid
             * preceding_env_discount
             * gamma_powers
             * rewards
-        ).sum(
-            dim=1,
-            keepdim=True)
+        ).sum(dim=1,keepdim=True)
 
-        # Effective trajectory length:
-        # n_step unless a termination/truncation boundary occurs first.
+        # trajectory length / number of included transitions 
         horizons = valid.sum(dim=1).to(th.long)  # (B,)
 
-        # Product of environment discounts over included transitions.
+        # Product of environment discounts over included transitions
+        # if "valid = true", use value at "env_discounts"
+        # if valid = false, put "1" there since it won't influence the env_discount_product 
         included_env_discounts = th.where(
             valid.bool(),
             env_discounts,
@@ -562,13 +556,10 @@ class ReplayBuffer(BaseBuffer):
             dim=1,
             keepdim=True)
 
-        # ACME stores gamma^(horizon - 1) * product(environment discounts).
-        # The learner applies the final gamma.
+        #  stores gamma^(horizon - 1) * product(environment discounts)
+        # then during training, the learner applies the final gamma
         collapsed_discounts = (
-            th.pow(
-                gamma_tensor,
-                horizons.to(rewards.dtype) - 1.0,
-            ).unsqueeze(-1)
+            th.pow(gamma_tensor,horizons.to(rewards.dtype) - 1.0).unsqueeze(-1)
             * env_discount_product)
 
         # Select s_{t+horizon}
@@ -602,8 +593,8 @@ class ReplayBuffer(BaseBuffer):
             actions=self.actions.cpu().numpy(),
            # behavior_log_probs=self.behavior_log_probs.cpu().numpy(),
             rewards=self.rewards.cpu().numpy(),
-            dones=self.dones.cpu().numpy(),
-            timeouts=self.timeouts.cpu().numpy(),
+            terminations=self.terminations.cpu().numpy(),
+            truncations=self.truncations.cpu().numpy(),
             pos=self.pos,
             full=self.full,
             valid=self.valid.cpu().numpy(),
@@ -618,11 +609,12 @@ class ReplayBuffer(BaseBuffer):
         self.actions = th.from_numpy(data['actions']).to(self.device)
        # self.behavior_log_probs = th.from_numpy(data['behavior_log_probs']).to(self.device) if 'behavior_log_probs' in data else th.zeros_like(self.behavior_log_probs)
         self.rewards = th.from_numpy(data['rewards']).to(self.device)
-        self.dones = th.from_numpy(data['dones']).to(self.device)
-        self.timeouts = th.from_numpy(data['timeouts']).to(self.device)
+        self.terminations = th.from_numpy(data["terminations"]).to(self.device)
+        self.truncations = th.from_numpy(data["truncations"]).to(self.device)
+        
         self.pos = int(data['pos'])
         self.full = bool(data['full'])
-        self.valid = th.from_numpy(data['valid']).to(self.device) if 'valid' in data else th.ones_like(self.dones)
+        self.valid = th.from_numpy(data['valid']).to(self.device) if 'valid' in data else th.ones_like(self.terminations)
 
 
         # Only store device for later (used in to_torch)
