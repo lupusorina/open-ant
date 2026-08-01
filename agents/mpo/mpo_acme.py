@@ -177,6 +177,9 @@ class MPO:
         self.reward_tracker = None
         self.csv_file_info = None
         self.csv_file_agent_vars = None
+        self.csv_file_raw_actions = None
+        self.writer_raw_actions = None
+        self.raw_action_buffer = []
         self.writer_info = None
         self.writer_agent_vars = None
         self.keys_info = None
@@ -552,10 +555,24 @@ class MPO:
         self.writer_info = csv.DictWriter(self.csv_file_info, fieldnames=["step"] + self.keys_info)
         if not info_has_header:
             self.writer_info.writeheader()
-
+        
+        raw_action_path = os.path.join(log_dir,"raw_actions.csv")
+        raw_action_has_header = (
+            append
+            and os.path.exists(raw_action_path)
+            and os.path.getsize(raw_action_path) > 0)
+        self.csv_file_raw_actions = open(raw_action_path,mode,newline="")
+        self.writer_raw_actions = csv.writer(self.csv_file_raw_actions)
+        if not raw_action_has_header:
+            self.writer_raw_actions.writerow(
+                ["step"]
+                + [f"action_{i}" for i in range(self.act_dim)]
+            )
+        self.raw_action_buffer = []
+        reward_log_env_id = self.args.env_id.replace("/", "_")
         self.reward_tracker = RewardTracker(
             env_dt=self.args.dt,
-            env_id=self.args.env_id,
+            env_id=reward_log_env_id,
             log_folder=log_dir,
             time_window=120.0,
         )
@@ -573,7 +590,7 @@ class MPO:
         self.info_log_buffer = []
         self.agent_vars_buffer = []
 
-    def log_step(self, global_step, infos, rewards, metrics=None):
+    def log_step(self, global_step, infos, rewards, metrics=None, raw_action=None):
         if self.writer_info is None:
             return
 
@@ -582,14 +599,29 @@ class MPO:
         else:
             tracked_reward = float(rewards.reshape(-1)[0].item())
         self.reward_tracker.update(tracked_reward)
-        
+        if raw_action is not None:
+            if torch.is_tensor(raw_action):
+                raw_action_np = (raw_action.detach().cpu().numpy())
+            else:
+                raw_action_np = np.asarray(raw_action)
+            action_0 = raw_action_np[0]
+            self.raw_action_buffer.append([global_step, *action_0.tolist()])
+        # Write the accumulated actions only once every save interval.
+        if (global_step % self.args.save_every_n_steps == 0
+            and self.raw_action_buffer
+        ):
+            self.writer_raw_actions.writerows(self.raw_action_buffer)
+            self.csv_file_raw_actions.flush()
+            self.raw_action_buffer.clear()
         if global_step % self.args.log_every_n_steps != 0:
             return
 
         row = {"step": global_step}
+        
         for k in self.keys_info:
             if k in infos:
                 row[k] = arr_to_str(infos[k][0])
+        
         self.info_log_buffer.append(row)
 
 
@@ -714,6 +746,10 @@ class MPO:
             print(f"[√] Loaded replay buffer.")
     
     def cleanup(self):
+        if self.writer_raw_actions is not None and self.raw_action_buffer:
+            self.writer_raw_actions.writerows(self.raw_action_buffer)
+            self.csv_file_raw_actions.flush()
+            self.raw_action_buffer.clear()
         if self.writer_info is not None and self.info_log_buffer:
             for row in self.info_log_buffer:
                 self.writer_info.writerow(row)
@@ -724,6 +760,8 @@ class MPO:
             self.csv_file_agent_vars.flush()
         if self.csv_file_info:
             self.csv_file_info.close()
+        if self.csv_file_raw_actions is not None:
+            self.csv_file_raw_actions.close()
         if self.csv_file_agent_vars:
             self.csv_file_agent_vars.close()
         if self.envs:
@@ -1011,23 +1049,28 @@ def main():
 
     raw_env, envs = make_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
     
-    model = raw_env.envs[0].unwrapped.model
-    print("\n========== LOADED MUJOCO MODEL ==========")
+    print("\n========== LOADED ENVIRONMENT ==========")
     print("env_id:", args.env_id)
-    print("requested model_path:", args.model_path)
-    print("nbody:", model.nbody)
-    print("nu:", model.nu)
+    print("observation space:", raw_env.single_observation_space)
     print("action space:", raw_env.single_action_space)
-    print("body masses:", model.body_mass)
-    print("geom friction:")
-    print(model.geom_friction)
-    print("actuator ctrlrange:")
-    print(model.actuator_ctrlrange)
-    print("actuator dyntype:")
-    print(model.actuator_dyntype)
-    print("first actuator dynprm:")
-    print(model.actuator_dynprm[:, 0])
-    print("=========================================\n")
+    print("dt:", args.dt)
+    if not args.env_id.startswith("dm_control/"):
+        model = raw_env.envs[0].unwrapped.model
+        print("requested model_path:", args.model_path)
+        print("nbody:", model.nbody)
+        print("nu:", model.nu)
+        print("body masses:", model.body_mass)
+        print("geom friction:")
+        print(model.geom_friction)
+        print("actuator ctrlrange:")
+        print(model.actuator_ctrlrange)
+        print("actuator dyntype:")
+        print(model.actuator_dyntype)
+        print("first actuator dynprm:")
+        print(model.actuator_dynprm[:, 0])
+    else:
+        print("DeepMind Control model: managed internally by dm_control")
+    print("========================================\n")
 
     agent = MPO(args=args,envs=envs,disk_folder=disk_folder,run_name=run_name,runs_directory=args.runs_directory)
     
@@ -1079,7 +1122,7 @@ def main():
                 metrics = agent.agent_step(next_obs, selected_actions, rewards, terminations, truncations, infos)
             
             current_step = agent.global_step
-            agent.log_step(current_step, infos, rewards, metrics)
+            agent.log_step(current_step, infos, rewards, metrics, raw_action=selected_actions)
 
             # TENSORBOARD THINGS
             # if writer is not None and current_step % args.log_interval == 0:

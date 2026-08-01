@@ -10,7 +10,13 @@ import gymnasium as gym
 import numpy as np
 from gymnasium.vector import AutoresetMode
 from skrl.envs.wrappers.torch import wrap_env
+try:
+    import shimmy
 
+    # Makes the registration explicit.
+    gym.register_envs(shimmy)
+except ImportError:
+    shimmy = None
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../sim")))
 from ant_mujoco import AntEnv
 
@@ -71,7 +77,28 @@ def _make_gymnasium_env(args, seed, idx, disk_folder, run_name, runs_directory, 
     if args.capture_video and idx == 0 and render_mode is None:
         render_mode = "rgb_array"
 
-    env = gym.make(args.env_id, render_mode=render_mode, xml_file=args.model_path)
+    is_dm_control = args.env_id.startswith("dm_control/")
+    gym_kwargs = {"render_mode": render_mode}
+    # Gymnasium MuJoCo environments accept your custom XML.
+    # DeepMind Control environments construct their own models.
+    if is_dm_control:
+        # Seed random initial joint states and target placement.
+        gym_kwargs["task_kwargs"] = {
+            "random": seed,
+        }
+
+        # Ask dm_control itself to concatenate its named observations.
+        gym_kwargs["environment_kwargs"] = {
+            "flat_observation": True,
+        }
+    else:
+        # Only ordinary Gymnasium MuJoCo environments receive custom XML.
+        gym_kwargs["xml_file"] = args.model_path
+
+    env = gym.make(args.env_id, **gym_kwargs)
+    if isinstance(env.observation_space, gym.spaces.Dict):
+        env = gym.wrappers.FlattenObservation(env)
+
     # Gymnasium MuJoCo often returns float64 obs while declaring float32 spaces.
     float32_obs_space = gym.spaces.Box(
         low=env.observation_space.low.astype(np.float32),
