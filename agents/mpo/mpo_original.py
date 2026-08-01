@@ -134,10 +134,12 @@ class MPO:
 
         self.log_eta = nn.Parameter(
             torch.full((1,), self._init_log_eta, dtype=torch.float32, device=self.device))
+        
+        # no more per-dimension log alpha/stddevs. 
         self.log_alpha_mean = nn.Parameter(
-            torch.full((self.act_dim,), self._init_log_alpha_mean, dtype=torch.float32, device=self.device))
+            torch.full((1,), self._init_log_alpha_mean, dtype=torch.float32, device=self.device))
         self.log_alpha_stddev = nn.Parameter(
-            torch.full((self.act_dim,), self._init_log_alpha_stddev, dtype=torch.float32, device=self.device))
+            torch.full((1,), self._init_log_alpha_stddev, dtype=torch.float32, device=self.device))
         self.log_penalty_eta = nn.Parameter(torch.full((1,),self._init_log_eta,dtype=torch.float32,device=self.device))
         self.dual_optimizer = optim.Adam(
             [
@@ -207,8 +209,6 @@ class MPO:
         for idx in range(self.act_dim):
             self.keys_agent_vars.extend(
                 [
-                    f"dual_alpha_mean_{idx}",
-                    f"dual_alpha_stddev_{idx}",
                     f"pi_stddev_{idx}",
                 ]
             )
@@ -427,7 +427,7 @@ class MPO:
                     log_mu = behavior_log_probs[:, 1:]
                     log_rhos = log_pi - log_mu
                     clipped_rhos = torch.exp(torch.clamp(log_rhos,max=0.0))
-                    c_t = (self._retrace_lambda * clipped_rhos)
+                    c_t = clipped_rhos
                 else:
                     q_t = rewards.new_empty((B, 0))
                     c_t = rewards.new_empty((B, 0))
@@ -555,21 +555,28 @@ class MPO:
             normalized_weights += penalty_normalized_weights  # pyrefly: ignore[unsupported-operation]
             loss_temperature += loss_penalty_temperature  # pyrefly: ignore[unsupported-operation]
     
-        # Decompose the online policy into fixed-mean & fixed-stddev distributions
-        # https://arxiv.org/pdf/1812.02256.pdf.
-        fixed_stddev_distribution = dist.Independent(dist.Normal(online_mu, target_sigma), 1)
-        fixed_mean_distribution = dist.Independent(dist.Normal(target_mu, online_sigma), 1)
-
         # Compute the decomposed policy losses.
-        loss_policy_mean = compute_cross_entropy_loss(
-            sampled_actions, normalized_weights, fixed_stddev_distribution)
-        loss_policy_stddev = compute_cross_entropy_loss(
-            sampled_actions, normalized_weights, fixed_mean_distribution)
+        # loss_policy_mean = compute_cross_entropy_loss(
+        #     sampled_actions, normalized_weights, fixed_stddev_distribution)
+        # loss_policy_stddev = compute_cross_entropy_loss(
+        #     sampled_actions, normalized_weights, fixed_mean_distribution)
+        
+        # one non-decoupled M-step likelihood, comparing entire online policy vs q(a|s) parametric dist.
+        loss_policy = compute_cross_entropy_loss(
+            sampled_actions, normalized_weights, online_policy)
 
-        kl_mean = torch.distributions.kl_divergence(target_policy.base_dist,
-            fixed_stddev_distribution.base_dist)  # Shape [B, D].
-        kl_stddev = torch.distributions.kl_divergence(target_policy.base_dist,
-            fixed_mean_distribution.base_dist)  # Shape [B, D]
+        old_var = target_sigma.square()
+        new_var = online_sigma.square()
+        kl_mean_per_state = 0.5 * ((online_mu - target_mu).square() / new_var).sum(dim=-1)
+        kl_cov_per_state = 0.5 * (
+            old_var / new_var 
+            - 1.0 
+            + torch.log(new_var / old_var)
+        ).sum(dim=-1)
+        # expected constraints over replay states, approximate integral by taking mean
+        kl_mean = kl_mean_per_state.mean()  #dimension = 1. scalar KL vals.
+        kl_stddev = kl_cov_per_state.mean()
+
         
         # Compute the alpha-weighted KL-penalty and dual losses to adapt the alphas.
         loss_kl_mean, loss_alpha_mean = compute_parametric_kl_penalty_and_dual_loss(
@@ -578,7 +585,7 @@ class MPO:
             kl_stddev, alpha_stddev, self._epsilon_stddev)
         
         # Combine losses.
-        loss_policy = loss_policy_mean + loss_policy_stddev 
+       
         loss_kl_penalty = loss_kl_mean + loss_kl_stddev
         loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature
         total_mpo_loss = (loss_policy + loss_kl_penalty + loss_dual)
@@ -586,8 +593,7 @@ class MPO:
         # critic_trainable_variables = self.__critic_network.trainable_variables
 
         # record stats
-        mean_kl_mean_per_dim = kl_mean.mean(dim=0)
-        mean_kl_stddev_per_dim = kl_stddev.mean(dim=0)
+      
 
         pi_stddev = online_sigma
         pi_stddev_min_per_state = pi_stddev.min(dim=-1).values
@@ -628,12 +634,6 @@ class MPO:
 
         # per dim vals
         for j in range(self.act_dim):
-            policy_stats[f"dual_alpha_mean_{j}"] = (
-                alpha_mean[j].detach().item()
-            )
-            policy_stats[f"dual_alpha_stddev_{j}"] = (
-                alpha_stddev[j].detach().item()
-            )
             policy_stats[f"pi_stddev_{j}"] = (
                 pi_stddev[:, j].detach().mean().item()
             )
@@ -781,8 +781,6 @@ class MPO:
                 "mean_return": self.reward_tracker.mean_return,
             }
             for idx in range(self.act_dim):
-                agent_vars_row[f"dual_alpha_mean_{idx}"] = metrics.get(f"dual_alpha_mean_{idx}")
-                agent_vars_row[f"dual_alpha_stddev_{idx}"] = metrics.get(f"dual_alpha_stddev_{idx}")
                 agent_vars_row[f"pi_stddev_{idx}"] = metrics.get(f"pi_stddev_{idx}")
             
             self.agent_vars_buffer.append(agent_vars_row)
@@ -957,37 +955,38 @@ def compute_cross_entropy_loss(
   return loss_policy_gradient.mean(dim=0)
 
 def compute_parametric_kl_penalty_and_dual_loss(
-    kl: torch.Tensor,
-    alpha: nn.Parameter,
-    epsilon: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-  """Computes the KL cost to be added to the Lagragian and its dual loss.
+        kl: torch.Tensor,
+        alpha: nn.Parameter,
+        epsilon: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Computes the KL cost to be added to the Lagragian and its dual loss.
 
-  The KL cost is simply the alpha-weighted KL divergence and it is added as a
-  regularizer to the policy loss. The dual variable alpha itself has a loss that
-  can be minimized to adapt the strength of the regularizer to keep the KL
-  between consecutive updates at the desired target value of epsilon.
+    The KL cost is simply the alpha-weighted KL divergence and it is added as a
+    regularizer to the policy loss. The dual variable alpha itself has a loss that
+    can be minimized to adapt the strength of the regularizer to keep the KL
+    between consecutive updates at the desired target value of epsilon.
 
-  Args:
-    kl: KL divergence between the target and online policies.
-    alpha: Lagrange multipliers (dual variables) for the KL constraints.
-    epsilon: Desired value for the KL.
+    Args:
+        kl: KL divergence between the target and online policies.
+        alpha: Lagrange multipliers (dual variables) for the KL constraints.
+        epsilon: Desired value for the KL.
 
-  Returns:
-    loss_kl: alpha-weighted KL regularization to be added to the policy loss.
-    loss_alpha: The Lagrange dual loss minimized to adapt alpha.
-  """
+    Returns:
+        loss_kl: alpha-weighted KL regularization to be added to the policy loss.
+        loss_alpha: The Lagrange dual loss minimized to adapt alpha.
+    """
 
-  # Compute the mean KL over the batch.
-  mean_kl = kl.mean(dim=0)  # (D,)
+    # Compute the mean KL over the batch.
+    #mean_kl = kl.mean(dim=0)  # [B,D] --> (D,)
+    mean_kl = kl.mean()
 
-  # actor sees gradients through KL, not alpha
-  loss_kl = torch.sum(alpha.detach() * mean_kl)
+    # actor sees gradients through KL, not alpha
+    loss_kl = alpha.detach() * mean_kl
 
-  # Compute the dual loss.
-  loss_alpha = torch.sum(alpha * (epsilon - mean_kl.detach()))
+    # Compute the dual loss.
+    loss_alpha = alpha.squeeze() * (epsilon - mean_kl.detach())
 
-  return loss_kl, loss_alpha
+    return loss_kl, loss_alpha
 
 def compute_nonparametric_kl_from_normalized_weights(
     normalized_weights: torch.Tensor) -> torch.Tensor:
