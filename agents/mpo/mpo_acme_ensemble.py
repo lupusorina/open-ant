@@ -35,7 +35,10 @@ from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
 
-from nn import AcmeActor, ScalarAcmeCritic
+try:
+    from .nn import AcmeActor, ScalarAcmeCritic  # imported as package
+except ImportError:
+    from nn import AcmeActor, ScalarAcmeCritic   # run standalone
 
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -846,7 +849,7 @@ def td_learning(v_tm1, r_t, pcont_t, v_t):
 
     return loss, target, td_error
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_name", type=str, default="empo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
@@ -934,7 +937,7 @@ def parse_args():
     parser.add_argument("--policy_init_scale", type=float, default=0.7)
     parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     def make_env(seed, idx, capture_video, run_name):

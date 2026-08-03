@@ -1318,7 +1318,7 @@ def compute_nonparametric_kl_from_normalized_weights(
     # Return the expectation with respect to the non-parametric policy.
     return torch.sum(normalized_weights * integrand,dim=0,)
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_name", type=str, default="dmpo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
@@ -1426,7 +1426,7 @@ def parse_args():
 
     # parser.add_argument("--critic_torso_init_scale", type=float, default=0.333)
     # parser.add_argument("--critic_head_init_scale", type=float, default=1e-4)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     def make_env(seed, idx, capture_video, run_name):
