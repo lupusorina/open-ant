@@ -10,7 +10,9 @@ set -euo pipefail
 # Seeds run in this exact order.
 SEEDS=(10 1 2 3 8 7 6 5 4 9 0)
 
-SCRIPT="dmpo_acme.py"
+# The DMPO agent is now a configuration of the merged agent in agents/mpo.
+SCRIPT="../mpo/mpo_acme.py"
+CRITIC_TYPE="categorical"
 
 # Sim1 and Sim2 both save under this same parent directory.
 RUNS_DIR="runs/spi1536_gamma92_init_min"
@@ -47,6 +49,7 @@ run_sim () {
     touch "${marker}"
 
     python3 "${SCRIPT}" \
+        --critic_type "${CRITIC_TYPE}" \
         --render_mode rgb_array \
         --total_timesteps 40_000 \
         --dt 0.12 \
@@ -140,6 +143,7 @@ run_continual () {
     echo "=========================================="
 
     python3 "${SCRIPT}" \
+        --critic_type "${CRITIC_TYPE}" \
         --render_mode rgb_array \
         --total_timesteps 120_000 \
         --dt 0.12 \
@@ -187,6 +191,7 @@ elif [ "$1" == "sim_then_continual" ]; then
 
 elif [ "$1" == "hw" ]; then
     python3 "${SCRIPT}" \
+        --critic_type "${CRITIC_TYPE}" \
         --render_mode rgb_array \
         --dt 0.20 \
         --total_timesteps 60000 \
