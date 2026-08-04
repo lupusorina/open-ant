@@ -23,3 +23,7 @@ tyro
 pandas
 mediapy
 wandb
+
+# hyperparameter tuning
+optuna>=4.9
+optuna-dashboard
