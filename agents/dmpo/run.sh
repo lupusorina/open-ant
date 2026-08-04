@@ -1,7 +1,8 @@
 #!/bin/bash
 # Learn in simulation.
 if [ "$1" == "sim" ]; then
-        python3 dmpo_acme.py \
+        python3 ../mpo/mpo_acme.py \
+            --critic_type categorical \
             --render_mode rgb_array \
             --total_timesteps 40_000 \
             --dt 0.12 \
