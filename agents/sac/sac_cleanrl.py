@@ -424,7 +424,7 @@ def arr_to_str(x):
         return "[" + " ".join(map(str, x.tolist())) + "]"
     return x
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
 
     # General.
@@ -513,7 +513,7 @@ def parse_args():
         terminate_on_upside_down=True,
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args
 
 if __name__ == "__main__":
