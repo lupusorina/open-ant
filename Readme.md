@@ -155,6 +155,30 @@ cd agents/sarsa/
 ./run.sh hw
 ```
 
+## Hyperparameter tuning
+
+Optuna-based tuning of the agents
+
+MPO:
+```bash
+python3 -m tuning.runner --entry agents.mpo.tune_mpo --name mpo_search --storage-dir runs/tuning --workers 8 --n-trials 512
+```
+
+SAC:
+```bash
+python3 -m tuning.runner --entry agents.sac.tune_sac --name sac_search --storage-dir runs/tuning --workers 8 --n-trials 512
+```
+
+ANY (MPO and SAC in one study ~ should find the best algorithm and its hyperparameters):
+```bash
+python3 -m tuning.runner --entry agents.tune_any --name any_search --storage-dir runs/tuning --workers 8 --n-trials 1024
+```
+
+Monitor the tuning progress with the optuna-dashboard:
+```bash
+optuna-dashboard runs/tuning/*_search.journal
+```
+
 ## Frequently Asked Questions (FAQ)
 
 ### Q: The position of the ant flickers. What should I do?
