@@ -6,36 +6,39 @@ import argparse
 import subprocess
 import csv
 import time
-import math
 import random
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
 
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as dist
 
-from skrl.envs.wrappers.torch import wrap_env
 from skrl.utils import set_seed
 try:
-    from .buffer_acme import NStepReplayBufferSamples, ReplayBuffer  # imported as package
+    from .buffer_acme import ReplayBuffer  # imported as package
 except ImportError:
-    from buffer_acme import NStepReplayBufferSamples, ReplayBuffer   # run standalone
+    from buffer_acme import ReplayBuffer   # run standalone
+try:
+    from .envs import is_gymnasium_env, make_envs
+except ImportError:
+    from envs import is_gymnasium_env, make_envs
 
-import gymnasium as gym
-from gymnasium.vector import AutoresetMode
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../sim')))
-from ant_mujoco import AntEnv
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../embodied_ant_env')))
-from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
+from embodied_ant_env import ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
 
-from nn import AcmeActor, ScalarAcmeCritic
+try:
+    from .nn import (AcmeActor, AcmeCritic, DiscreteValuedDistribution,  # imported as package
+                     ScalarAcmeCritic, categorical, td_learning)
+except ImportError:
+    from nn import (AcmeActor, AcmeCritic, DiscreteValuedDistribution,   # run standalone
+                    ScalarAcmeCritic, categorical, td_learning)
 
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -109,20 +112,37 @@ class MPO:
         for p in self.actor_target.parameters():
             p.requires_grad = False
 
-        self.critic = ScalarAcmeCritic(
-            obs_dim=self.obs_dim,
-            act_dim=self.act_dim,
-            action_low=self.action_low,
-            action_high=self.action_high,
-            layer_sizes=critic_layer_sizes,
-        ).to(self.device)
+        if self.args.critic_type == "categorical":
+            critic_cls = AcmeCritic
+            critic_kwargs = dict(
+                vmin=args.vmin,
+                vmax=args.vmax,
+                num_atoms=args.num_atoms,
+            )
+        else:
+            critic_cls = ScalarAcmeCritic
+            critic_kwargs = {}
 
-        self.target_critic = copy.deepcopy(self.critic)
-        for p in self.target_critic.parameters():
+        self.critics = nn.ModuleList([
+            critic_cls(
+                obs_dim=self.obs_dim,
+                act_dim=self.act_dim,
+                action_low=self.action_low,
+                action_high=self.action_high,
+                layer_sizes=critic_layer_sizes,
+                **critic_kwargs,
+            ) for _ in range(self.args.ensemble)
+        ]).to(self.device)
+
+        self.target_critics = copy.deepcopy(self.critics)
+        for p in self.target_critics.parameters():
             p.requires_grad = False
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.policy_lr)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.q_lr)
+        self.critic_optimizers = [
+            optim.Adam(critic.parameters(), lr=args.q_lr)
+            for critic in self.critics
+        ]
 
         self._init_log_eta = args.init_log_temperature
         self._init_log_alpha_mean = args.init_log_alpha_mean
@@ -178,15 +198,21 @@ class MPO:
         self.reward_tracker = None
         self.csv_file_info = None
         self.csv_file_agent_vars = None
+        self.csv_file_raw_actions = None
+        self.writer_raw_actions = None
+        self.raw_action_buffer = []
         self.writer_info = None
         self.writer_agent_vars = None
         self.keys_info = None
         self.keys_agent_vars = [
-            "critic_loss","policy_loss","dual_alpha_mean","dual_alpha_stddev",
+            "critic_loss",
+            *([f"critic_loss_{idx}" for idx in range(self.args.ensemble)]
+              if self.args.ensemble > 1 else []),
+            "policy_loss","dual_alpha_mean","dual_alpha_stddev",
             "dual_temperature","loss_alpha","loss_temperature","loss_policy_cross_entropy",
             "loss_kl_penalty","kl_q_rel","kl_mean_rel","kl_stddev_rel","q_min",
             "q_max","pi_stddev_min","pi_stddev_max","pi_stddev_cond","utd",
-            "SPS","average_reward_per_second","reward"]
+            "SPS","average_reward_per_second","reward","mean_return"]
 
         for idx in range(self.act_dim):
             self.keys_agent_vars.extend(
@@ -207,6 +233,7 @@ class MPO:
         # when transitioning from terminal state to reset state - this is when pending_autoreset=1,
         # to inform agent to not use this transition during training.
         self.pending_autoreset = torch.zeros(self.envs.num_envs,dtype=torch.bool,device=self.device)
+        self._ep_returns = np.zeros(self.envs.num_envs, dtype=np.float64)
         print("Agent initialized and compiled")
     
     def _random_action(self):
@@ -235,6 +262,28 @@ class MPO:
                 return actions
         return self._random_action()
 
+    def _step_rewards_np(self, infos, rewards):
+        if "original_reward" in infos:
+            return np.asarray(infos["original_reward"], dtype=np.float64).reshape(-1)
+        if isinstance(rewards, torch.Tensor):
+            return rewards.detach().cpu().numpy().reshape(-1).astype(np.float64)
+        return np.asarray(rewards, dtype=np.float64).reshape(-1)
+
+    def _update_episode_returns(self, infos, rewards, boundaries, autoreset_now):
+        if self.reward_tracker is None:
+            return
+        step_rewards = self._step_rewards_np(infos, rewards)
+        done_np = boundaries.detach().cpu().numpy().reshape(-1).astype(bool)
+        autoreset_np = autoreset_now.detach().cpu().numpy().reshape(-1).astype(bool)
+        n = min(self.envs.num_envs, len(step_rewards))
+        for i in range(n):
+            if autoreset_np[i]:
+                self._ep_returns[i] = step_rewards[i]
+            else:
+                self._ep_returns[i] += step_rewards[i]
+                if done_np[i]:
+                    self.reward_tracker.record_episode_return(self._ep_returns[i])
+
     def agent_step(self, next_obs, actions, rewards, terminations, truncations, infos):
         terminations = terminations.bool()
         truncations = truncations.bool()
@@ -248,6 +297,8 @@ class MPO:
         else:
             autoreset_now = self.pending_autoreset
         valid = ~autoreset_now
+
+        self._update_episode_returns(infos, rewards, boundaries, autoreset_now)
 
         num_inserts = int(valid.sum().item())
         self.rb.add(
@@ -291,10 +342,18 @@ class MPO:
                 self.actor_target.load_state_dict(self.actor.state_dict())
 
             if (self.learner_step % self.target_critic_update_period == 0):
-                self.target_critic.load_state_dict(self.critic.state_dict())
+                for critic, target_critic in zip(self.critics, self.target_critics):
+                    target_critic.load_state_dict(critic.state_dict())
         self.learner_step += 1
 
         with torch.no_grad():
+            # Randomized critic subset in case of ensemble
+            subset_size = min(2, len(self.critics))
+            if len(self.critics) > 1:
+                subset_idx = torch.randperm(len(self.critics), device=self.device)[:subset_size]
+            else:
+                subset_idx = None
+
             # 1. sample 1 replay batch
             data = self.rb.sample_nstep(
                 batch_size=self.batch_size,
@@ -328,28 +387,79 @@ class MPO:
             )
 
             flat_actions = sampled_actions.reshape(N * B, D)
-            
-            sampled_q_t = self.target_critic(
-                tiled_states,
-                flat_actions,
-            ).reshape(N,B)
-            
-            q_values = sampled_q_t
 
-            averaged_q_t = sampled_q_t.mean(dim=0)
-        
         online_policy = self.actor.forward(s_t)
-        online_q = self.critic(s_tm1, a_tm1).squeeze(-1)
 
         # bootstrapping coefficient
         pcont_t = (self.args.gamma * data.discounts).squeeze(-1)
-        
-        # TD loss: 0.5 * (target - online_q)^2, target = r_t + pcont_t * averaged_q_t
-        target = (r_t + pcont_t * averaged_q_t).detach()
-        td_error = target - online_q
-        critic_loss = (0.5 * td_error.square()).mean()
-        scalar_dtype = sampled_q_t.dtype
-        dual_variable_shape = D
+
+        if self.args.critic_type == "categorical":
+            # Sample from the target critic(s) and compute the average target distribution
+            with torch.no_grad():
+                sampled_q_t_distributions = [
+                    critic(tiled_states, flat_actions)
+                    for critic in self.target_critics
+                ]
+                num_atoms = sampled_q_t_distributions[0].logits.shape[-1]
+                sampled_q_logits = torch.stack([
+                    d.logits.reshape(N, B, num_atoms)
+                    for d in sampled_q_t_distributions], dim=0)
+
+                # Average the target over the sampled distributions from a subset of critics
+                if subset_idx is None:
+                    subset_logits = sampled_q_logits
+                    subset_atom_values = self.target_critics[0].atom_values
+                else:
+                    subset_logits = sampled_q_logits[subset_idx]
+                    subset_atom_values = self.target_critics[subset_idx[0]].atom_values
+                sampled_q_logprobs = torch.log_softmax(subset_logits, dim=-1)
+                averaged_target_logits = torch.logsumexp(sampled_q_logprobs, dim=(0, 1))
+
+                target_q_distribution = DiscreteValuedDistribution(
+                    values=subset_atom_values,
+                    logits=averaged_target_logits,
+                )
+                q_values = torch.stack([
+                    d.mean().reshape(N, B)
+                    for d in sampled_q_t_distributions], dim=0).mean(dim=0)
+
+            # Cross-entropy loss per critic
+            critic_loss_per_critic = torch.stack([
+                categorical(
+                    q_tm1=critic(s_tm1, a_tm1),
+                    r_t=r_t,
+                    d_t=pcont_t,
+                    q_t=target_q_distribution,
+                ).mean()
+                for critic in self.critics], dim=0)
+        else:
+            with torch.no_grad():
+                sampled_q_t = torch.stack([
+                    critic(tiled_states, flat_actions).squeeze(-1).reshape(N, B)
+                    for critic in self.target_critics], dim=0)
+
+                # Min over the sampled subset of critics
+                if subset_idx is None:
+                    q_values_target_calc = sampled_q_t.min(dim=0).values
+                else:
+                    q_values_target_calc = sampled_q_t[subset_idx].min(dim=0).values
+
+                # Mean over all critics for the Q values in the E-step
+                q_values = sampled_q_t.mean(dim=0)
+
+                # Average Q value across the sampled actions
+                averaged_q_t = q_values_target_calc.mean(dim=0)
+
+            # Q(s_t, a_t) for EACH online critic in the ensemble
+            online_q = torch.stack([
+                critic(s_tm1, a_tm1).squeeze(-1) for critic in self.critics], dim=0)
+
+            # TD loss: 0.5 * (target - online_q)^2, target = r_t + pcont_t * averaged_q_t
+            critic_loss_per_critic, _target, _td_error = td_learning(online_q, r_t, pcont_t, averaged_q_t)
+            critic_loss_per_critic = critic_loss_per_critic.mean(dim=1)
+
+        # Scalar objective as a sum over the ensemble of critics
+        critic_loss = critic_loss_per_critic.sum()
 
         with torch.no_grad():
             self.log_eta.clamp_(min=-18.0)
@@ -487,7 +597,8 @@ class MPO:
             )
 
         # Compute gradients 
-        self.critic_optimizer.zero_grad()
+        for optimizer in self.critic_optimizers:
+            optimizer.zero_grad()
         self.actor_optimizer.zero_grad()
         self.dual_optimizer.zero_grad()
 
@@ -495,58 +606,130 @@ class MPO:
         total_mpo_loss.backward()               # policy + KL penalty + dual, one backward
 
         # clip
-        nn.utils.clip_grad_norm_(self.critic.parameters(), self.args.max_grad_norm)
+        for critic, optimizer in zip(self.critics, self.critic_optimizers):
+            nn.utils.clip_grad_norm_(critic.parameters(), self.args.max_grad_norm)
+            optimizer.step()
+
         nn.utils.clip_grad_norm_(self.actor.parameters(), self.args.max_grad_norm)
 
-        self.critic_optimizer.step()
         self.actor_optimizer.step()
         self.dual_optimizer.step()
 
         # Losses to track.
         fetches = {
-            'critic_loss': critic_loss.detach().item(),
+            'critic_loss': critic_loss_per_critic.mean().detach().item(),
             'policy_loss': total_mpo_loss.detach().item(),
 
             **policy_stats,
         }
+        if self.args.ensemble > 1:
+            for idx, loss_i in enumerate(critic_loss_per_critic):
+                fetches[f"critic_loss_{idx}"] = loss_i.detach().item()
         return fetches
     
-    def initialize_logging(self, info):
+    def initialize_logging(self, info, append=False):
         self.start_time = time.time()
 
         log_dir = os.path.join(self.disk_folder, self.runs_directory, self.run_name)
-        self.csv_file_info = open(os.path.join(log_dir, "info_logs.csv"), "w", newline="")
-        self.keys_info = [k for k in info.keys() if not (k.startswith("bodies") or k.startswith("_"))]
-        self.writer_info = csv.DictWriter(self.csv_file_info, fieldnames=["step"] + self.keys_info)
-        self.writer_info.writeheader()
+        
+        mode = "a" if append else "w"
 
+        def _check_existing_header(path, fieldnames):
+            with open(path, "r", newline="") as f:
+                existing = next(csv.reader(f), None)
+            if existing is None or existing == list(fieldnames):
+                return
+            raise ValueError(
+                f"Cannot append to {path}: the run is being resumed with different settings than it was started with"
+            )
+
+        info_path = os.path.join(log_dir, "info_logs.csv")
+        info_has_header = (
+            append
+            and os.path.exists(info_path)
+            and os.path.getsize(info_path) > 0
+        )
+        self.keys_info = [k for k in info.keys() if not (k.startswith("bodies") or k.startswith("_"))]
+        if info_has_header:
+            _check_existing_header(info_path, ["step"] + self.keys_info)
+        self.csv_file_info = open(os.path.join(log_dir, "info_logs.csv"), mode, newline="")
+        self.writer_info = csv.DictWriter(self.csv_file_info, fieldnames=["step"] + self.keys_info)
+        if not info_has_header:
+            self.writer_info.writeheader()
+        
+        raw_action_path = os.path.join(log_dir,"raw_actions.csv")
+        raw_action_has_header = (
+            append
+            and os.path.exists(raw_action_path)
+            and os.path.getsize(raw_action_path) > 0)
+        if raw_action_has_header:
+            _check_existing_header(
+                raw_action_path,
+                ["step"] + [f"action_{i}" for i in range(self.act_dim)],
+            )
+        self.csv_file_raw_actions = open(raw_action_path,mode,newline="")
+        self.writer_raw_actions = csv.writer(self.csv_file_raw_actions)
+        if not raw_action_has_header:
+            self.writer_raw_actions.writerow(
+                ["step"]
+                + [f"action_{i}" for i in range(self.act_dim)]
+            )
+        self.raw_action_buffer = []
+        reward_log_env_id = self.args.env_id.replace("/", "_")
         self.reward_tracker = RewardTracker(
             env_dt=self.args.dt,
-            env_id=self.args.env_id,
+            env_id=reward_log_env_id,
             log_folder=log_dir,
             time_window=120.0,
         )
-
-        self.csv_file_agent_vars = open(os.path.join(log_dir, "performance_variables.csv"), "w", newline="")
+        performance_path = os.path.join(log_dir,"performance_variables.csv")
+        performance_has_header = (
+            append
+            and os.path.exists(performance_path)
+            and os.path.getsize(performance_path) > 0
+        )
+        if performance_has_header:
+            _check_existing_header(performance_path, ["step"] + self.keys_agent_vars)
+        self.csv_file_agent_vars = open(performance_path, mode, newline="")
         self.writer_agent_vars = csv.DictWriter(self.csv_file_agent_vars, fieldnames=["step"] + self.keys_agent_vars)
-        self.writer_agent_vars.writeheader()
+        if not performance_has_header:
+            self.writer_agent_vars.writeheader()
 
         self.info_log_buffer = []
         self.agent_vars_buffer = []
 
-    def log_step(self, global_step, infos, rewards, metrics=None):
+    def log_step(self, global_step, infos, rewards, metrics=None, raw_action=None):
         if self.writer_info is None:
             return
 
-        self.reward_tracker.update(infos['original_reward'][0])
-        
+        if "original_reward" in infos:
+            tracked_reward = infos["original_reward"][0]
+        else:
+            tracked_reward = float(rewards.reshape(-1)[0].item())
+        self.reward_tracker.update(tracked_reward)
+        if raw_action is not None:
+            if torch.is_tensor(raw_action):
+                raw_action_np = (raw_action.detach().cpu().numpy())
+            else:
+                raw_action_np = np.asarray(raw_action)
+            action_0 = raw_action_np[0]
+            self.raw_action_buffer.append([global_step, *action_0.tolist()])
+        # Write the accumulated actions only once every save interval.
+        if (global_step % self.args.save_every_n_steps == 0
+            and self.raw_action_buffer
+        ):
+            self.writer_raw_actions.writerows(self.raw_action_buffer)
+            self.csv_file_raw_actions.flush()
+            self.raw_action_buffer.clear()
         if global_step % self.args.log_every_n_steps != 0:
             return
 
         row = {"step": global_step}
+        
         for k in self.keys_info:
             if k in infos:
                 row[k] = arr_to_str(infos[k][0])
+        
         self.info_log_buffer.append(row)
 
 
@@ -579,6 +762,7 @@ class MPO:
                 "SPS": sps,
                 "average_reward_per_second": (self.reward_tracker.average_reward_per_second),
                 "reward": reward_value,
+                "mean_return": self.reward_tracker.mean_return,
             }
             for idx in range(self.act_dim):
                 agent_vars_row[f"dual_alpha_mean_{idx}"] = metrics.get(f"dual_alpha_mean_{idx}")
@@ -600,15 +784,14 @@ class MPO:
             self.agent_vars_buffer = []
     
     def save_checkpoint(self):
-        checkpoint_step = self.global_step
         checkpoint = {
             "actor": self.actor.state_dict(),
             "actor_target": self.actor_target.state_dict(),
-            "critic": self.critic.state_dict(),
-            "target_critic": self.target_critic.state_dict(),
+            "critics": [critic.state_dict() for critic in self.critics],
+            "target_critics": [critic.state_dict() for critic in self.target_critics],
 
             "actor_optimizer": self.actor_optimizer.state_dict(),
-            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "critic_optimizers": [optimizer.state_dict() for optimizer in self.critic_optimizers],
             "dual_optimizer": self.dual_optimizer.state_dict(),
 
             "log_eta": self.log_eta.detach().cpu().clone(),
@@ -620,6 +803,10 @@ class MPO:
             "target_policy_update_period": (self.target_policy_update_period),
             "target_critic_update_period": (self.target_critic_update_period),
         }
+        if len(self.critics) == 1:
+            checkpoint["critic"] = checkpoint["critics"][0]
+            checkpoint["target_critic"] = checkpoint["target_critics"][0]
+            checkpoint["critic_optimizer"] = checkpoint["critic_optimizers"][0]
         torch.save(checkpoint, os.path.join(self.weights_folder, f"checkpoint_{self.global_step}.pth"))
         # if global_step % self.args.save_every_n_steps == 0:
         self.rb.save(os.path.join(self.weights_folder, "replay_buffer.npz"))
@@ -645,10 +832,32 @@ class MPO:
         
         self.actor.load_state_dict(checkpoint["actor"])
         self.actor_target.load_state_dict(checkpoint["actor_target"])
-        self.critic.load_state_dict(checkpoint["critic"])
-        self.target_critic.load_state_dict(checkpoint["target_critic"])
+
+        def _checked_list(plural, singular, live, what):
+            saved = checkpoint[plural] if plural in checkpoint else [checkpoint[singular]]
+            if len(saved) != len(live):
+                raise ValueError(
+                    f"Ensemble size mismatch for {what}: the checkpoint at {checkpoint_path} stores {len(saved)} but this run was saved with --ensemble {len(live)}."
+                )
+            return saved
+
+        for critic, state_dict in zip(
+            self.critics, _checked_list("critics", "critic", self.critics, "critics")
+        ):
+            critic.load_state_dict(state_dict)
+        for target_critic, state_dict in zip(
+            self.target_critics,
+            _checked_list("target_critics", "target_critic", self.target_critics, "target critics"),
+        ):
+            target_critic.load_state_dict(state_dict)
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
-        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+        for optimizer, state_dict in zip(
+            self.critic_optimizers,
+            _checked_list(
+                "critic_optimizers", "critic_optimizer", self.critic_optimizers, "critic optimizers"
+            ),
+        ):
+            optimizer.load_state_dict(state_dict)
         self.dual_optimizer.load_state_dict(checkpoint["dual_optimizer"])
       
         with torch.no_grad():
@@ -670,6 +879,10 @@ class MPO:
             print(f"[√] Loaded replay buffer.")
     
     def cleanup(self):
+        if self.writer_raw_actions is not None and self.raw_action_buffer:
+            self.writer_raw_actions.writerows(self.raw_action_buffer)
+            self.csv_file_raw_actions.flush()
+            self.raw_action_buffer.clear()
         if self.writer_info is not None and self.info_log_buffer:
             for row in self.info_log_buffer:
                 self.writer_info.writerow(row)
@@ -680,6 +893,8 @@ class MPO:
             self.csv_file_agent_vars.flush()
         if self.csv_file_info:
             self.csv_file_info.close()
+        if self.csv_file_raw_actions is not None:
+            self.csv_file_raw_actions.close()
         if self.csv_file_agent_vars:
             self.csv_file_agent_vars.close()
         if self.envs:
@@ -794,7 +1009,7 @@ def compute_nonparametric_kl_from_normalized_weights(
     # Return the expectation with respect to the non-parametric policy.
     return torch.sum(normalized_weights * integrand,dim=0,)
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_name", type=str, default="mpo_ant")
     parser.add_argument("--runs_directory", type=str, default="runs")
@@ -805,13 +1020,29 @@ def parse_args():
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
     parser.add_argument("--log_every_n_steps", type=int, default=4000)
+    parser.add_argument("--critic_type", type=str, default="scalar", choices=["scalar", "categorical"], help="The 'scalar' critic is regular MPO, whereas 'categorical' distributional critic is for DMPO")
+    parser.add_argument("--ensemble", type=int, default=1, help="Number of critics in the ensemble, where 1 reproduces the single-critic agent")
 
-    parser.add_argument("--env_id", type=str, default="EAnt")
+    parser.add_argument(
+        "--env_id",
+        type=str,
+        default="EAnt",
+        help="Embodied Ant id (EAnt / SimEmbodiedAnt / HwEmbodiedAnt) or Gymnasium "
+             "MuJoCo id (Hopper-v5, Walker2d-v5, Humanoid-v5, Ant-v5, ...)",
+    )
     parser.add_argument("--total_timesteps", type=int, default=60_000)
     parser.add_argument("--num_envs", type=int, default=1)
 
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
     parser.add_argument("--batch_size", type=int, default=512)
+
+    # Categorical distributional critic
+    parser.add_argument("--vmin", type=float, default=-500.0,
+                        help="Minimum atom value for distributional critic")
+    parser.add_argument("--vmax", type=float, default=20.0,
+                        help="Maximum atom value for distributional critic")
+    parser.add_argument("--num_atoms", type=int, default=101,
+                        help="Number of categorical atoms for distributional critic")
 
     parser.add_argument("--log_interval", type=int, default=100,
                         help="env steps between TensorBoard scalar writes")
@@ -831,7 +1062,6 @@ def parse_args():
    
     parser.add_argument("--max_grad_norm", type=float, default=40.0)
 
-    parser.add_argument("--ensemble", type=int, default=1) #doesn't matter in this script
     # true learning start = learning start // num_envs (floor division)
     parser.add_argument("--learning_starts", type=int, default=200)
     parser.add_argument("--policy_lr", type=float, default=3e-4)
@@ -842,7 +1072,6 @@ def parse_args():
 
     parser.add_argument("--policy_layer_sizes",type=int,nargs="+",default=[256, 256, 256])
     parser.add_argument("--critic_layer_sizes",type=int,nargs="+",default=[512, 512, 256])
-    parser.add_argument("--utd", type=int, default=32)
     parser.add_argument("--td_horizon", type=int, default=5,
                         help="number of steps collapsed into each replay transition")
     
@@ -863,11 +1092,17 @@ def parse_args():
     parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
     parser.add_argument("--weights_path", type=str, default=None)
+    parser.add_argument("--resume_in_place", action="store_true", default=False)
     parser.add_argument("--task_type", type=str, default="back_and_forth",
                         choices=["forward", "back_and_forth"])
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3)
     parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3])
-    parser.add_argument("--reward_scale", type=float, default=100.0)
+    parser.add_argument(
+        "--reward_scale",
+        type=float,
+        default=None,
+        help="Reward multiplier (default: 100 for embodied Ant, 1 for Gymnasium envs)",
+    )
     parser.add_argument("--model_path", type=str,
                         default="../../sim/assets/ant_with_camera_after_sys_id.xml")
 
@@ -883,52 +1118,11 @@ def parse_args():
     parser.add_argument("--policy_init_scale", type=float, default=0.7)
     parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
 
-def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
-    def make_env(seed, idx, capture_video, run_name):
-        def _init():
-            joint_config = {
-                'hip_zero': 0,
-                'knee_zero': -np.radians(50),
-                'hip_range': np.radians(30),
-                'knee_range': np.radians(20),
-            }
-            if args.hw_config is None:
-                env = AntEnv(
-                    control_dt=args.dt,
-                    render_mode=args.render_mode,
-                    terminate_on_upside_down=args.terminate_on_upside_down,
-                    task=task,
-                    joint_config=joint_config,
-                    model_path=os.path.join(os.path.dirname(__file__), args.model_path),
-                )
-            else:
-                with open(args.hw_config, 'r') as f:
-                    cfg = json.load(f)
-                env = make_ant_env(cfg, render_mode=args.render_mode,
-                                   dt=args.dt, joint_config=joint_config, task=task)
-            if capture_video and idx == 0:
-                env = gym.wrappers.RecordVideo(
-                    env,
-                    os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
-                    step_trigger=lambda x: x % args.save_every_n_steps == 0,
-                    video_length=args.save_every_n_steps,
-                )
-            env.action_space.seed(seed)
-            env = gym.wrappers.TransformReward(env, lambda r: r * args.reward_scale)
-            return env
-        return _init
+    assert args.ensemble >= 1
 
-    env_raw = gym.vector.SyncVectorEnv(
-        [make_env(args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)],autoreset_mode=AutoresetMode.NEXT_STEP)
-    assert isinstance(env_raw.single_action_space, gym.spaces.Box), "[!] Only continuous action space is supported."
-    
-    # wrap the env using skrl, gymnasium
-    envs = wrap_env(env_raw, wrapper="gymnasium")
-    print(f"[√] Created environment with {envs.num_envs} environments.")
-    
-    return env_raw, envs
+    return args
 
 def _try_run_git_command(args, cwd):
     try:
@@ -969,22 +1163,62 @@ def main():
     args.learning_starts = args.learning_starts//args.num_envs #integer div takes floor
 
     date = datetime.now().strftime("%Y%m%d-%H%M%S")
-    disk_folder = ''
-    os.makedirs(args.runs_directory, exist_ok=True)
-    run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
-    os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
+    disk_folder = ""
+    if args.resume_in_place:
+        if args.weights_path is None:
+            raise ValueError("--resume_in_place requires --weights_path")
 
-    if args.task_type == "forward":
-        task = ForwardTask()
-    elif args.task_type == "back_and_forth":
-        RADIUS = args.radius_back_and_forth
-        ORIGIN = np.array(args.origin_back_and_forth)
-        task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
-        print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
+        weights_path = os.path.abspath(args.weights_path.rstrip("/"))
+        if os.path.basename(weights_path) != "weights_and_args":
+            raise ValueError("--weights_path must point to the weights_and_args directory ")
+        run_dir = os.path.dirname(weights_path)
+
+        args.runs_directory = os.path.dirname(run_dir)
+        run_name = os.path.basename(run_dir)
+
+        print(f"[√] Resuming in existing run directory: {run_dir}")
     else:
-        raise ValueError(f"Invalid task type: {args.task_type}")
+        os.makedirs(args.runs_directory, exist_ok=True)
+        run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
+        os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
-    raw_env, envs = make_ant_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
+    task = None
+    if not is_gymnasium_env(args.env_id):
+        if args.task_type == "forward":
+            task = ForwardTask()
+        elif args.task_type == "back_and_forth":
+            RADIUS = args.radius_back_and_forth
+            ORIGIN = np.array(args.origin_back_and_forth)
+            task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
+            print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
+        else:
+            raise ValueError(f"Invalid task type: {args.task_type}")
+
+    raw_env, envs = make_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
+    
+    print("\n========== LOADED ENVIRONMENT ==========")
+    print("env_id:", args.env_id)
+    print("observation space:", raw_env.single_observation_space)
+    print("action space:", raw_env.single_action_space)
+    print("dt:", args.dt)
+    if not args.env_id.startswith("dm_control/"):
+        model = raw_env.envs[0].unwrapped.model
+        print("requested model_path:", args.model_path)
+        print("nbody:", model.nbody)
+        print("nu:", model.nu)
+        print("body masses:", model.body_mass)
+        print("geom friction:")
+        print(model.geom_friction)
+        print("actuator ctrlrange:")
+        print(model.actuator_ctrlrange)
+        print("actuator dyntype:")
+        print(model.actuator_dyntype)
+        print("first actuator dynprm:")
+        print(model.actuator_dynprm[:, 0])
+    else:
+        print("DeepMind Control model: managed internally by dm_control")
+    print("========================================\n")
+
     agent = MPO(args=args,envs=envs,disk_folder=disk_folder,run_name=run_name,runs_directory=args.runs_directory)
     
     save_git_info(
@@ -1003,7 +1237,11 @@ def main():
     print(f"num_envs: {envs.num_envs}")
 
     obs, info = envs.reset()
-    agent.initialize_logging(info)
+    agent.initialize_logging(info, append=args.resume_in_place)
+    
+    if args.resume_in_place:
+        # RewardTracker has its own counter, so continue it from the checkpoint.
+        agent.reward_tracker.step = agent.global_step
 
     # try:
     #     from torch.utils.tensorboard import SummaryWriter
@@ -1017,7 +1255,6 @@ def main():
     #time_start_learning = time.time()
     step_times = []
 
-    train_steps = int(np.round(args.total_timesteps/args.num_envs))
     try:
         for step in tqdm(range(agent.global_step, args.total_timesteps)):
             time_now = time.time()
@@ -1031,7 +1268,7 @@ def main():
                 metrics = agent.agent_step(next_obs, selected_actions, rewards, terminations, truncations, infos)
             
             current_step = agent.global_step
-            agent.log_step(current_step, infos, rewards, metrics)
+            agent.log_step(current_step, infos, rewards, metrics, raw_action=selected_actions)
 
             # TENSORBOARD THINGS
             # if writer is not None and current_step % args.log_interval == 0:
@@ -1052,10 +1289,12 @@ def main():
                     writer.flush()
             step_times.append(f"{current_step},{time.time() - time_now}\n")
 
-        with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
-            f.writelines(step_times)
+        # with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
+        #     f.writelines(step_times)
     finally:
-        with open(os.path.join(args.runs_directory,run_name,"step_times.csv"),"w") as f:
+        step_times_mode = "a" if args.resume_in_place else "w"
+
+        with open(os.path.join(args.runs_directory,run_name,"step_times.csv"),step_times_mode) as f:
             f.writelines(step_times)
 
         if not args.eval:

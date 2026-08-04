@@ -183,6 +183,83 @@ class DiscreteValuedDistribution:
     def mean(self) -> torch.Tensor:
         return (self.probs * self.values).sum(dim=-1, keepdim=True)
 
+# critic is only allowed to output probabilities on fixed grid of return vals
+# Z = [logit(return =vmin), logit(return = vmax)], bins = num atoms 
+def l2_project(Zp: torch.Tensor, P: torch.Tensor, Zq: torch.Tensor) -> torch.Tensor:
+    """Project distribution (Zp, P) onto support Zq under the L2 metric over CDFs.
+
+    Zp: (B, Kp) source support
+    P:  (B, Kp) source probabilities
+    Zq: (Kq,) target support
+    returns: (B, Kq)
+    """
+    #Extracts vmin and vmax and construct helper tensors from Zq
+    vmin, vmax = Zq[0], Zq[-1]
+    d_pos = torch.cat([Zq, vmin[None]], dim=0)[1:]
+    d_neg = torch.cat([vmax[None], Zq], dim=0)[:-1]
+
+    # Clips Zp to be in new support range (vmin, vmax).
+    clipped_zp = torch.clamp(Zp, vmin, vmax)[:, None, :]
+    clipped_zq = Zq[None, :, None]
+
+    # Gets the distance between atom values in support
+    d_pos = (d_pos - Zq)[None, :, None]
+    d_neg = (Zq - d_neg)[None, :, None]
+
+    delta_qp = clipped_zp - clipped_zq
+    d_sign = (delta_qp >= 0.0).to(P.dtype)
+
+    delta_hat = (
+        d_sign * delta_qp / d_pos
+        - (1.0 - d_sign) * delta_qp / d_neg
+    )
+    P = P[:, None, :]
+    # returns the L2 projection of (Zp, P) onto Zq. --> note it's Zq!! not Zp!!
+
+    return torch.sum(torch.clamp(1.0 - delta_hat, 0.0, 1.0) * P, dim=2)
+
+
+# computes categorical distributional loss
+# q_t.values = the target atoms (the return bins, i.e. -150, -145, .. +150)
+# target for current = Z_target_t = r_t + gamma * Z_target(S_{t+1}, a'), where a' is from target policy
+# p_t is the probabilities for the logit values, which here, each logit val correspond to a target atom from q_t
+def categorical(
+    q_tm1: DiscreteValuedDistribution,
+    r_t: torch.Tensor,
+    d_t: torch.Tensor,
+    q_t: DiscreteValuedDistribution,
+) -> torch.Tensor:
+    """Categorical distributional loss. Returns per-sample loss (B,)."""
+    values = q_t.values
+
+    # r_t.reshape change reward shape from (B,) to (B,1)
+    # since values have shape (k,), where k = num atoms
+    # this makes every atom get the reward and d_t bellman shift.
+    z_t = r_t.reshape(-1, 1) + d_t.reshape(-1, 1) * values  # shape (B,K)
+    # in order to do l2_project, the atoms need probability mass p_t attached
+    # to each atom, not logits. 
+    p_t = torch.softmax(q_t.logits, dim=-1)
+
+    # need to project shifted distrib back onto atom values
+    target = l2_project(z_t, p_t, values).detach()
+
+    # pytorch equivalent of tf.nn.softmax_cross_entropy_with_logits
+    # loss = (-labels * torch.nn.functional.log_softmax(logits, dim=-1)).sum(dim=-1)
+    log_p_tm1 = torch.log_softmax(q_tm1.logits, dim=-1)
+    
+    # target = the projected (Zp, P) onto Zq - Z_w'(St, At)
+    # q_tm1 logits = online critic's prediction.
+    # cross entropy formula
+    return -(target * log_p_tm1).sum(dim=-1)
+
+def td_learning(v_tm1, r_t, pcont_t, v_t):
+    target = (r_t + pcont_t * v_t).detach()
+    td_error = target - v_tm1
+    loss = 0.5 * td_error.square()
+
+    return loss, target, td_error
+
+
 class DiscreteValuedHead(nn.Module):
     ''' maps hidden features to logits over a fixed support of return atoms,
     then returns a discretevalueddistribution '''
