@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # Usage:
-#   bash run-dmpo-ant.sh sim
-#   bash run-dmpo-ant.sh sim_continual_learning
-#   bash run-dmpo-ant.sh sim_then_continual
-#   bash run-dmpo-ant.sh hw
+#   bash runall.sh sim
+#   bash runall.sh sim_continual_learning
+#   bash runall.sh sim_then_continual
+#   bash runall.sh hw
 
 # Seeds run in this exact order.
 SEEDS=(10 1 2 3 8 7 6 5 4 9 0)
@@ -18,11 +18,11 @@ ENSEMBLE=3
 RUNS_DIR="runs/ensemble_spi1536_gamma92"
 
 # Sim1 output folders:
-#   runs-ant/dmpo_retrace_YYYYMMDD-HHMMSS_seed_3
+#   runs-ant/mpo_YYYYMMDD-HHMMSS_seed_3
 SIM_EXP_NAME="mpo"
 
 # Sim2 output folders:
-#   runs-ant/continuous_dmpo_retrace_YYYYMMDD-HHMMSS_seed_3
+#   runs-ant/continuous_mpo_YYYYMMDD-HHMMSS_seed_3
 CONT_EXP_NAME="continuous_mpo"
 
 CAPTURE_VIDEO=0
@@ -219,6 +219,6 @@ elif [ "$1" == "hw" ]; then
         $(video_flag)
 
 else
-    echo "Usage: bash run-dmpo-ant.sh {sim|sim_continual_learning|sim_then_continual|hw}"
+    echo "Usage: bash runall.sh {sim|sim_continual_learning|sim_then_continual|hw}"
     exit 1
 fi
