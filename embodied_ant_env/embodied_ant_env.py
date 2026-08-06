@@ -261,27 +261,27 @@ class EmbodiedAnt(gym.Env):
         if self.render_mode == 'human' or self.render_mode == 'rgb_array':
             self.i += 1
 
-            if isinstance(self.task, BackAndForthTask):
-                # Draw the origin circle.
-                origin_3D_O = np.array([self.task.origin[0], self.task.origin[1], 0.0])
-                self.tracker.draw_circle(self.vis_frame,
-                                            origin_3D_O,
-                                            self.task.radius)
-                reward_direction_I = np.array([self.task.reward_direction_I[0],
-                                                self.task.reward_direction_I[1],
-                                                0.0])
-                self.tracker.draw_arrow(self.vis_frame,
-                                            origin_3D_O,
-                                            reward_direction_I)
-                r_B = np.array([info['reward_direction_B_x'],
-                                info['reward_direction_B_y'],
-                                0.0])
-                if 'body' in info['bodies']:
-                    R_B_I = info['bodies']['body']['orientation']
-                    r_I = R_B_I @ r_B
-                    self.tracker.draw_arrow(self.vis_frame,
-                                            self.last_pos,
-                                            r_I)
+            # if isinstance(self.task, BackAndForthTask):
+            #     # Draw the origin circle.
+            #     origin_3D_O = np.array([self.task.origin[0], self.task.origin[1], 0.0])
+            #     self.tracker.draw_circle(self.vis_frame,
+            #                                 origin_3D_O,
+            #                                 self.task.radius)
+            #     reward_direction_I = np.array([self.task.reward_direction_I[0],
+            #                                     self.task.reward_direction_I[1],
+            #                                     0.0])
+            #     self.tracker.draw_arrow(self.vis_frame,
+            #                                 origin_3D_O,
+            #                                 reward_direction_I)
+            #     r_B = np.array([info['reward_direction_B_x'],
+            #                     info['reward_direction_B_y'],
+            #                     0.0])
+            #     if 'body' in info['bodies']:
+            #         R_B_I = info['bodies']['body']['orientation']
+            #         r_I = R_B_I @ r_B
+            #         self.tracker.draw_arrow(self.vis_frame,
+            #                                 self.last_pos,
+            #                                 r_I)
             info['vis_frame'] = self.vis_frame
             if self.render_mode == 'human':
                 if self.i % 10 == 0:
