@@ -1183,16 +1183,16 @@ def main():
         os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
     task = None
-    if not is_gymnasium_env(args.env_id):
-        if args.task_type == "forward":
-            task = ForwardTask()
-        elif args.task_type == "back_and_forth":
-            RADIUS = args.radius_back_and_forth
-            ORIGIN = np.array(args.origin_back_and_forth)
-            task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
-            print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
-        else:
-            raise ValueError(f"Invalid task type: {args.task_type}")
+    print(f"args.env_id: {args.env_id}")
+    if args.task_type == "forward":
+        task = ForwardTask()
+    elif args.task_type == "back_and_forth":
+        RADIUS = args.radius_back_and_forth
+        ORIGIN = np.array(args.origin_back_and_forth)
+        task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
+        print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
+    else:
+        raise ValueError(f"Invalid task type: {args.task_type}")
 
     raw_env, envs = make_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
     
@@ -1201,24 +1201,6 @@ def main():
     print("observation space:", raw_env.single_observation_space)
     print("action space:", raw_env.single_action_space)
     print("dt:", args.dt)
-    if not args.env_id.startswith("dm_control/"):
-        model = raw_env.envs[0].unwrapped.model
-        print("requested model_path:", args.model_path)
-        print("nbody:", model.nbody)
-        print("nu:", model.nu)
-        print("body masses:", model.body_mass)
-        print("geom friction:")
-        print(model.geom_friction)
-        print("actuator ctrlrange:")
-        print(model.actuator_ctrlrange)
-        print("actuator dyntype:")
-        print(model.actuator_dyntype)
-        print("first actuator dynprm:")
-        print(model.actuator_dynprm[:, 0])
-    else:
-        print("DeepMind Control model: managed internally by dm_control")
-    print("========================================\n")
-
     agent = MPO(args=args,envs=envs,disk_folder=disk_folder,run_name=run_name,runs_directory=args.runs_directory)
     
     save_git_info(
