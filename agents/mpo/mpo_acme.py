@@ -360,7 +360,9 @@ class MPO:
                 n_step=self.trajectory_length,
                 gamma=self.args.gamma,
             )
-            B = self.batch_size
+            B = data.observations.shape[0]
+            if B == 0:
+                raise RuntimeError("Replay buffer returned an empty batch")
             # the same samples are used to average the target categorical 
             # critic distributions & obtain scalar Q vals for MPO.
             N = self.args.sample_action_num
@@ -1096,7 +1098,7 @@ def parse_args(argv=None):
     parser.add_argument("--task_type", type=str, default="back_and_forth",
                         choices=["forward", "back_and_forth"])
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3)
-    parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3])
+    parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.7, -0.25])
     parser.add_argument(
         "--reward_scale",
         type=float,
