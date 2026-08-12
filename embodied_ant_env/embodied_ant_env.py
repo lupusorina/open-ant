@@ -418,7 +418,7 @@ class EmbodiedAnt(gym.Env):
             return True
         if 'body' in info['bodies']:
             img_pos = info['bodies']['body']['image_pos']
-            if img_pos[0] < 0.1 or img_pos[0] > 0.9 or img_pos[1] < 0.1 or img_pos[1] > 0.9:
+            if img_pos[0] < 0.05 or img_pos[0] > 0.95 or img_pos[1] < 0.05 or img_pos[1] > 0.95:
                 print('body is out of camera frame')
                 return True # body is out of frame
         return False
