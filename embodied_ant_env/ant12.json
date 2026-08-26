@@ -55,7 +55,7 @@
   "camera_id": 0,
   "camera_fov_diagonal_deg": 58,
   "camera_tag_sizes": {
-    "origin": 0.1,
+    "origin": 0.1,  
     "body": 0.045
   },
   "camera_tag_ids": {
