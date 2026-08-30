@@ -236,7 +236,6 @@ class PerWeightMetaAdam:
             p.add_(delta)    # w_t+1
 
             if self.use_idbd:
-                print("using idbd")
                 h = state["h"]
                 z = h * g    # the old h. z_t = h_t * g_t = meta gradient
                 h.mul_(self.gamma).add_(delta)   # h_t+1 = gamma * h_t + Delta w_t
@@ -260,8 +259,6 @@ class PerWeightMetaAdam:
                 state["beta"].addcdiv_(
                     meta_m_hat, torch.sqrt(meta_v_hat) + self.eps,
                     value=-self.meta_lr)
-            else:
-                print("not using idbd")
 
     def state_dict(self):
         saved_state = []
@@ -430,6 +427,10 @@ class SAC:
         print(f"[√] Using device: {self.device}")
 
         self.use_idbd=use_idbd
+        if self.use_idbd:
+            print(" using idbd")
+        else:
+            print("not using idbd")
 
         # Set seeds for reproducibility.
         random.seed(seed)
