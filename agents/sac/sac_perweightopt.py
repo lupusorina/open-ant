@@ -169,7 +169,8 @@ class PerWeightMetaAdam:
         alpha0, meta_lr=1e-3,
         gamma=0.999,
         b1=0.9,b2=0.999,    # default first & second moment decay rates for adam
-        meta_b1=0.9,meta_b2=0.999, eps=1e-8, #decay=0.1,
+        meta_b1=0.9,meta_b2=0.999, eps=1e-8,
+        use_idbd=True,
     ):
         self.params = list(params)
         self.meta_lr = meta_lr
@@ -180,6 +181,7 @@ class PerWeightMetaAdam:
         self.meta_b2 = meta_b2
         self.eps = eps
         self.alpha0 = alpha0
+        self.use_idbd = use_idbd
 
         self.state = []
         initial_beta = math.log(alpha0)
@@ -212,7 +214,10 @@ class PerWeightMetaAdam:
             g = p.grad
 
             # Current per-weight step size
-            alpha = torch.exp(state["beta"])
+            if self.use_idbd:
+                alpha = torch.exp(state["beta"])
+            else:
+                alpha = self.alpha0
 
             # Base Adam
             state["step"].add_(1)
@@ -230,30 +235,33 @@ class PerWeightMetaAdam:
             delta = -alpha * m_hat / (torch.sqrt(v_hat) + self.eps)
             p.add_(delta)    # w_t+1
 
-            h = state["h"]
-            z = h * g    # the old h. z_t = h_t * g_t = meta gradient
-            h.mul_(self.gamma).add_(delta)   # h_t+1 = gamma * h_t + Delta w_t
+            if self.use_idbd:
+                print("using idbd")
+                h = state["h"]
+                z = h * g    # the old h. z_t = h_t * g_t = meta gradient
+                h.mul_(self.gamma).add_(delta)   # h_t+1 = gamma * h_t + Delta w_t
 
-            # Meta Adam on beta
-            state["meta_step"].add_(1)
-            meta_t = state["meta_step"]
-            meta_m = state["meta_m"]
-            meta_v = state["meta_v"]
+                # Meta Adam on beta
+                state["meta_step"].add_(1)
+                meta_t = state["meta_step"]
+                meta_m = state["meta_m"]
+                meta_v = state["meta_v"]
 
-            meta_m.mul_(self.meta_b1).add_(z,
-                alpha=1.0 - self.meta_b1)    # meta m_t+1 = b1*m_t + (1-b1)z_t
+                meta_m.mul_(self.meta_b1).add_(z,
+                    alpha=1.0 - self.meta_b1)    # meta m_t+1 = b1*m_t + (1-b1)z_t
 
-            meta_v.mul_(self.meta_b2).addcmul_(   # meta v_t+1
-                z, z, value=1.0 - self.meta_b2)
+                meta_v.mul_(self.meta_b2).addcmul_(   # meta v_t+1
+                    z, z, value=1.0 - self.meta_b2)
 
-            meta_m_hat = meta_m / (1.0 - self.meta_b1 ** meta_t)
-            meta_v_hat = meta_v / (1.0 - self.meta_b2 ** meta_t)
-            
-            # beta_t+1. addcdiv_ does inplace modification of input beta
-            state["beta"].addcdiv_(
-                meta_m_hat,
-                torch.sqrt(meta_v_hat) + self.eps,
-                value=-self.meta_lr)
+                meta_m_hat = meta_m / (1.0 - self.meta_b1 ** meta_t)
+                meta_v_hat = meta_v / (1.0 - self.meta_b2 ** meta_t)
+                
+                # beta_t+1. addcdiv_ does inplace modification of input beta
+                state["beta"].addcdiv_(
+                    meta_m_hat, torch.sqrt(meta_v_hat) + self.eps,
+                    value=-self.meta_lr)
+            else:
+                print("not using idbd")
 
     def state_dict(self):
         saved_state = []
@@ -389,6 +397,7 @@ class SAC:
                  alpha_lr: float,
                  policy_lr: float,
 
+                 use_idbd: bool,
                  meta_lr: float,
                  meta_gamma: float,
                  adam_b1: float,
@@ -420,6 +429,8 @@ class SAC:
         self.device = device
         print(f"[√] Using device: {self.device}")
 
+        self.use_idbd=use_idbd
+
         # Set seeds for reproducibility.
         random.seed(seed)
         np.random.seed(seed)
@@ -436,6 +447,7 @@ class SAC:
         self.qf2_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, num_extra_weights=num_extra_weights).to(self.device)
         self.qf1_target.load_state_dict(self.qf1.state_dict())
         self.qf2_target.load_state_dict(self.qf2.state_dict())
+        
         self.q_optimizer = PerWeightMetaAdam(
             list(self.qf1.parameters()) +
             list(self.qf2.parameters()),
@@ -446,9 +458,8 @@ class SAC:
             b2=adam_b2,
             meta_b1=meta_b1,
             meta_b2=meta_b2,
-            #decay=decay,
+            use_idbd=use_idbd,
         )
-
         self.actor_optimizer = PerWeightMetaAdam(
             self.actor.parameters(),
             alpha0=policy_lr,
@@ -458,8 +469,9 @@ class SAC:
             b2=adam_b2,
             meta_b1=meta_b1,
             meta_b2=meta_b2,
-          #  decay=decay,
+            use_idbd=use_idbd,
         )
+
         self.learning_starts = learning_starts
         self.autotune = autotune
         self.batch_size = batch_size
@@ -806,8 +818,6 @@ class SAC:
                     f"alpha={self.alpha:.6g}"
                 )
 
-
-
 # For logging.
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -858,53 +868,21 @@ def parse_args():
     parser.add_argument("--alpha_lr", type=float, default=1e-3,
                         help="alpha learning rate")
 
-    parser.add_argument(
-        "--meta_lr",
-        type=float,
-        default=1e-3,
-        help="Meta Adam learning rate",
-    )
-
-    parser.add_argument(
-        "--meta_gamma",
-        type=float,
-        default=0.999,
-        help="Hessian-free MetaOptimize trace discount",
-    )
-
-    parser.add_argument(
-        "--adam_b1",
-        type=float,
-        default=0.9,
-        help="Base Adam beta1",
-    )
-    # parser.add_argument(
-    #         "--weight_decay",
-    #         type=float,
-    #         default=0.1,
-    #         help="weight decay for AdamW",
-    #     )
-
-    parser.add_argument(
-        "--adam_b2",
-        type=float,
-        default=0.999,
-        help="Base Adam beta2",
-    )
-
-    parser.add_argument(
-        "--meta_b1",
-        type=float,
-        default=0.9,
-        help="Meta Adam beta1",
-    )
-
-    parser.add_argument(
-        "--meta_b2",
-        type=float,
-        default=0.999,
-        help="Meta Adam beta2",
-    )
+    #____ idbd-related meta learning args
+    parser.add_argument("--use_idbd",action=argparse.BooleanOptionalAction,default=True,
+                        help="use PerWeightMetaAdam (Adam & IDBD, or --no-use_idbd")
+    parser.add_argument("--meta_lr",type=float,default=1e-3,
+                        help="Meta Adam learning rate")
+    parser.add_argument("--meta_gamma",type=float,default=0.999,
+                        help="Hessian-free MetaOptimize trace discount")
+    parser.add_argument("--adam_b1",type=float,default=0.9,
+                        help="Base Adam beta1")
+    parser.add_argument("--adam_b2",type=float,default=0.999,
+                        help="Base Adam beta2",)
+    parser.add_argument("--meta_b1",type=float,default=0.9,
+                        help="Meta Adam beta1")
+    parser.add_argument("--meta_b2",type=float,default=0.999,
+                        help="Meta Adam beta2")
     
     parser.add_argument("--policy_frequency", type=int, default=2,
                         help="policy update frequency")
@@ -1022,6 +1000,7 @@ if __name__ == "__main__":
                 adam_b2=args.adam_b2,
                 meta_b1=args.meta_b1,
                 meta_b2=args.meta_b2,
+                use_idbd=args.use_idbd,
                 num_extra_weights=num_extra_weights,
               #  decay=args.weight_decay,
 

@@ -10,7 +10,7 @@ set -euo pipefail
 SEEDS=(3)
 
 SCRIPT="sac_perweightopt.py"
-RUNS_DIR="runs/idbd_newweight_nolayernorm_resetalpha"
+RUNS_DIR="runs/newweight_layernorm_resetalpha"
 
 SIM1_XML="/home/seliu/open-ant/sim/assets/ant_with_camera_after_sys_id.xml"
 SIM2_XML="/home/seliu/open-ant/sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml"
@@ -36,7 +36,7 @@ run_sim1 () {
         --num_envs 1 \
         --seed "${SEED}" \
         --cuda \
-        --no-use_layer_norm
+        --no-use_idbd
 }
 
 
@@ -62,7 +62,7 @@ run_sim2 () {
         --cuda \
         --load_extra_weights \
         --num_extra_weights 26 \
-        --no-use_layer_norm \
+        --no-use_idbd \
         --reset_entropy_alpha
 }
 
