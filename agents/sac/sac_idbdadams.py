@@ -32,20 +32,53 @@ from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
 
+def variance_scaling_init_(
+    tensor: torch.Tensor,
+    scale: float = 1.0,
+    mode: str = "fan_in",
+    distribution: str = "truncated_normal"
+) -> torch.Tensor:
+    distribution = distribution.lower()
+    if distribution not in {"truncated_normal","untruncated_normal","uniform"}:
+        raise ValueError("distribution must be 'truncated_normal','untruncated_normal', or 'uniform'")
+    if mode not in {"fan_in", "fan_out", "fan_avg"}:
+        raise ValueError("mode must be 'fan_in', 'fan_out', or 'fan_avg'")
+    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(tensor)
+    if mode == "fan_in":
+        n = fan_in
+    elif mode == "fan_out":
+        n = fan_out
+    else:
+        n = (fan_in + fan_out) / 2.0
+    variance = scale / max(1.0, n)
+    with torch.no_grad():
+        if distribution == "truncated_normal":
+            correction = 0.87962566103423978
+            std = math.sqrt(variance) / correction
+            return nn.init.trunc_normal_(tensor,mean=0.0,std=std,a=-2.0 * std,b=2.0 * std)
+        if distribution == "untruncated_normal":
+            std = math.sqrt(variance)
+            return tensor.normal_(mean=0.0, std=std)
+        if distribution == "uniform":
+            limit = math.sqrt(3.0 * variance)
+            return tensor.uniform_(-limit, limit)
+
 class SoftQNetwork(nn.Module):
-    def __init__(self, env, use_layer_norm=False):
+    def __init__(self, env, use_layer_norm=False, num_extra_weights=0):
         super().__init__()
         self.use_layer_norm = use_layer_norm
+
+        hidden_dim = 256 + num_extra_weights
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
-            256,
+            hidden_dim,
         )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
 
         if use_layer_norm:
-            self.ln1 = nn.LayerNorm(256)
-            self.ln2 = nn.LayerNorm(256)
+            self.ln1 = nn.LayerNorm(hidden_dim)
+            self.ln2 = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
@@ -64,17 +97,18 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
 class Actor(nn.Module):
-    def __init__(self, env, use_layer_norm=False):
+    def __init__(self, env, use_layer_norm=False, num_extra_weights=0):
         super().__init__()
         self.use_layer_norm = use_layer_norm
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+        hidden_dim = 256 + num_extra_weights
+        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_mean = nn.Linear(hidden_dim, np.prod(env.single_action_space.shape))
+        self.fc_logstd = nn.Linear(hidden_dim, np.prod(env.single_action_space.shape))
 
         if use_layer_norm:
-            self.ln1 = nn.LayerNorm(256)
-            self.ln2 = nn.LayerNorm(256)
+            self.ln1 = nn.LayerNorm(hidden_dim)
+            self.ln2 = nn.LayerNorm(hidden_dim)
 
         # Action rescaling.
         self.register_buffer(
@@ -343,6 +377,8 @@ class SAC:
                  adam_b2: float,
                  meta_b1: float,
                  meta_b2: float,
+
+                 num_extra_weights: int,
              #    decay: float,
 
                  autotune: bool,
@@ -375,11 +411,11 @@ class SAC:
         torch.backends.cudnn.benchmark = not torch_deterministic
 
         # Networks.
-        self.actor = Actor(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf1 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf2 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf1_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf2_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
+        self.actor = Actor(self.envs, use_layer_norm=use_layer_norm, num_extra_weights=num_extra_weights).to(self.device)
+        self.qf1 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, num_extra_weights=num_extra_weights).to(self.device)
+        self.qf2 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, num_extra_weights=num_extra_weights).to(self.device)
+        self.qf1_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, num_extra_weights=num_extra_weights).to(self.device)
+        self.qf2_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, num_extra_weights=num_extra_weights).to(self.device)
         self.qf1_target.load_state_dict(self.qf1.state_dict())
         self.qf2_target.load_state_dict(self.qf2.state_dict())
         self.q_optimizer = PerWeightMetaAdam(
@@ -597,15 +633,200 @@ class SAC:
             state["a_optimizer"] = self.a_optimizer.state_dict()
         return state
 
-    def load_state(self, state_dict):
-        """Loads the full state of the agent from a state dictionary."""
-        self.actor.load_state_dict(state_dict["actor"])
-        self.qf1.load_state_dict(state_dict["qf1"])
-        self.qf2.load_state_dict(state_dict["qf2"])
-        self.qf1_target.load_state_dict(state_dict["qf1_target"])
-        self.qf2_target.load_state_dict(state_dict["qf2_target"])
-        self.q_optimizer.load_state_dict(state_dict["q_optimizer"])
-        self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
+    def load_state(self, state_dict, load_extra_weights=False):
+        if not load_extra_weights:
+            """Loads the full state of the agent from a state dictionary."""
+            self.actor.load_state_dict(state_dict["actor"])
+            self.qf1.load_state_dict(state_dict["qf1"])
+            self.qf2.load_state_dict(state_dict["qf2"])
+            self.qf1_target.load_state_dict(state_dict["qf1_target"])
+            self.qf2_target.load_state_dict(state_dict["qf2_target"])
+            self.q_optimizer.load_state_dict(state_dict["q_optimizer"])
+            self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
+
+        else:
+            old_actor = state_dict["actor"]
+            old_hidden = old_actor["fc1.weight"].shape[0]
+
+            with torch.no_grad():
+                # Copy old 256 neurons.
+                self.actor.fc1.weight[:old_hidden].copy_(
+                    old_actor["fc1.weight"].to(self.device)
+                )
+                self.actor.fc1.bias[:old_hidden].copy_(
+                    old_actor["fc1.bias"].to(self.device)
+                )
+
+                # New first-layer neurons: small random.
+                variance_scaling_init_(
+                    self.actor.fc1.weight[old_hidden:],
+                    scale=1e-4,
+                    mode="fan_in",
+                    distribution="truncated_normal",
+                )
+                self.actor.fc1.bias[old_hidden:].zero_()
+
+
+                # ==========================================
+                # ACTOR fc2
+                # ==========================================
+
+                # First initialize ALL new portions small random.
+                variance_scaling_init_(
+                    self.actor.fc2.weight,
+                    scale=1e-4,
+                    mode="fan_in",
+                    distribution="truncated_normal",
+                )
+                self.actor.fc2.bias.zero_()
+
+                # Restore exact old Sim1 block.
+                self.actor.fc2.weight[
+                    :old_hidden,
+                    :old_hidden
+                ].copy_(
+                    old_actor["fc2.weight"].to(self.device)
+                )
+
+                self.actor.fc2.bias[:old_hidden].copy_(
+                    old_actor["fc2.bias"].to(self.device)
+                )
+
+                # NEW first-layer neurons should not initially
+                # perturb OLD second-layer neurons.
+                self.actor.fc2.weight[
+                    :old_hidden,
+                    old_hidden:
+                ].zero_()
+
+                # ==========================================
+                # ACTOR output heads
+                # ==========================================
+
+                self.actor.fc_mean.weight[
+                    :, :old_hidden
+                ].copy_(
+                    old_actor["fc_mean.weight"].to(self.device)
+                )
+
+                self.actor.fc_mean.bias.copy_(
+                    old_actor["fc_mean.bias"].to(self.device)
+                )
+
+                self.actor.fc_mean.weight[
+                    :, old_hidden:
+                ].zero_()
+
+                self.actor.fc_logstd.weight[
+                    :, :old_hidden
+                ].copy_(
+                    old_actor["fc_logstd.weight"].to(self.device)
+                )
+
+                self.actor.fc_logstd.bias.copy_(
+                    old_actor["fc_logstd.bias"].to(self.device)
+                )
+
+                self.actor.fc_logstd.weight[
+                    :, old_hidden:
+                ].zero_()
+
+                # CRITICS
+                # ==========================================
+
+                critic_pairs = [
+                    (self.qf1, state_dict["qf1"]),
+                    (self.qf2, state_dict["qf2"]),
+                    (self.qf1_target, state_dict["qf1_target"]),
+                    (self.qf2_target, state_dict["qf2_target"]),
+                ]
+
+                for critic, old_critic in critic_pairs:
+
+                    old_hidden = old_critic["fc1.weight"].shape[0]
+
+                    # --------------------------------------
+                    # critic fc1
+                    # --------------------------------------
+
+                    critic.fc1.weight[:old_hidden].copy_(
+                        old_critic["fc1.weight"].to(self.device)
+                    )
+
+                    critic.fc1.bias[:old_hidden].copy_(
+                        old_critic["fc1.bias"].to(self.device)
+                    )
+
+                    variance_scaling_init_(
+                        critic.fc1.weight[old_hidden:],
+                        scale=1e-4,
+                        mode="fan_in",
+                        distribution="truncated_normal",
+                    )
+
+                    critic.fc1.bias[old_hidden:].zero_()
+
+
+                    # --------------------------------------
+                    # critic fc2
+                    # --------------------------------------
+
+                    variance_scaling_init_(
+                        critic.fc2.weight,
+                        scale=1e-4,
+                        mode="fan_in",
+                        distribution="truncated_normal",
+                    )
+
+                    critic.fc2.bias.zero_()
+
+                    critic.fc2.weight[
+                        :old_hidden,
+                        :old_hidden
+                    ].copy_(
+                        old_critic["fc2.weight"].to(self.device)
+                    )
+
+                    critic.fc2.bias[:old_hidden].copy_(
+                        old_critic["fc2.bias"].to(self.device)
+                    )
+
+                    # New h1 -> old h2 starts at zero.
+                    critic.fc2.weight[
+                        :old_hidden,
+                        old_hidden:
+                    ].zero_()
+
+
+                    # --------------------------------------
+                    # critic fc3
+                    # --------------------------------------
+
+                    critic.fc3.weight[
+                        :, :old_hidden
+                    ].copy_(
+                        old_critic["fc3.weight"].to(self.device)
+                    )
+
+                    critic.fc3.bias.copy_(
+                        old_critic["fc3.bias"].to(self.device)
+                    )
+
+                    # New h2 -> Q starts at zero.
+                    critic.fc3.weight[
+                        :, old_hidden:
+                    ].zero_()
+
+            print(
+                f"[√] Expanded network: "
+                f"{old_hidden} -> {self.actor.fc1.out_features}"
+            )
+
+            print(
+                "[√] New hidden weights = small random; "
+                "new output connections = zero."
+            )
+                
         self.global_step = state_dict.get("global_step", 0)
         if self.autotune and "log_alpha" in state_dict:
             log_alpha_tensor = state_dict["log_alpha"].to(self.device)
@@ -757,6 +978,16 @@ def parse_args():
     parser.add_argument("--model_path", type=str, default="../../sim/assets/ant_with_camera_after_sys_id.xml",
                         help="XML file to use for the environment")
 
+    parser.add_argument(
+        "--load_extra_weights",
+        action="store_true",
+        default=False,
+        help="expand hidden layers when loading an old checkpoint")
+
+    parser.add_argument(
+        "--num_extra_weights",type=int,default=0,
+        help="number of extra hidden units to add to each hidden layer")
+
     parser.set_defaults(
         torch_deterministic=True,
         autotune=True,
@@ -804,6 +1035,7 @@ if __name__ == "__main__":
     # Setup device.
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    num_extra_weights = (args.num_extra_weights if args.load_extra_weights else 0)
     # Create SAC agent.
     agent = SAC(envs=envs,
                 device=device,
@@ -817,6 +1049,7 @@ if __name__ == "__main__":
                 adam_b2=args.adam_b2,
                 meta_b1=args.meta_b1,
                 meta_b2=args.meta_b2,
+                num_extra_weights=num_extra_weights,
               #  decay=args.weight_decay,
 
                 autotune=args.autotune,
@@ -836,7 +1069,7 @@ if __name__ == "__main__":
     # Load the model.
     if args.weights_path is not None:
         state = torch.load(os.path.join(args.weights_path, f"weights.pth"))
-        agent.load_state(state)
+        agent.load_state(state, load_extra_weights=args.load_extra_weights)
         step = state["global_step"]
         agent.load_replay_buffer(os.path.join(args.weights_path, f"replay_buffer"))
 
