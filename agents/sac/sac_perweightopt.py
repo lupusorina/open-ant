@@ -157,12 +157,8 @@ class Actor(nn.Module):
 
 class PerWeightMetaAdam:
     """
-    Hessian-free MetaOptimize:
-        base optimizer = Adam
-        meta optimizer = Adam
-        step size = one alpha_i = exp(beta_i) per scalar parameter
-
-    No AdamW weight decay.
+    IDBD with base optimizer = Adam, meta optimizer = Adam
+     step size = one alpha_i = exp(beta_i) per scalar parameter
     """
     def __init__(
         self, params,
@@ -189,7 +185,7 @@ class PerWeightMetaAdam:
         for p in self.params:
             self.state.append({
                 # Base Adam states
-                "step": torch.zeros_like(p, dtype=torch.long),
+                "step": torch.zeros_like(p, dtype=torch.long),   # make 
                 "m": torch.zeros_like(p),
                 "v": torch.zeros_like(p),
 
@@ -294,37 +290,25 @@ class PerWeightMetaAdam:
                 "Optimizer state does not match number of parameters."
             )
 
-        for p, dst, src in zip(
-            self.params,
-            self.state,
-            saved_state,
-        ):
+        for p, dst, src in zip(self.params, self.state, saved_state):
             old_shape = src["m"].shape
             old_slices = tuple(
                 slice(0, size)
-                for size in old_shape
-            )
+                for size in old_shape)
 
             for key in dst:
                 if torch.is_tensor(dst[key]):
                     src_value = src[key]
                     src_tensor = src_value.to(p.device)
 
-                    if src_tensor.shape == dst[key].shape:
+                    if src_tensor.shape == dst[key].shape: 
                         dst[key].copy_(src_tensor)
                     else:
                         if not load_extra_weights:
-                            raise ValueError(
-                                f"Optimizer state shape mismatch: "
-                                f"{src_tensor.shape} vs "
-                                f"{dst[key].shape}"
-                            )
-                        dst[key][old_slices].copy_(
-                            src_tensor
-                        )
+                            raise ValueError(f"Optimizer state shape mismatch: {src_tensor.shape} vs {dst[key].shape}")
+                        dst[key][old_slices].copy_(src_tensor)
                 else:
                     dst[key] = src[key]
-
 
         self.meta_lr = state_dict.get("meta_lr", self.meta_lr)
         self.gamma = state_dict.get("gamma", self.gamma)
@@ -692,7 +676,7 @@ class SAC:
                 # New first-layer neurons: small random.
                 variance_scaling_init_(
                     self.actor.fc1.weight[old_hidden:],
-                    scale=1e-4,
+                    scale=1, #1e-4,
                     mode="fan_in",
                     distribution="truncated_normal",
                 )
@@ -702,7 +686,7 @@ class SAC:
                 # initialize all new portions with small random
                 variance_scaling_init_(
                     self.actor.fc2.weight,
-                    scale=1e-4,
+                    scale=1, # 1e-4,
                     mode="fan_in",
                     distribution="truncated_normal",
                 )
@@ -753,14 +737,14 @@ class SAC:
                     critic.fc1.bias[:old_hidden].copy_(old_critic["fc1.bias"].to(self.device))
                     variance_scaling_init_(
                         critic.fc1.weight[old_hidden:],
-                        scale=1e-4,
+                        scale=1, #1e-4,
                         mode="fan_in",
                         distribution="truncated_normal")
                     critic.fc1.bias[old_hidden:].zero_()
 
                     variance_scaling_init_(
                         critic.fc2.weight,
-                        scale=1e-4,
+                        scale=1,  #1e-4,
                         mode="fan_in",
                         distribution="truncated_normal")
                     critic.fc2.bias.zero_()
