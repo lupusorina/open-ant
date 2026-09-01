@@ -19,7 +19,7 @@ The hardware is designed to be easy to build and use:
 
 ## Assembly video
 
-[Watch the assembly video](https://youtu.be/siWUn2i8hFY?si=Tb2L7xUlnYaNfrpW)
+[Watch the assembly video](https://www.youtube.com/watch?v=9aowd2JxAnE)
 
 ### Specs.
 
@@ -30,7 +30,7 @@ The hardware is designed to be easy to build and use:
 ### Physical Ant platform, learning arena, and system overview.
 
 <p align="center">
-  <img src="./imgs/robots.png" alt="Robots" width="600"/>
+  <img src="./imgs/robots.png" alt="Robot setup" width="600"/>
 </p>
 <p align="center">
   <b>Physical Ant platform, learning arena, and system overview.</b> (a) An overhead webcam tracks the fiducial markers to compute reward signals for locomotion tasks as well as the heading vector of the ant. The robot is connected by cables to AC power and to an external computer where the agent is running. (b) The main components of the Physical Ant. (c) The Gymnasium Ant, which was the inspiration for the Physical Ant.
@@ -52,7 +52,7 @@ The hardware is designed to be easy to build and use:
 | Short USB-A to micro-USB cable            | 1        | For Dynamixel U2D2                                                                                          | [Amazon](https://www.amazon.com/dp/B08BZD66H4?th=1)                                                | $6.99                |
 | USB-A extension cable                     | 1        | As tether for the robot                                                                                     | [Amazon](https://www.amazon.com/dp/B07ZV6FHWF/)                                                    | $5.99                |
 | 12V 8A AC to DC Converter Power Adapter    | 1        | Power adapter for the robot, to replace the one from the U2D2 starter kit | [Amazon](https://www.amazon.com/dp/B0F24DZ2SB?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1)                     | $17.09                |
-| Screw M2x4mm with socket head             | 80       | Output shaft, 8 per motor, 3D print assembly                                                                | [McMaster](https://www.mcmaster.com/91290A012/)                                                    | $18.48 (pack of 100) |
+| Screw M2x4mm with socket head             | 80       | Output shaft, 8 per motor, 3D print assembly                                                                | [McMaster](https://www.mcmaster.com/91290A011/)                                                    | $18.48 (pack of 100) |
 | M2 washer            | 64       | Output shaft                                                                | [McMaster](https://www.mcmaster.com/93475A195/)  | $1.78 (pack of 100) |
 | Screw M2.5x16mm with socket head          | 32       | motor mount, 4 per motor                                                                                    | [McMaster](https://www.mcmaster.com/91290a106/)                                                    | $12.81 (pack of 50)  |
 | Screw M3x8mm with socket head             | 6        | U2D2 power board mount + IMU                                                                                | [McMaster](https://www.mcmaster.com/91290A113/)                                                    | $12.82 (pack of 100) |
@@ -184,8 +184,11 @@ We recommend 3D printing socks out of TPU.
 ### Q: There might be intermittent communication dropout. How is this addressed?
 
 During long duration run-time learning experiments, we observed intermittent, very short communication dropouts. 
-The power connection was modified to connect directly to the screw terminals on the control board rather than using the barrel connector. This eliminated the voltage drops caused by vibration-induced intermittent contact during learning experiments.
+The power connection was modified to connect directly to the screw terminals on the control board rather than using the barrel connector. This eliminated the voltage drops caused by vibration-induced intermittent contact during learning experiments (see paper for more details).
 
+### Are there other failures that a user should be aware of?
+
+We noticed that the short USB cable connected to the Cable Matters Ultra Mini USB Hub may become damaged over time, especially if the user is not using a ziptie for strain relief. If the cable is damaged, it can cause intermittent communication (comm) dropouts. We recommend replacing the USB cable if you observe this issue. We also recommend to ensure that the components don't move freely inside the ant. Using glue gun/tape is recommended.
 
 ## Misc
 
