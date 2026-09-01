@@ -10,11 +10,11 @@ set -euo pipefail
 SEEDS=(3)
 
 SCRIPT="sac_perweightopt.py"
-RUNS_DIR="runs/newweight_layernorm_resetalpha"
+RUNS_DIR="runs/no_adam/idbd_noweight_nolayernorm"
 
-SIM1_XML="/home/seliu/open-ant/sim/assets/ant_with_camera_after_sys_id.xml"
-SIM2_XML="/home/seliu/open-ant/sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml"
-SIM1_STEPS=40000
+SIM1_XML="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/ant_with_camera_after_sys_id.xml"
+SIM2_XML="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml"
+SIM1_STEPS=4000000
 SIM2_STEPS=2000000
 
 
@@ -30,13 +30,13 @@ run_sim1 () {
         --model_path "${SIM1_XML}" \
         --total_timesteps "${SIM1_STEPS}" \
         --dt 0.12 \
-        --meta_gamma 0.99 \
         --runs_directory "${RUNS_DIR}" \
         --exp_name sac_sim1 \
         --num_envs 1 \
         --seed "${SEED}" \
         --cuda \
-        --no-use_idbd
+        --no-use_layer_norm
+        # --no-use_idbd        # --use_idbd
 }
 
 
@@ -53,17 +53,15 @@ run_sim2 () {
         --model_path "${SIM2_XML}" \
         --total_timesteps "$((SIM1_STEPS + SIM2_STEPS))" \
         --dt 0.12 \
-        --meta_gamma 0.99 \
         --runs_directory "${RUNS_DIR}" \
         --exp_name continuous_sac \
         --num_envs 1 \
         --seed "${SEED}" \
         --weights_path "${WEIGHTS_PATH}" \
         --cuda \
-        --load_extra_weights \
-        --num_extra_weights 26 \
-        --no-use_idbd \
-        --reset_entropy_alpha
+        --no-use_layer_norm
+        # --load_extra_weights \
+        # --num_extra_weights 26   # --no-use_idbd \
 }
 
 
@@ -83,8 +81,7 @@ run_hw () {
         --runs_directory runs_hw_new_refactored_code \
         --exp_name trial_1 \
         --seed "${SEED}" \
-        --cuda \
-        --no-use_layer_norm 
+        --cuda 
 }
 
 

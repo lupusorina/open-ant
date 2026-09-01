@@ -155,6 +155,130 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
 
+class PerWeightIDBD:
+    """
+    IDBD 
+     step size = one alpha_i = exp(beta_i) per scalar parameter
+    """
+    def __init__(
+        self, params,
+        alpha0, meta_lr=1e-3,
+        gamma=0.999,
+        use_idbd=True,
+    ):
+        self.params = list(params)
+        self.meta_lr = meta_lr
+        self.gamma = gamma
+        self.alpha0 = alpha0
+        self.use_idbd = use_idbd
+
+        self.state = []
+        initial_beta = math.log(alpha0)
+
+        for p in self.params:
+            self.state.append({
+                "h": torch.zeros_like(p),
+                "beta": torch.full_like(p, initial_beta)})
+
+    def zero_grad(self):
+        for p in self.params:
+            p.grad = None
+
+    @torch.no_grad()
+    def step(self):
+        for p, state in zip(self.params, self.state):
+            if p.grad is None:
+                continue
+
+            g = p.grad
+
+            if not self.use_idbd:
+                p.add_(g, alpha=-self.alpha0)
+                continue
+    
+            beta = state["beta"]
+            h = state["h"]
+
+            beta.add_(g * h * -self.meta_lr)
+            alpha = torch.exp(beta) # alpha_t+1
+            p.add_(-alpha * g)   # theta_t+1
+            
+            new_h = (h * self.gamma) - (alpha * g)
+            h.copy_(new_h)
+
+    def state_dict(self):
+        saved_state = []
+
+        for state in self.state:
+            saved_state.append({
+                key: (
+                    value.detach().cpu()
+                    if torch.is_tensor(value)
+                    else value
+                )
+                for key, value in state.items()
+            })
+
+        return {
+            "state": saved_state,
+            "meta_lr": self.meta_lr,
+            "gamma": self.gamma,
+            "alpha0": self.alpha0,
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state_dict, load_extra_weights=False):
+        saved_state = state_dict["state"]
+
+        if len(saved_state) != len(self.state):
+            raise ValueError(
+                "Optimizer state does not match number of parameters."
+            )
+
+        for p, dst, src in zip(self.params, self.state, saved_state):
+            old_shape = src["beta"].shape
+            old_slices = tuple(
+                slice(0, size)
+                for size in old_shape)
+
+            for key in dst:
+                if torch.is_tensor(dst[key]):
+                    src_value = src[key]
+                    src_tensor = src_value.to(p.device)
+
+                    if src_tensor.shape == dst[key].shape: 
+                        dst[key].copy_(src_tensor)
+                    else:
+                        if not load_extra_weights:
+                            raise ValueError(f"Optimizer state shape mismatch: {src_tensor.shape} vs {dst[key].shape}")
+                        dst[key][old_slices].copy_(src_tensor)
+                else:
+                    dst[key] = src[key]
+
+        self.meta_lr = state_dict.get("meta_lr", self.meta_lr)
+        self.gamma = state_dict.get("gamma", self.gamma)
+        self.alpha0 = state_dict.get("alpha0", self.alpha0)
+    
+    @torch.no_grad()
+    def get_lr_tensors(self):
+        """
+        Return effective per-parameter learning-rate tensors.
+        Same ordering and same shapes as self.params.
+        """
+        lr_tensors = []
+
+        for p, state in zip(self.params, self.state):
+            if self.use_idbd:
+                lr = torch.exp(state["beta"])
+            else:
+                lr = torch.full_like(
+                    p,
+                    self.alpha0,
+                    dtype=torch.float32)
+
+            lr_tensors.append(lr.detach().cpu().clone())
+        return lr_tensors
+
 class PerWeightMetaAdam:
     """
     IDBD with base optimizer = Adam, meta optimizer = Adam
@@ -321,6 +445,26 @@ class PerWeightMetaAdam:
         self.eps = state_dict.get("eps", self.eps)
         self.alpha0 = state_dict.get("alpha0", self.alpha0)
       #  self.decay = state_dict.get("decay", self.decay)
+    
+    @torch.no_grad()
+    def get_lr_tensors(self):
+        """
+        Return effective per-parameter learning-rate tensors.
+        Same ordering and same shapes as self.params.
+        """
+        lr_tensors = []
+
+        for p, state in zip(self.params, self.state):
+            if self.use_idbd:
+                lr = torch.exp(state["beta"])
+            else:
+                lr = torch.full_like(
+                    p,
+                    self.alpha0,
+                    dtype=torch.float32)
+
+            lr_tensors.append(lr.detach().cpu().clone())
+        return lr_tensors
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     """Create the vectorized environment outside the SAC class."""
@@ -433,27 +577,42 @@ class SAC:
         self.qf1_target.load_state_dict(self.qf1.state_dict())
         self.qf2_target.load_state_dict(self.qf2.state_dict())
         
-        self.q_optimizer = PerWeightMetaAdam(
+        # self.q_optimizer = PerWeightMetaAdam(
+        #     list(self.qf1.parameters()) +
+        #     list(self.qf2.parameters()),
+        #     alpha0=q_lr,
+        #     meta_lr=meta_lr,
+        #     gamma=meta_gamma,
+        #     b1=adam_b1,
+        #     b2=adam_b2,
+        #     meta_b1=meta_b1,
+        #     meta_b2=meta_b2,
+        #     use_idbd=use_idbd,
+        # )
+        # self.actor_optimizer = PerWeightMetaAdam(
+        #     self.actor.parameters(),
+        #     alpha0=policy_lr,
+        #     meta_lr=meta_lr,
+        #     gamma=meta_gamma,
+        #     b1=adam_b1,
+        #     b2=adam_b2,
+        #     meta_b1=meta_b1,
+        #     meta_b2=meta_b2,
+        #     use_idbd=use_idbd,
+        # )
+        self.q_optimizer = PerWeightIDBD(
             list(self.qf1.parameters()) +
             list(self.qf2.parameters()),
             alpha0=q_lr,
             meta_lr=meta_lr,
             gamma=meta_gamma,
-            b1=adam_b1,
-            b2=adam_b2,
-            meta_b1=meta_b1,
-            meta_b2=meta_b2,
             use_idbd=use_idbd,
         )
-        self.actor_optimizer = PerWeightMetaAdam(
+        self.actor_optimizer = PerWeightIDBD(
             self.actor.parameters(),
             alpha0=policy_lr,
             meta_lr=meta_lr,
             gamma=meta_gamma,
-            b1=adam_b1,
-            b2=adam_b2,
-            meta_b1=meta_b1,
-            meta_b2=meta_b2,
             use_idbd=use_idbd,
         )
 
@@ -1055,6 +1214,22 @@ if __name__ == "__main__":
         if agent.global_step % args.save_every_n_steps == 0:
             state = agent.get_state()
             torch.save(state, os.path.join(args.runs_directory, run_name, f"weights.pth"))
+
+            lr_dir = os.path.join(args.runs_directory, run_name, "learning_rates")
+            os.makedirs(lr_dir, exist_ok=True)
+            lr_data = {}
+            actor_lrs = agent.actor_optimizer.get_lr_tensors()
+            for (name, param), lr in zip(agent.actor.named_parameters(),actor_lrs):
+                lr_data[f"actor.{name}"] = lr.numpy()
+            q_lrs = agent.q_optimizer.get_lr_tensors()
+            q_names = (
+                [f"qf1.{name}" for name, param in agent.qf1.named_parameters()]
+                +
+                [f"qf2.{name}" for name, param in agent.qf2.named_parameters()]
+            )
+            for name, lr in zip(q_names, q_lrs):
+                lr_data[name] = lr.numpy()
+            np.savez_compressed(os.path.join(lr_dir, f"lr_step_{agent.global_step}.npz"), **lr_data)
 
             replay_buffer = agent.get_replay_buffer()
             replay_buffer.dumps(os.path.join(args.runs_directory, run_name, f"replay_buffer"))

@@ -10,8 +10,7 @@ import pandas as pd
 # ============================================================
 
 RUNS_DIR = (
-    "/home/seliu/open-ant/agents/sac/"
-    "runs/idbd_newweight_nolayernorm_resetalpha"
+    "/home/serenaliu/caltech_linc_home/open-ant/agents/sac/runs/adam_newweight_layernorm_resetalpha"
 )
 
 SEEDS_TO_PLOT = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]

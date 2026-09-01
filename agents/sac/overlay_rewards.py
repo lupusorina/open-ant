@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-RUNS_DIR = "/home/serenaliu/caltech_linc_home/open-ant/agents/sac/runs/idbd_largerweight_nolayernorm_noresetalpha"
+RUNS_DIR = "/home/serenaliu/caltech_linc_home/open-ant/agents/sac/runs/no_adam/idbd_noweight_nolayernorm/"
+
 
 # Only seed 1 currently exists, but missing seeds will be skipped.
 SEEDS_TO_PLOT = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -120,8 +121,8 @@ if num_plotted == 0:
 
 plt.xlabel("Total Step")
 plt.ylabel("Reward")
-
-plt.ylim(0, 0.2)
+# plt.xlim(0, 120000)
+plt.ylim(-0.025, 0.2)
 plt.yticks(
     [
         0,
