@@ -291,6 +291,8 @@ class PerWeightMetaAdam:
         b1=0.9,b2=0.999,    # default first & second moment decay rates for adam
         meta_b1=0.9,meta_b2=0.999, eps=1e-8,
         use_idbd=True,
+        min_alpha=1e-6,
+        max_alpha=1e-2,
     ):
         self.params = list(params)
         self.meta_lr = meta_lr
@@ -302,6 +304,8 @@ class PerWeightMetaAdam:
         self.eps = eps
         self.alpha0 = alpha0
         self.use_idbd = use_idbd
+        self.min_beta = math.log(min_alpha)
+        self.max_beta = math.log(max_alpha)
 
         self.state = []
         initial_beta = math.log(alpha0)
@@ -376,9 +380,212 @@ class PerWeightMetaAdam:
                 meta_v_hat = meta_v / (1.0 - self.meta_b2 ** meta_t)
                 
                 # beta_t+1. addcdiv_ does inplace modification of input beta
-                state["beta"].addcdiv_(
-                    meta_m_hat, torch.sqrt(meta_v_hat) + self.eps,
-                    value=-self.meta_lr)
+                # state["beta"].addcdiv_(
+                #     meta_m_hat, torch.sqrt(meta_v_hat) + self.eps,
+                #     value=-self.meta_lr)
+                beta = state["beta"]
+                beta.addcdiv_(
+                    meta_m_hat,
+                    torch.sqrt(meta_v_hat) + self.eps,
+                    value=-self.meta_lr,
+                )
+                beta.clamp_(self.min_beta, self.max_beta)
+
+    def state_dict(self):
+        saved_state = []
+
+        for state in self.state:
+            saved_state.append({
+                key: (
+                    value.detach().cpu()
+                    if torch.is_tensor(value)
+                    else value
+                )
+                for key, value in state.items()
+            })
+
+        return {
+            "state": saved_state,
+            "meta_lr": self.meta_lr,
+            "gamma": self.gamma,
+            "b1": self.b1,
+            "b2": self.b2,
+            "meta_b1": self.meta_b1,
+            "meta_b2": self.meta_b2,
+            "eps": self.eps,
+            "alpha0": self.alpha0,
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, state_dict, load_extra_weights=False):
+        saved_state = state_dict["state"]
+
+        if len(saved_state) != len(self.state):
+            raise ValueError(
+                "Optimizer state does not match number of parameters."
+            )
+
+        for p, dst, src in zip(self.params, self.state, saved_state):
+            old_shape = src["m"].shape
+            old_slices = tuple(
+                slice(0, size)
+                for size in old_shape)
+
+            for key in dst:
+                if torch.is_tensor(dst[key]):
+                    src_value = src[key]
+                    src_tensor = src_value.to(p.device)
+
+                    if src_tensor.shape == dst[key].shape: 
+                        dst[key].copy_(src_tensor)
+                    else:
+                        if not load_extra_weights:
+                            raise ValueError(f"Optimizer state shape mismatch: {src_tensor.shape} vs {dst[key].shape}")
+                        dst[key][old_slices].copy_(src_tensor)
+                else:
+                    dst[key] = src[key]
+
+        self.meta_lr = state_dict.get("meta_lr", self.meta_lr)
+        self.gamma = state_dict.get("gamma", self.gamma)
+        self.b1 = state_dict.get("b1", self.b1)
+        self.b2 = state_dict.get("b2", self.b2)
+
+        self.meta_b1 = state_dict.get("meta_b1", self.meta_b1)
+        self.meta_b2 = state_dict.get("meta_b2", self.meta_b2)
+
+        self.eps = state_dict.get("eps", self.eps)
+        self.alpha0 = state_dict.get("alpha0", self.alpha0)
+      #  self.decay = state_dict.get("decay", self.decay)
+    
+    @torch.no_grad()
+    def get_lr_tensors(self):
+        """
+        Return effective per-parameter learning-rate tensors.
+        Same ordering and same shapes as self.params.
+        """
+        lr_tensors = []
+
+        for p, state in zip(self.params, self.state):
+            if self.use_idbd:
+                lr = torch.exp(state["beta"])
+            else:
+                lr = torch.full_like(
+                    p,
+                    self.alpha0,
+                    dtype=torch.float32)
+
+            lr_tensors.append(lr.detach().cpu().clone())
+        return lr_tensors
+
+class NetworkMetaAdam:
+    def __init__(
+        self, params,
+        alpha0, meta_lr=1e-3,
+        gamma=0.999,
+        b1=0.9,b2=0.999,    # default first & second moment decay rates for adam
+        meta_b1=0.9,meta_b2=0.999, eps=1e-8,
+        use_idbd=True,
+        min_alpha=1e-6,
+        max_alpha=1e-2,
+    ):
+        self.params = list(params)
+        self.meta_lr = meta_lr
+        self.gamma = gamma
+        self.b1 = b1
+        self.b2 = b2
+        self.meta_b1 = meta_b1
+        self.meta_b2 = meta_b2
+        self.eps = eps
+        self.alpha0 = alpha0
+        self.use_idbd = use_idbd
+        self.min_beta = math.log(min_alpha)
+        self.max_beta = math.log(max_alpha)
+
+        self.state = []
+        initial_beta = math.log(alpha0)
+
+        for p in self.params:
+            self.state.append({
+                # Base Adam states
+                "step": torch.zeros_like(p, dtype=torch.long),   # make 
+                "m": torch.zeros_like(p),
+                "v": torch.zeros_like(p),
+        
+        self.beta = torch.tensor(np.log(alpha0), dtype=torch.float32, device=p.device)
+        
+                "h": torch.zeros_like(p),
+                "beta": torch.full_like(p, initial_beta),
+
+                # Meta Adam state
+                "meta_step": torch.zeros_like(p, dtype=torch.long),
+                "meta_m": torch.zeros_like(p),
+                "meta_v": torch.zeros_like(p)})
+
+    def zero_grad(self):
+        for p in self.params:
+            p.grad = None
+
+    @torch.no_grad()
+    def step(self):
+        for p, state in zip(self.params, self.state):
+            if p.grad is None:
+                continue
+
+            g = p.grad
+
+            # Current per-weight step size
+            if self.use_idbd:
+                alpha = torch.exp(state["beta"])
+            else:
+                alpha = self.alpha0
+
+            # Base Adam
+            state["step"].add_(1)
+            t = state["step"]
+            m = state["m"]
+            v = state["v"]
+
+            m.mul_(self.b1).add_(g, alpha=1.0 - self.b1)
+            v.mul_(self.b2).addcmul_(g, g, value=1.0 - self.b2)
+            # bias corrections
+            m_hat = m / (1.0 - self.b1 ** t)
+            v_hat = v / (1.0 - self.b2 ** t)
+
+           # w_{t+1} = w_t + Delta w_t  
+            delta = -alpha * m_hat / (torch.sqrt(v_hat) + self.eps)
+            p.add_(delta)    # w_t+1
+
+            if self.use_idbd:
+                h = state["h"]
+                z = h * g    # the old h. z_t = h_t * g_t = meta gradient
+                h.mul_(self.gamma).add_(delta)   # h_t+1 = gamma * h_t + Delta w_t
+
+                # Meta Adam on beta
+                state["meta_step"].add_(1)
+                meta_t = state["meta_step"]
+                meta_m = state["meta_m"]
+                meta_v = state["meta_v"]
+
+                meta_m.mul_(self.meta_b1).add_(z,
+                    alpha=1.0 - self.meta_b1)    # meta m_t+1 = b1*m_t + (1-b1)z_t
+
+                meta_v.mul_(self.meta_b2).addcmul_(   # meta v_t+1
+                    z, z, value=1.0 - self.meta_b2)
+
+                meta_m_hat = meta_m / (1.0 - self.meta_b1 ** meta_t)
+                meta_v_hat = meta_v / (1.0 - self.meta_b2 ** meta_t)
+                
+                # beta_t+1. addcdiv_ does inplace modification of input beta
+                # state["beta"].addcdiv_(
+                #     meta_m_hat, torch.sqrt(meta_v_hat) + self.eps,
+                #     value=-self.meta_lr)
+                beta = state["beta"]
+                beta.addcdiv_(
+                    meta_m_hat,
+                    torch.sqrt(meta_v_hat) + self.eps,
+                    value=-self.meta_lr,
+                )
+                beta.clamp_(self.min_beta, self.max_beta)
 
     def state_dict(self):
         saved_state = []
@@ -577,44 +784,54 @@ class SAC:
         self.qf1_target.load_state_dict(self.qf1.state_dict())
         self.qf2_target.load_state_dict(self.qf2.state_dict())
         
-        # self.q_optimizer = PerWeightMetaAdam(
+        self.q1_optimizer = PerWeightMetaAdam(
+            list(self.qf1.parameters()),
+            alpha0=q_lr,
+            meta_lr=meta_lr,
+            gamma=meta_gamma,
+            b1=adam_b1,
+            b2=adam_b2,
+            meta_b1=meta_b1,
+            meta_b2=meta_b2,
+            use_idbd=use_idbd,
+        )
+        self.q2_optimizer = PerWeightMetaAdam(
+            list(self.qf2.parameters()),
+            alpha0=q_lr,
+            meta_lr=meta_lr,
+            gamma=meta_gamma,
+            b1=adam_b1,
+            b2=adam_b2,
+            meta_b1=meta_b1,
+            meta_b2=meta_b2,
+            use_idbd=use_idbd,
+        )
+        self.actor_optimizer = PerWeightMetaAdam(
+            self.actor.parameters(),
+            alpha0=policy_lr,
+            meta_lr=meta_lr,
+            gamma=meta_gamma,
+            b1=adam_b1,
+            b2=adam_b2,
+            meta_b1=meta_b1,
+            meta_b2=meta_b2,
+            use_idbd=use_idbd,
+        )
+        # self.q_optimizer = PerWeightIDBD(
         #     list(self.qf1.parameters()) +
         #     list(self.qf2.parameters()),
         #     alpha0=q_lr,
         #     meta_lr=meta_lr,
         #     gamma=meta_gamma,
-        #     b1=adam_b1,
-        #     b2=adam_b2,
-        #     meta_b1=meta_b1,
-        #     meta_b2=meta_b2,
         #     use_idbd=use_idbd,
         # )
-        # self.actor_optimizer = PerWeightMetaAdam(
+        # self.actor_optimizer = PerWeightIDBD(
         #     self.actor.parameters(),
         #     alpha0=policy_lr,
         #     meta_lr=meta_lr,
         #     gamma=meta_gamma,
-        #     b1=adam_b1,
-        #     b2=adam_b2,
-        #     meta_b1=meta_b1,
-        #     meta_b2=meta_b2,
         #     use_idbd=use_idbd,
         # )
-        self.q_optimizer = PerWeightIDBD(
-            list(self.qf1.parameters()) +
-            list(self.qf2.parameters()),
-            alpha0=q_lr,
-            meta_lr=meta_lr,
-            gamma=meta_gamma,
-            use_idbd=use_idbd,
-        )
-        self.actor_optimizer = PerWeightIDBD(
-            self.actor.parameters(),
-            alpha0=policy_lr,
-            meta_lr=meta_lr,
-            gamma=meta_gamma,
-            use_idbd=use_idbd,
-        )
 
         self.learning_starts = learning_starts
         self.autotune = autotune
@@ -721,9 +938,13 @@ class SAC:
             qf2_values_mean = qf2_a_values.mean().item()
 
             # Optimize the Action-Value networks.
-            self.q_optimizer.zero_grad()
-            qf_loss.backward()
-            self.q_optimizer.step()
+            self.q1_optimizer.zero_grad()
+            qf1_loss.backward()
+            self.q1_optimizer.step()
+
+            self.q2_optimizer.zero_grad()
+            qf2_loss.backward()
+            self.q2_optimizer.step()
 
             if self.global_step % self.policy_frequency == 0:
                 for _ in range(
@@ -797,7 +1018,9 @@ class SAC:
             "qf2": self.qf2.state_dict(),
             "qf1_target": self.qf1_target.state_dict(),
             "qf2_target": self.qf2_target.state_dict(),
-            "q_optimizer": self.q_optimizer.state_dict(),
+            #"q_optimizer": self.q_optimizer.state_dict(),
+            "q1_optimizer": self.q1_optimizer.state_dict(),
+            "q2_optimizer": self.q2_optimizer.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "global_step": self.global_step
         }
@@ -815,12 +1038,17 @@ class SAC:
             self.qf2.load_state_dict(state_dict["qf2"])
             self.qf1_target.load_state_dict(state_dict["qf1_target"])
             self.qf2_target.load_state_dict(state_dict["qf2_target"])
-            self.q_optimizer.load_state_dict(state_dict["q_optimizer"])
+            #self.q_optimizer.load_state_dict(state_dict["q_optimizer"])
+            self.q1_optimizer.load_state_dict(state_dict["q1_optimizer"])
+            self.q2_optimizer.load_state_dict(state_dict["q2_optimizer"])
             self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
 
         else:
-            self.q_optimizer.load_state_dict(
-                state_dict["q_optimizer"],load_extra_weights=True,)
+            #self.q_optimizer.load_state_dict(
+            #    state_dict["q_optimizer"],load_extra_weights=True,)
+
+            self.q1_optimizer.load_state_dict(state_dict["q1_optimizer"], load_extra_weights=True)
+            self.q2_optimizer.load_state_dict(state_dict["q2_optimizer"], load_extra_weights=True)
 
             self.actor_optimizer.load_state_dict(
                 state_dict["actor_optimizer"],load_extra_weights=True)
@@ -1221,14 +1449,21 @@ if __name__ == "__main__":
             actor_lrs = agent.actor_optimizer.get_lr_tensors()
             for (name, param), lr in zip(agent.actor.named_parameters(),actor_lrs):
                 lr_data[f"actor.{name}"] = lr.numpy()
-            q_lrs = agent.q_optimizer.get_lr_tensors()
+            # q_lrs = agent.q_optimizer.get_lr_tensors()
+            q1_lrs = agent.q1_optimizer.get_lr_tensors()
+            q2_lrs = agent.q2_optimizer.get_lr_tensors()
+
             q_names = (
                 [f"qf1.{name}" for name, param in agent.qf1.named_parameters()]
                 +
                 [f"qf2.{name}" for name, param in agent.qf2.named_parameters()]
             )
-            for name, lr in zip(q_names, q_lrs):
-                lr_data[name] = lr.numpy()
+            # for name, lr in zip(q_names, q_lrs):
+            #     lr_data[name] = lr.numpy()
+            for (name, _), lr in zip(agent.qf1.named_parameters(), q1_lrs):
+                lr_data[f"qf1.{name}"] = lr.numpy()
+            for (name, _), lr in zip(agent.qf2.named_parameters(), q2_lrs):
+                lr_data[f"qf2.{name}"] = lr.numpy()
             np.savez_compressed(os.path.join(lr_dir, f"lr_step_{agent.global_step}.npz"), **lr_data)
 
             replay_buffer = agent.get_replay_buffer()
