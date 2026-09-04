@@ -1041,7 +1041,7 @@ def parse_args(argv=None):
     # Categorical distributional critic
     parser.add_argument("--vmin", type=float, default=-500.0,
                         help="Minimum atom value for distributional critic")
-    parser.add_argument("--vmax", type=float, default=20.0,
+    parser.add_argument("--vmax", type=float, default=50.0,
                         help="Maximum atom value for distributional critic")
     parser.add_argument("--num_atoms", type=int, default=101,
                         help="Number of categorical atoms for distributional critic")
