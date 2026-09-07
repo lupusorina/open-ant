@@ -7,16 +7,18 @@ set -euo pipefail
 #   bash run.sh sim_then_continual
 #   bash run.sh hw
 
-SEEDS=(3)
+SEEDS=(15 16 17 18 19 20 21) 
 
-SCRIPT="sac_perweight_neworder.py"
+# 3 4 5 6 7
+# 8 9 10 13 14
+SCRIPT="sac_cleanrl.py"
 
-RUNS_DIR="runs/sac_pernetwork_neworder/"
+RUNS_DIR="runs/30seeds_2/"
 
-SIM1_XML="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/ant_with_camera_after_sys_id.xml"
-SIM2_XML="/home/serenaliu/caltech_linc_home/open-ant/sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml"
+SIM1_XML="/home/seliu/open-ant/sim/assets/ant_with_camera_after_sys_id.xml"
+SIM2_XML="/home/seliu/open-ant/sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml"
 SIM1_STEPS=40000
-SIM2_STEPS=2000000
+SIM2_STEPS=110000
 
 
 # =========================
