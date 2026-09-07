@@ -7,7 +7,7 @@
 # ← Edit this list to whatever seeds you want
 SEEDS=(1 2 3 4 5 6 7 8 9 10)
 
-RUNS_DIR="runs/sac_mixbuff_asym"
+RUNS_DIR="runs/sac_mixbuff_asym_freq2"
 
 MODE="${1:-all}"
 
@@ -40,13 +40,13 @@ run_continual () {
         --render_mode rgb_array \
         --env_id SimEmbodiedAnt \
         --runs_directory "${RUNS_DIR}" \
-        --exp_name continuous_sac \
+        --exp_name continuous_sac_freq2 \
         --num_envs 1 \
         --dt 0.12 \
         --weights_path "${sim1_dir}" \
         --total_timesteps 150000 \
         --model_path ../../sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml \
-        --policy_frequency 20 \
+        --policy_frequency 2 \
         --policy_lr 1e-5 \
         --q_lr 3e-4 \
         --seed "${seed}" \

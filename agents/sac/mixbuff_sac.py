@@ -247,7 +247,6 @@ class SAC:
         self.rb = ReplayBuffer(
                 storage=LazyTensorStorage(buffer_size, device=device),
                 sampler=RandomSampler(),
-                batch_size=batch_size,
             )
         
         # offline replay buffer, loaded during sim2
@@ -403,10 +402,13 @@ class SAC:
         self.rb_offline = ReplayBuffer(
                 storage=LazyTensorStorage(1_000_000, device=self.device),
                 sampler=RandomSampler(),
-                batch_size=self.batch_size,
             )
         self.rb_offline.loads(replay_buffer_path)
-        # loads is a tourchrl method, read saved buffer from the specified path on disk, and puts it in self.rb_offline with the transition data 
+        # loads is a tourchrl method, read saved buffer from the specified path on disk, and puts it in self.rb_offline with the transition data
+        # loads() restores the batch_size that was saved with the on-disk buffer, which conflicts with
+        # the explicit per-call sample sizes used for offline/online mixing below; clear it so sample()
+        # doesn't warn every step.
+        self.rb_offline._batch_size = None
     
     def get_state(self):
         """Returns the full state of the agent including all network weights and optimizers."""
