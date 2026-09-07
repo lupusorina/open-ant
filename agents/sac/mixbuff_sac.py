@@ -692,7 +692,7 @@ if __name__ == "__main__":
             envs.reset()
 
         # Save the model.
-        if step % args.save_every_n_steps == 0:
+        if step % args.save_every_n_steps == 0 or step == args.total_timesteps - 1:
             state = agent.get_state()
             torch.save(state, os.path.join(args.runs_directory, run_name, f"weights.pth"))
 
