@@ -1224,8 +1224,19 @@ def main():
     agent.initialize_logging(info, append=args.resume_in_place)
     
     if args.resume_in_place:
-        # RewardTracker has its own counter, so continue it from the checkpoint.
-        agent.reward_tracker.step = agent.global_step
+        # RewardTracker has its own counter. Continue it from the last row already
+        # written to its CSV (not from agent.global_step) because global_step can
+        # include an offset inherited from an earlier phase (e.g. sim1 weights
+        # loaded before a continual-learning run), while the CSV's own "step"
+        # column is always local to this run.
+        reward_csv_path = agent.reward_tracker.csv_path
+        last_local_step = 0.0
+        if os.path.exists(reward_csv_path):
+            with open(reward_csv_path, "r", newline="") as f:
+                rows = list(csv.reader(f))
+            if len(rows) > 1:
+                last_local_step = float(rows[-1][0])
+        agent.reward_tracker.step = last_local_step
 
     # try:
     #     from torch.utils.tensorboard import SummaryWriter
