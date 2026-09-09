@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-RUNS_DIR = "/home/serenaliu/caltech_linc_home/open-ant/agents/sac/runs/sac_pernetwork_neworder/"
+RUNS_DIR = "/data2/serenaliu_data/2sac_mixbuf_asym/"
 
 
 
