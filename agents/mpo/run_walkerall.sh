@@ -7,18 +7,38 @@ cd "$(dirname "$0")"
 
 SCRIPT="mpo_acme.py"
 
-GPU_LIST=(2)
+# Number of GPUs to use: GPUs 0..NUM_GPUS-1 each get their own worker (see
+# run_gpu_worker below). This matches how Slurm exposes GPUs: an allocated
+# GPU is always local index 0, 1, ... regardless of its physical index on the
+# node, so NUM_GPUS should just match --gres/--gpus-per-task in the sbatch
+# script. Override at the command line, e.g. `NUM_GPUS=2 bash run_walkerall.sh`.
+#
+# For pinning to specific physical GPU indices instead (e.g. testing on a
+# shared local workstation), set GPU_LIST_ENV="1 3" to bypass NUM_GPUS.
+NUM_GPUS="${NUM_GPUS:-4}"
 
-SEEDS=(0)
+if [[ -n "${GPU_LIST_ENV:-}" ]]; then
+    read -ra GPU_LIST <<< "${GPU_LIST_ENV}"
+else
+    GPU_LIST=()
+    for ((i = 0; i < NUM_GPUS; i++)); do
+        GPU_LIST+=("${i}")
+    done
+fi
+
+# NOTE: with only one seed here, only one GPU worker ever does anything --
+# the rest of GPU_LIST sits idle (see run_gpu_worker: each worker only picks
+# up every NUM_GPUS-th seed). Add more seeds to actually use more GPUs.
+SEEDS=(1 2 3 4)
 RUN_MODE="${1:-both}"
 SIM1_EXP_NAME="mpo_walker"
 SIM1_TOTAL_TIMESTEPS="2_000_000"
 GLOBAL_TOTAL_TIMESTEPS="5_000_000"
 
-RUNS_DIR="/data2/serenaliu_data/mpo_walker2"
+RUNS_DIR="/n/holylfs05/LABS/hankyang_lab/Lab/serenaliu/walker2d_v5/EMPO"
 
-MODEL1_PATH="../../sim/assets/walker2d_v5.xml"
-MODEL2_PATH="../../sim/assets/walker2d_sim2.xml"
+MODEL1_PATH="/n/home06/serenaliu/open-ant/sim/assets/walker2d_v5.xml"
+MODEL2_PATH="/n/home06/serenaliu/open-ant/sim/assets/walker2d_sim2.xml"
 
 CRITIC_TYPE="scalar"
 ENSEMBLE=3
