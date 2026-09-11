@@ -1,21 +1,34 @@
 #!/usr/bin/env bash
 # Run independent walker Sim1 -> Sim2 pipelines.
 # At most one pipeline runs on each selected GPU.
+#
+# Usage:
+#   bash run_walkerall.sh sim                     # Sim1 only
+#   bash run_walkerall.sh sim_continual_learning   # Sim2 only, auto-detects existing Sim1 run per seed
+#   bash run_walkerall.sh sim_then_continual       # Sim1 -> Sim2 (default)
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 SCRIPT="mpo_acme.py"
 
-GPU_LIST=(2)
+GPU_LIST=(3)
 
-SEEDS=(0)
-RUN_MODE="${1:-both}"
+SEEDS=(5 6)
+RUN_MODE="${1:-sim_then_continual}"
+
+case "${RUN_MODE}" in
+    sim|sim_continual_learning|sim_then_continual) ;;
+    *)
+        echo "Usage: bash run_walkerall.sh {sim|sim_continual_learning|sim_then_continual}" >&2
+        exit 1
+        ;;
+esac
 SIM1_EXP_NAME="mpo_walker"
-SIM1_TOTAL_TIMESTEPS="2_000_000"
+SIM1_TOTAL_TIMESTEPS="1_000_000"
 GLOBAL_TOTAL_TIMESTEPS="5_000_000"
 
-RUNS_DIR="/data2/serenaliu_data/mpo_walker2"
+RUNS_DIR="/data2/serenaliu_data/2empo_walker_gamma99_policy05"
 
 MODEL1_PATH="../../sim/assets/walker2d_v5.xml"
 MODEL2_PATH="../../sim/assets/walker2d_sim2.xml"
@@ -36,7 +49,7 @@ run_seed_pipeline() {
     # -------------------------------------------------------------------------
     # Sim1
     # -------------------------------------------------------------------------
-    if [[ "${RUN_MODE}" != "sim2" ]]; then
+    if [[ "${RUN_MODE}" != "sim_continual_learning" ]]; then
         echo
         echo "Seed ${seed}: starting Sim1 on physical GPU ${physical_gpu}"
 
@@ -54,7 +67,11 @@ run_seed_pipeline() {
             --cuda \
             --model_path "${MODEL1_PATH}" \
             --critic_type "${CRITIC_TYPE}" \
-            --ensemble "${ENSEMBLE}"
+            --ensemble "${ENSEMBLE}" \
+            --gamma 0.99 \
+            --dual_lr 0.005 \
+            --policy_init_scale 0.5 
+
 
         sim1_run_dir="$(
             find "${RUNS_DIR}" \
@@ -74,15 +91,15 @@ run_seed_pipeline() {
         echo "Sim1 run: ${sim1_run_dir}"
 
         # Stop here for Sim1-only mode.
-        if [[ "${RUN_MODE}" == "sim1" ]]; then
+        if [[ "${RUN_MODE}" == "sim" ]]; then
             return
         fi
     fi
 
     # -------------------------------------------------------------------------
-    # Find existing Sim1 run for Sim2-only mode
+    # Find existing Sim1 run for Sim2-only (sim_continual_learning) mode
     # -------------------------------------------------------------------------
-    if [[ "${RUN_MODE}" == "sim2" ]]; then
+    if [[ "${RUN_MODE}" == "sim_continual_learning" ]]; then
         sim1_run_dir="$(
             find "${RUNS_DIR}" \
                 -maxdepth 1 \
@@ -124,7 +141,10 @@ run_seed_pipeline() {
         --model_path "${MODEL2_PATH}" \
         --cuda \
         --critic_type "${CRITIC_TYPE}" \
-        --ensemble "${ENSEMBLE}"
+        --ensemble "${ENSEMBLE}" \
+        --gamma 0.99 \
+        --dual_lr 0.005 \
+        --policy_init_scale 0.5 
     echo
     echo "Seed ${seed}: Sim1 and Sim2 both finished on GPU ${physical_gpu}."
 
