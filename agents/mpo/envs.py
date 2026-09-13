@@ -19,9 +19,18 @@ except ImportError:
     shimmy = None
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../sim")))
 from ant_mujoco import AntEnv
+from microduck_mujoco import MicroduckEnv
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../embodied_ant_env")))
 from embodied_ant_env import make_ant_env
+
+# Registering Microduck as a real Gymnasium env id lets it flow through the
+# same `is_gymnasium_env` / `_make_gymnasium_env` path as Hopper-v5 etc. below
+# (gym.make(..., xml_file=args.model_path, render_mode=...)) with no other
+# code changes: `MicroduckEnv` accepts the same `xml_file`/`render_mode` kwargs
+# and exposes `.dt` for the dt-sync in make_envs().
+if "Microduck-v0" not in gym.envs.registry:
+    gym.register(id="Microduck-v0", entry_point=MicroduckEnv)
 
 # Embodied / custom Ant IDs used by this repo (not Gymnasium registry entries).
 EMBODIED_ANT_ENV_IDS = {
