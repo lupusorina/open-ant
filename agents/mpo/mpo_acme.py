@@ -1019,6 +1019,9 @@ def parse_args(argv=None):
     parser.add_argument("--torch_deterministic", action="store_true", default=False)
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--capture_video", action="store_true")
+    parser.add_argument("--capture_video_steps", type=int, default=None,
+                        help="If set, record one continuous video from step 0 through this "
+                             "many steps, instead of the recurring save_every_n_steps clips.")
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
     parser.add_argument("--log_every_n_steps", type=int, default=4000)

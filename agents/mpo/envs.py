@@ -63,11 +63,19 @@ def _unwrap_base_env(env):
 
 def _maybe_record_video(env, args, idx, disk_folder, run_name, runs_directory):
     if args.capture_video and idx == 0:
+        if args.capture_video_steps is not None:
+            # One continuous clip covering step 0 through capture_video_steps,
+            # independent of save_every_n_steps (which also drives checkpointing).
+            step_trigger = lambda x: x == 0
+            video_length = args.capture_video_steps
+        else:
+            step_trigger = lambda x: x % args.save_every_n_steps == 0
+            video_length = args.save_every_n_steps
         env = gym.wrappers.RecordVideo(
             env,
             os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
-            step_trigger=lambda x: x % args.save_every_n_steps == 0,
-            video_length=args.save_every_n_steps,
+            step_trigger=step_trigger,
+            video_length=video_length,
         )
     return env
 

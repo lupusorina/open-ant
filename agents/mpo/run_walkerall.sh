@@ -12,9 +12,12 @@ cd "$(dirname "$0")"
 
 SCRIPT="mpo_acme.py"
 
-GPU_LIST=(3)
+GPU_LIST=(1)
 
-SEEDS=(5 6)
+SEEDS=(5)
+# empo walker: 1, 2, 
+# 3, 4
+# now 5.
 RUN_MODE="${1:-sim_then_continual}"
 
 case "${RUN_MODE}" in
@@ -26,12 +29,12 @@ case "${RUN_MODE}" in
 esac
 SIM1_EXP_NAME="mpo_walker"
 SIM1_TOTAL_TIMESTEPS="1_000_000"
-GLOBAL_TOTAL_TIMESTEPS="5_000_000"
+GLOBAL_TOTAL_TIMESTEPS="2_500_000"
 
-RUNS_DIR="/data2/serenaliu_data/2empo_walker_gamma99_policy05"
+RUNS_DIR="/data2/serenaliu_data/2empo_walker_impfast_spi192"
 
 MODEL1_PATH="../../sim/assets/walker2d_v5.xml"
-MODEL2_PATH="../../sim/assets/walker2d_sim2.xml"
+MODEL2_PATH="../../sim/assets/walker2d_sim2_massfric.xml"
 
 CRITIC_TYPE="scalar"
 ENSEMBLE=3
@@ -70,7 +73,8 @@ run_seed_pipeline() {
             --ensemble "${ENSEMBLE}" \
             --gamma 0.99 \
             --dual_lr 0.005 \
-            --policy_init_scale 0.5 
+            --policy_init_scale 0.5 \
+            --samples_per_insert 192
 
 
         sim1_run_dir="$(
@@ -144,7 +148,8 @@ run_seed_pipeline() {
         --ensemble "${ENSEMBLE}" \
         --gamma 0.99 \
         --dual_lr 0.005 \
-        --policy_init_scale 0.5 
+        --policy_init_scale 0.5 \
+        --samples_per_insert 192
     echo
     echo "Seed ${seed}: Sim1 and Sim2 both finished on GPU ${physical_gpu}."
 
