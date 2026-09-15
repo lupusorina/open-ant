@@ -29,14 +29,21 @@ except ImportError:
 
 CHECK_COLORS = {
     "pruned": "#999999",
-    "checkd_1seed": "#f0ad4e",
+    "checked_1seed": "#f0ad4e",
+    "gated_1seed": "#f0ad4e",
 }
+
+
+def _check_of(trial, default=None):
+    value = trial.user_attrs.get("check", trial.user_attrs.get("gate"))
+    return default if value is None else value
+
 
 STAGE2_METRICS = ("robustness", "adaptation", "deploy")
 
 
 def _is_full(trial) -> bool:
-    check = trial.user_attrs.get("check")
+    check = _check_of(trial)
     return isinstance(check, str) and check.startswith("full_")
 
 
@@ -110,7 +117,7 @@ def _duration_scatter(study):
         if t.state == TrialState.PRUNED:
             pruned.append((dur, y, t.number))
             continue
-        check = t.user_attrs.get("check", t.state.name.lower())
+        check = _check_of(t, t.state.name.lower())
         by_check.setdefault(check, []).append((dur, y, t.number))
     if pruned:
         fig = make_subplots(
@@ -216,8 +223,8 @@ def selection_diagnostics(study, n_blocks: int = 6) -> dict:
     out = {
         "n_trials": len(trials),
         "n_full": len(full),
-        "n_checkd": sum(
-            1 for t in trials if t.user_attrs.get("check") == "checkd_1seed"
+        "n_checked": sum(
+            1 for t in trials if _check_of(t) in ("checked_1seed", "gated_1seed")
         ),
         "n_pruned": sum(1 for t in trials if t.state == TrialState.PRUNED),
         "blocks": [],
@@ -268,7 +275,7 @@ def _selection_diagnostics_html(study):
     d = selection_diagnostics(study)
     fmt = lambda v, spec=".2f": "-" if v is None else format(v, spec)
     head = (
-        f"<p>{d['n_trials']} trials: {d['n_full']} fully scored, {d['n_checkd']} checkd, "
+        f"<p>{d['n_trials']} trials: {d['n_full']} fully scored, {d['n_checked']} checked, "
         f"{d['n_pruned']} pruned. Seed-1 offset (J_seed1 minus the mean of the "
         f"unselected seeds, over fully scored trials): <b>{fmt(d['seed1_offset'])}</b>; "
         f"pearson between the last two unselected seeds: "
@@ -309,7 +316,7 @@ def _top10_table(study):
     for t in trials:
         cells = [f"<td>{t.number}</td><td>{t.value:.4f}</td>"]
         for c in attr_cols:
-            v = t.user_attrs.get(c, "")
+            v = _check_of(t, "") if c == "check" else t.user_attrs.get(c, "")
             cells.append(f"<td>{v if not isinstance(v, float) else f'{v:.4f}'}</td>")
         for p in param_names:
             v = t.params.get(p, "")

@@ -212,7 +212,7 @@ def build_objective(setup: TuningConfig):
             if seed_index == 0 and setup.seeds_per_trial > 1:
                 threshold, n_completed = _check_threshold(trial, setup.check_percentile)
                 if n_completed >= setup.check_min_completed and j_seed < threshold:
-                    trial.set_user_attr("check", "checkd_1seed")
+                    trial.set_user_attr("check", "checked_1seed")
                     return j_seed
 
         trial.set_user_attr("check", full_check)

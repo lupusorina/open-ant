@@ -67,7 +67,8 @@ def top_trials(study: optuna.Study, k: int, seeds_per_trial: int):
     eligible = [
         t
         for t in study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
-        if t.value is not None and t.user_attrs.get("check") == check
+        if t.value is not None
+        and t.user_attrs.get("check", t.user_attrs.get("gate")) == check
     ]
     if len(eligible) < k:
         raise SystemExit(
