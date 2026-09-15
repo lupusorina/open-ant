@@ -122,49 +122,150 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 
+class OriginalRewardWrapper(gym.Wrapper):
+    """Store the pre-scaling reward in info['original_reward'].
+
+    The embodied Ant Task objects set this key themselves (see
+    embodied_ant_env.py); plain Gymnasium envs (e.g. Walker2d-v5) never do,
+    so this wrapper fills it in for those.
+    """
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        info["original_reward"] = np.asarray(reward, dtype=np.float64)
+        return obs, reward, terminated, truncated, info
+
+
+# Embodied / custom Ant IDs used by this repo (not Gymnasium registry entries).
+EMBODIED_ANT_ENV_IDS = {
+    "EAnt",
+    "SimEmbodiedAnt",
+    "HwEmbodiedAnt",
+    "CustomAnt-v0",
+}
+
+
+def is_gymnasium_env(env_id: str) -> bool:
+    """True for registered Gymnasium envs (Hopper-v5, Walker2d-v5, Humanoid-v5, ...)."""
+    if env_id in EMBODIED_ANT_ENV_IDS:
+        return False
+    return env_id in gym.envs.registry
+
+
+def effective_reward_scale(args) -> float:
+    if args.reward_scale is not None:
+        return float(args.reward_scale)
+    return 1.0 if is_gymnasium_env(args.env_id) else 100.0
+
+
+def _unwrap_base_env(env):
+    while hasattr(env, "env"):
+        env = env.env
+    return env
+
+
+def _make_gymnasium_env(args, seed, idx, disk_folder, run_name, runs_directory, reward_scale):
+    render_mode = args.render_mode
+    if args.capture_video and idx == 0 and render_mode is None:
+        render_mode = "rgb_array"
+
+    env = gym.make(args.env_id, render_mode=render_mode, xml_file=args.model_path)
+    if isinstance(env.observation_space, gym.spaces.Dict):
+        env = gym.wrappers.FlattenObservation(env)
+
+    # Gymnasium MuJoCo often returns float64 obs while declaring float32 spaces.
+    float32_obs_space = gym.spaces.Box(
+        low=env.observation_space.low.astype(np.float32),
+        high=env.observation_space.high.astype(np.float32),
+        dtype=np.float32,
+    )
+    env = gym.wrappers.TransformObservation(
+        env,
+        lambda obs: np.asarray(obs, dtype=np.float32),
+        float32_obs_space,
+    )
+    env = OriginalRewardWrapper(env)
+    if args.capture_video and idx == 0:
+        print('RecordVideo')
+        env = gym.wrappers.RecordVideo(env, os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
+                                       step_trigger=lambda x: x % args.save_every_n_steps == 0, video_length=args.save_every_n_steps)
+    env.action_space.seed(seed)
+    env = gym.wrappers.TransformReward(env, lambda reward, scale=reward_scale: reward * scale)
+    return env
+
+
+def _make_embodied_ant_env(args, task, seed, idx, disk_folder, run_name, runs_directory, reward_scale):
+    joint_config = {
+        'hip_zero': 0,
+        'knee_zero': -np.radians(50),
+        'hip_range': np.radians(30),
+        'knee_range': np.radians(20),
+    }
+    if args.hw_config is None:
+        env = AntEnv(
+            control_dt=args.dt,
+            render_mode=args.render_mode,
+            terminate_on_upside_down=args.terminate_on_upside_down,
+            task=task,
+            joint_config=joint_config,
+            model_path=os.path.join(os.path.dirname(__file__), args.model_path),
+        )
+    else:
+        with open(args.hw_config, 'r') as f:
+            cfg = json.load(f)
+        env = make_ant_env(cfg, render_mode=args.render_mode,
+                           dt=args.dt,
+                           joint_config=joint_config,
+                           task=task,
+                           )
+        # env.metadata['render_fps'] = 1/args.dt
+
+    if args.capture_video and idx == 0:
+        print('RecordVideo')
+        env = gym.wrappers.RecordVideo(env, os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
+                                       step_trigger=lambda x: x % args.save_every_n_steps == 0, video_length=args.save_every_n_steps)
+    env.action_space.seed(seed)
+    env = gym.wrappers.TransformReward(env, lambda reward, scale=reward_scale: reward * scale)
+    return env
+
+
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
-    """Create the vectorized environment outside the SAC class."""
+    """Create the vectorized environment outside the SAC class.
+
+    Builds either the custom embodied AntEnv, or (when args.env_id names a
+    registered Gymnasium env, e.g. Walker2d-v5) a real Gymnasium MuJoCo env
+    loaded with args.model_path as its XML.
+    """
+    reward_scale = effective_reward_scale(args)
+    args.reward_scale = reward_scale
+    use_gym = is_gymnasium_env(args.env_id)
+
+    if use_gym:
+        print(f"[√] Using Gymnasium env_id={args.env_id} (reward_scale={reward_scale})")
+        if task is not None:
+            print("[!] Ignoring --task_type for Gymnasium environments")
+    else:
+        print(f"[√] Using embodied Ant env_id={args.env_id} (reward_scale={reward_scale})")
+
     def make_env(seed, idx, capture_video, run_name):
         def _init():
-            joint_config = {
-                'hip_zero': 0,
-                'knee_zero': -np.radians(50),
-                'hip_range': np.radians(30),
-                'knee_range': np.radians(20),
-            }
-            if args.hw_config is None:
-                env = AntEnv(
-                    control_dt=args.dt,
-                    render_mode=args.render_mode,
-                    terminate_on_upside_down=args.terminate_on_upside_down,
-                    task=task,
-                    joint_config=joint_config,
-                    model_path=os.path.join(os.path.dirname(__file__), args.model_path),
-                )
-            else:
-                with open(args.hw_config, 'r') as f:
-                    cfg = json.load(f)
-                env = make_ant_env(cfg, render_mode=args.render_mode,
-                                   dt=args.dt,
-                                   joint_config=joint_config,
-                                   task=task,
-                                   )
-                # env.metadata['render_fps'] = 1/args.dt
-
-            if capture_video and idx == 0:
-                print('RecordVideo')
-                env = gym.wrappers.RecordVideo(env, os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
-                                               step_trigger=lambda x: x % args.save_every_n_steps == 0, video_length=args.save_every_n_steps)
-            env.action_space.seed(seed)
-            # Reward scaling.
-            env = gym.wrappers.TransformReward(env, lambda reward: reward * args.reward_scale)
-            return env
+            if use_gym:
+                return _make_gymnasium_env(args, seed, idx, disk_folder, run_name, runs_directory, reward_scale)
+            return _make_embodied_ant_env(args, task, seed, idx, disk_folder, run_name, runs_directory, reward_scale)
         return _init
 
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "[!] Only continuous action space is supported."
+
+    if use_gym:
+        base = _unwrap_base_env(envs.envs[0])
+        if hasattr(base, "dt"):
+            args.dt = float(base.dt)
+            print(f"[√] Synced args.dt to Gymnasium env dt={args.dt}")
+
     print(f"[√] Created environment with {envs.num_envs} environments.")
     return envs
 
@@ -189,7 +290,8 @@ class SAC:
                  use_layer_norm: bool,
                  dt: float,
                  torch_deterministic: bool = True,
-                 record_infos_sac = True
+                 record_infos_sac = True,
+                 asymmetric_updates: bool = False,
                  ):
 
         # Environment.
@@ -227,7 +329,8 @@ class SAC:
         self.dt = dt
 
         self.record_infos_sac = record_infos_sac
-
+        self.asymmetric_updates = asymmetric_updates
+        self.critic_update_count = 0
         # Alpha (entropy coefficient).
         if self.autotune:
             self.target_entropy = -torch.prod(torch.Tensor(self.envs.single_action_space.shape).to(self.device)).item()
@@ -247,6 +350,10 @@ class SAC:
                 sampler=RandomSampler(),
                 batch_size=batch_size,
             )
+
+        # offline replay buffer, loaded during sim2
+        self.rb_offline = None
+        self.mix_alpha = 0.5
 
         self.global_step = 0
         self.obs = None
@@ -292,7 +399,16 @@ class SAC:
 
         # Learning.
         if self.global_step > self.learning_starts:
-            data, info_buffer = self.rb.sample(self.batch_size, return_info=True)
+            if self.rb_offline is not None:
+                num_online  = int(self.batch_size * self.mix_alpha)
+                num_offline = self.batch_size - num_online
+
+                # Is vertically stacking, dim = 0 the right concatenation?
+                data = torch.cat([self.rb_offline.sample(num_offline), self.rb.sample(num_online)], dim=0)
+            else:
+                num_online = self.batch_size
+                num_offline = 0
+                data, info_buffer = self.rb.sample(self.batch_size, return_info=True)
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = self.actor.get_action(data["next_observations"])
                 qf1_next_target = self.qf1_target(data["next_observations"], next_state_actions)
@@ -314,30 +430,37 @@ class SAC:
             qf_loss.backward()
             self.q_optimizer.step()
 
-            if self.global_step % self.policy_frequency == 0:
-                for _ in range(
-                        self.policy_frequency
-                ):  # Compensate for the delay by doing 'actor_update_interval' instead of 1.
-                    pi, log_pi, _ = self.actor.get_action(data["observations"])
-                    qf1_pi = self.qf1(data["observations"], pi)
-                    qf2_pi = self.qf2(data["observations"], pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
+            self.critic_update_count += 1
+            if self.asymmetric_updates:
+                should_update_actor = (self.critic_update_count % self.policy_frequency == 0)
+                num_actor_updates = 1 if should_update_actor else 0
 
-                    # Optimize the Actor network.
-                    self.actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    self.actor_optimizer.step()
+            else:
+                should_update_actor = (self.global_step % self.policy_frequency == 0)
+                num_actor_updates = self.policy_frequency if should_update_actor else 0
+            for _ in range(
+                    num_actor_updates
+            ):  # Compensate for the delay by doing 'actor_update_interval' instead of 1.
+                pi, log_pi, _ = self.actor.get_action(data["observations"])
+                qf1_pi = self.qf1(data["observations"], pi)
+                qf2_pi = self.qf2(data["observations"], pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
-                    if self.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = self.actor.get_action(data["observations"])
-                        alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
+                # Optimize the Actor network.
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
 
-                        self.a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        self.a_optimizer.step()
-                        self.alpha = self.log_alpha.exp().item()
+                if self.autotune:
+                    with torch.no_grad():
+                        _, log_pi, _ = self.actor.get_action(data["observations"])
+                    alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
+
+                    self.a_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    self.a_optimizer.step()
+                    self.alpha = self.log_alpha.exp().item()
 
             # Update the target networks.
             if self.global_step % self.target_network_frequency == 0:
@@ -376,6 +499,18 @@ class SAC:
 
     def load_replay_buffer(self, replay_buffer_path):
         self.rb.loads(replay_buffer_path)
+
+    def load_replay_buffer_offline(self, replay_buffer_path):
+        self.rb_offline = ReplayBuffer(
+                storage=LazyTensorStorage(1_000_000, device=self.device),
+                sampler=RandomSampler(),
+            )
+        self.rb_offline.loads(replay_buffer_path)
+        # loads is a tourchrl method, read saved buffer from the specified path on disk, and puts it in self.rb_offline with the transition data
+        # loads() restores the batch_size that was saved with the on-disk buffer, which conflicts with
+        # the explicit per-call sample sizes used for offline/online mixing below; clear it so sample()
+        # doesn't warn every step.
+        self.rb_offline._batch_size = None
 
     def get_state(self):
         """Returns the full state of the agent including all network weights and optimizers."""
@@ -501,11 +636,20 @@ def parse_args():
                         help="radius of the back and forth task")
     parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3],
                         help="origin of the back and forth task")
-    parser.add_argument("--reward_scale", type=float, default=100.0,
-                        help="reward scale factor")
+    parser.add_argument("--reward_scale", type=float, default=None,
+                        help="reward scale factor (default: 100 for embodied Ant, 1 for Gymnasium envs)")
     parser.add_argument("--model_path", type=str, default="../../sim/assets/ant_with_camera_after_sys_id.xml",
                         help="XML file to use for the environment")
-
+    parser.add_argument("--offline_buffer_path", type=str, default=None,
+                    help="path to sim1 replay buffer for offline mixing")
+    parser.add_argument("--load_buffer", action="store_true", default=False,
+                    help="whether to load the replay buffer from weights_path, if resuming a crashed run")
+    parser.add_argument(
+        "--asymmetric_updates",
+        action="store_true",
+        default=False,
+        help="use delayed actor updates during continual learning"
+    )
     parser.set_defaults(
         torch_deterministic=True,
         autotune=True,
@@ -525,10 +669,6 @@ if __name__ == "__main__":
     os.makedirs(args.runs_directory, exist_ok=True)
     run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
     os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
-
-    # Save the args.
-    with open(os.path.join(args.runs_directory, run_name, "args.json"), "w") as f:
-        json.dump(args.__dict__, f)
 
     # Create task.
     if args.task_type == "forward":
@@ -550,6 +690,11 @@ if __name__ == "__main__":
                          disk_folder=disk_folder,
                          run_name=run_name,
                          runs_directory=args.runs_directory)
+
+    # Save the args (after env creation, since dt/reward_scale may be synced from the env).
+    with open(os.path.join(args.runs_directory, run_name, "args.json"), "w") as f:
+        json.dump(args.__dict__, f)
+
     # Setup device.
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
@@ -565,6 +710,7 @@ if __name__ == "__main__":
                 batch_size=args.batch_size,
                 learning_starts=args.learning_starts,
                 policy_frequency=args.policy_frequency,
+                asymmetric_updates=args.asymmetric_updates,
                 target_network_frequency=args.target_network_frequency,
                 tau=args.tau,
                 gamma=args.gamma,
@@ -578,7 +724,12 @@ if __name__ == "__main__":
         state = torch.load(os.path.join(args.weights_path, f"weights.pth"))
         agent.load_state(state)
         step = state["global_step"]
-        agent.load_replay_buffer(os.path.join(args.weights_path, f"replay_buffer"))
+
+        if args.load_buffer:
+            agent.load_replay_buffer(os.path.join(args.weights_path, f"replay_buffer"))
+
+    if args.offline_buffer_path is not None:
+        agent.load_replay_buffer_offline(args.offline_buffer_path)
 
     if args.eval:
         step = 0 # Reset the step to 0 when eval.
@@ -597,8 +748,11 @@ if __name__ == "__main__":
 
     info_sac_logs = []
     info_sac = None
+    episode_return = 0.0
 
     obs, info = envs.reset(seed=args.seed)
+
+    sim2_start_step = step
 
     for step in tqdm(range(step, args.total_timesteps), initial=step):
 
@@ -613,12 +767,29 @@ if __name__ == "__main__":
             # Learn.
             info_sac = agent.agent_step(next_obs, selected_actions, rewards, terminations, truncations, infos)
 
+            # Offline mixing check at each step, and anneal mix_alpha over the first
+            # 12.5% of sim2 (continual learning) from 0.5 (half online/half offline) to 1.0 (fully online).
+            if agent.rb_offline is not None:
+                local_step = step - sim2_start_step
+                sim2_total = args.total_timesteps - sim2_start_step
+                mix_alpha_warmup_frac = 0.25
+                anneal_steps = mix_alpha_warmup_frac * sim2_total
+
+                agent.mix_alpha = min(1.0, 0.5 + 0.5 * local_step / anneal_steps)
+            if info_sac is not None:
+                info_sac["mix_alpha"] = agent.mix_alpha
+                info_sac["online_fraction"] = agent.mix_alpha
+                info_sac["offline_fraction"] = 1.0 - agent.mix_alpha
+
         reward_tracker.update(infos['original_reward'][0])
+        episode_return += infos['original_reward'][0]
 
         if info_sac is not None:
             info_sac_logs.append(info_sac)
 
         if any(truncations) or any(terminations):
+            reward_tracker.record_episode_return(episode_return)
+            episode_return = 0.0
             envs.reset()
 
         # Save the model.
