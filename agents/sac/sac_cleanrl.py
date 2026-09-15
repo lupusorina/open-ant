@@ -27,54 +27,74 @@ from tensordict import TensorDict
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../sim')))
 from ant_mujoco import AntEnv
+try:
+    from agents.mpo.envs import make_envs
+except ImportError:
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../mpo')))
+    from envs import make_envs
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../embodied_ant_env')))
 from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
 
+DEFAULT_LAYER_SIZES = (256, 256)
+
+
+def _build_trunk(module, in_dim, layer_sizes, use_layer_norm):
+    sizes = [int(s) for s in layer_sizes]
+    if not sizes:
+        raise ValueError("at least one hidden layer is required")
+    for i, size in enumerate(sizes):
+        setattr(module, f"fc{i + 1}", nn.Linear(in_dim, size))
+        if use_layer_norm:
+            setattr(module, f"ln{i + 1}", nn.LayerNorm(size))
+        in_dim = size
+    module.n_hidden = len(sizes)
+    return in_dim
+
+
+def _apply_trunk(module, x):
+    for i in range(module.n_hidden):
+        x = getattr(module, f"fc{i + 1}")(x)
+        if module.use_layer_norm:
+            x = getattr(module, f"ln{i + 1}")(x)
+        x = F.relu(x)
+    return x
+
+
 class SoftQNetwork(nn.Module):
-    def __init__(self, env, use_layer_norm=False):
+    def __init__(self, env, use_layer_norm=False, layer_sizes=DEFAULT_LAYER_SIZES):
         super().__init__()
         self.use_layer_norm = use_layer_norm
-        self.fc1 = nn.Linear(
+        width = _build_trunk(
+            self,
             np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
-            256,
+            layer_sizes,
+            use_layer_norm,
         )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
-
-        if use_layer_norm:
-            self.ln1 = nn.LayerNorm(256)
-            self.ln2 = nn.LayerNorm(256)
+        self.out_name = f"fc{self.n_hidden + 1}"
+        setattr(self, self.out_name, nn.Linear(width, 1))
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = self.fc1(x)
-        if self.use_layer_norm:
-            x = self.ln1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        if self.use_layer_norm:
-            x = self.ln2(x)
-        x = F.relu(x)
-        x = self.fc3(x)
-        return x
+        x = _apply_trunk(self, x)
+        return getattr(self, self.out_name)(x)
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
 class Actor(nn.Module):
-    def __init__(self, env, use_layer_norm=False):
+    def __init__(self, env, use_layer_norm=False, layer_sizes=DEFAULT_LAYER_SIZES):
         super().__init__()
         self.use_layer_norm = use_layer_norm
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
-
-        if use_layer_norm:
-            self.ln1 = nn.LayerNorm(256)
-            self.ln2 = nn.LayerNorm(256)
+        width = _build_trunk(
+            self,
+            np.array(env.single_observation_space.shape).prod(),
+            layer_sizes,
+            use_layer_norm,
+        )
+        self.fc_mean = nn.Linear(width, np.prod(env.single_action_space.shape))
+        self.fc_logstd = nn.Linear(width, np.prod(env.single_action_space.shape))
 
         # Action rescaling.
         self.register_buffer(
@@ -93,14 +113,7 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        x = self.fc1(x)
-        if self.use_layer_norm:
-            x = self.ln1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        if self.use_layer_norm:
-            x = self.ln2(x)
-        x = F.relu(x)
+        x = _apply_trunk(self, x)
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
@@ -124,48 +137,14 @@ class Actor(nn.Module):
 
 def make_ant_envs(args, task, disk_folder, run_name, runs_directory='runs'):
     """Create the vectorized environment outside the SAC class."""
-    def make_env(seed, idx, capture_video, run_name):
-        def _init():
-            joint_config = {
-                'hip_zero': 0,
-                'knee_zero': -np.radians(50),
-                'hip_range': np.radians(30),
-                'knee_range': np.radians(20),
-            }
-            if args.hw_config is None:
-                env = AntEnv(
-                    control_dt=args.dt,
-                    render_mode=args.render_mode,
-                    terminate_on_upside_down=args.terminate_on_upside_down,
-                    task=task,
-                    joint_config=joint_config,
-                    model_path=os.path.join(os.path.dirname(__file__), args.model_path),
-                )
-            else:
-                with open(args.hw_config, 'r') as f:
-                    cfg = json.load(f)
-                env = make_ant_env(cfg, render_mode=args.render_mode,
-                                   dt=args.dt,
-                                   joint_config=joint_config,
-                                   task=task,
-                                   )
-                # env.metadata['render_fps'] = 1/args.dt
-
-            if capture_video and idx == 0:
-                print('RecordVideo')
-                env = gym.wrappers.RecordVideo(env, os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
-                                               step_trigger=lambda x: x % args.save_every_n_steps == 0, video_length=args.save_every_n_steps)
-            env.action_space.seed(seed)
-            # Reward scaling.
-            env = gym.wrappers.TransformReward(env, lambda reward: reward * args.reward_scale)
-            return env
-        return _init
-
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)],
+    _, envs = make_envs(
+        args,
+        task,
+        disk_folder,
+        run_name,
+        runs_directory=runs_directory,
+        wrap_skrl=False,
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "[!] Only continuous action space is supported."
-    print(f"[√] Created environment with {envs.num_envs} environments.")
     return envs
 
 
@@ -189,7 +168,9 @@ class SAC:
                  use_layer_norm: bool,
                  dt: float,
                  torch_deterministic: bool = True,
-                 record_infos_sac = True
+                 record_infos_sac = True,
+                 policy_layer_sizes = DEFAULT_LAYER_SIZES,
+                 critic_layer_sizes = DEFAULT_LAYER_SIZES,
                  ):
 
         # Environment.
@@ -207,11 +188,11 @@ class SAC:
         torch.backends.cudnn.benchmark = not torch_deterministic
 
         # Networks.
-        self.actor = Actor(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf1 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf2 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf1_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
-        self.qf2_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm).to(self.device)
+        self.actor = Actor(self.envs, use_layer_norm=use_layer_norm, layer_sizes=policy_layer_sizes).to(self.device)
+        self.qf1 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, layer_sizes=critic_layer_sizes).to(self.device)
+        self.qf2 = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, layer_sizes=critic_layer_sizes).to(self.device)
+        self.qf1_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, layer_sizes=critic_layer_sizes).to(self.device)
+        self.qf2_target = SoftQNetwork(self.envs, use_layer_norm=use_layer_norm, layer_sizes=critic_layer_sizes).to(self.device)
         self.qf1_target.load_state_dict(self.qf1.state_dict())
         self.qf2_target.load_state_dict(self.qf2.state_dict())
         self.q_optimizer = optim.Adam(list(self.qf1.parameters()) + list(self.qf2.parameters()), lr=q_lr)
@@ -499,10 +480,12 @@ def parse_args(argv=None):
                         help="type of task")
     parser.add_argument("--radius_back_and_forth", type=float, default=0.3,
                         help="radius of the back and forth task")
-    parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.75, -0.3],
+    parser.add_argument("--origin_back_and_forth", type=float, nargs=2, default=[0.7, -0.25],
                         help="origin of the back and forth task")
     parser.add_argument("--reward_scale", type=float, default=100.0,
                         help="reward scale factor")
+    parser.add_argument("--policy_layer_sizes", type=int, nargs="+", default=list(DEFAULT_LAYER_SIZES), help="Hidden layer widths of the actor.")
+    parser.add_argument("--critic_layer_sizes", type=int, nargs="+", default=list(DEFAULT_LAYER_SIZES), help="Hidden layer widths of each Q network.")
     parser.add_argument("--model_path", type=str, default="../../sim/assets/ant_with_camera_after_sys_id.xml",
                         help="XML file to use for the environment")
 
@@ -570,7 +553,9 @@ if __name__ == "__main__":
                 gamma=args.gamma,
                 use_layer_norm=args.use_layer_norm,
                 seed=args.seed,
-                dt=args.dt)
+                dt=args.dt,
+                policy_layer_sizes=args.policy_layer_sizes,
+                critic_layer_sizes=args.critic_layer_sizes)
 
     step = 0
     # Load the model.
