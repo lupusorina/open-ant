@@ -2,7 +2,7 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
-from .sessions import MpoSession, SacSession
+from .sessions import MpoSession, SacSession, snapshot_sac_weights, snapshot_weights
 
 
 def _floor_divide_learning_starts(args) -> None:
@@ -15,12 +15,15 @@ class AgentAdapter:
     session_cls: Callable[..., Any]
     mutate_args: Optional[Callable[[Any], None]] = _floor_divide_learning_starts
     expand: Dict[str, "Expansion"] = field(default_factory=dict)
+    snapshot: Optional[Callable[[Any], Dict[str, Any]]] = None
 
     def module(self):
         return importlib.import_module(self.module_path)
 
-    def session(self, args, run_name):
-        return self.session_cls(self.module(), args, run_name)
+    def session(self, args, run_name, weights=None):
+        if weights is None:
+            return self.session_cls(self.module(), args, run_name)
+        return self.session_cls(self.module(), args, run_name, weights=weights)
 
 
 @dataclass(frozen=True)
@@ -48,9 +51,12 @@ MPO = AgentAdapter(
     module_path="agents.mpo.mpo_acme",
     session_cls=MpoSession,
     expand=MPO_LAYER_EXPANSIONS,
+    snapshot=snapshot_weights,
 )
 
 SAC = AgentAdapter(
     module_path="agents.sac.sac_cleanrl",
     session_cls=SacSession,
+    expand=MPO_LAYER_EXPANSIONS,
+    snapshot=snapshot_sac_weights,
 )

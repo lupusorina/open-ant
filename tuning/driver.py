@@ -31,8 +31,11 @@ def run_training(
     on_report: Optional[Callable[[int, float], bool]] = None,
     report_every_n_steps: int = 1000,
     run_name: Optional[str] = None,
-) -> float:
-    """Train once and return the final reward rate (nan if none was produced)"""
+    initial_weights: Optional[Dict[str, Any]] = None,
+    eval_spec: Optional[Dict[str, Any]] = None,
+    return_weights: bool = False,
+) -> Dict[str, Any]:
+    """Train once; return the final reward rate and an optional frozen eval."""
     args = build_args(adapter, config)
 
     assert not getattr(args, "eval", False), "the driver does not run evaluation"
@@ -47,9 +50,10 @@ def run_training(
     run_name = run_name or f"{args.exp_name}_seed_{args.seed}"
     os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
-    session = adapter.session(args, run_name)
+    session = adapter.session(args, run_name, weights=initial_weights)
     try:
         obs = session.reset()
+        stopped_early = False
 
         for _ in range(session.global_step, args.total_timesteps):
             obs = session.step(obs)
@@ -58,9 +62,19 @@ def run_training(
             if on_report is not None and step % report_every_n_steps == 0:
                 value = session.reward_rate
                 if value is not None and on_report(step, value):
+                    stopped_early = True
                     break
 
         final = session.reward_rate
-        return float("nan") if final is None else float(final)
+        evaluation = None
+        if eval_spec is not None and not stopped_early and hasattr(session, "evaluate"):
+            evaluation = session.evaluate(**eval_spec)
+        result = {
+            "final": float("nan") if final is None else float(final),
+            "eval": evaluation,
+        }
+        if return_weights and adapter.snapshot is not None:
+            result["weights"] = adapter.snapshot(session.agent)
+        return result
     finally:
         session.close()
