@@ -1,0 +1,14 @@
+dens1.5
+dens2
+dens3
+foot0.5
+foot0.2
+foot0.1
+delay0.12
+delay0.15
+delay0.2
+dens2_foot0.5
+dens2_delay0.05
+foot0.5_delay0.05
+all_mild
+all_hard
