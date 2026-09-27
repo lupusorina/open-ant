@@ -19,6 +19,7 @@ except ImportError:
     shimmy = None
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../sim")))
 from ant_mujoco import AntEnv
+from ant_mujoco_dr import AntEnvDR
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../embodied_ant_env")))
 from embodied_ant_env import make_ant_env
@@ -27,6 +28,7 @@ from embodied_ant_env import make_ant_env
 EMBODIED_ANT_ENV_IDS = {
     "EAnt",
     "SimEmbodiedAnt",
+    "SimEmbodiedAntDR",
     "HwEmbodiedAnt",
     "CustomAnt-v0",
 }
@@ -125,7 +127,8 @@ def _make_embodied_ant_env(args, task, seed, idx, disk_folder, run_name, runs_di
         "knee_range": np.radians(20),
     }
     if args.hw_config is None:
-        env = AntEnv(
+        env_cls = AntEnvDR if args.env_id == "SimEmbodiedAntDR" else AntEnv
+        env = env_cls(
             control_dt=args.dt,
             render_mode=args.render_mode,
             terminate_on_upside_down=args.terminate_on_upside_down,

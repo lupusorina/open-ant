@@ -1029,7 +1029,7 @@ def parse_args(argv=None):
         "--env_id",
         type=str,
         default="EAnt",
-        help="Embodied Ant id (EAnt / SimEmbodiedAnt / HwEmbodiedAnt) or Gymnasium "
+        help="Embodied Ant id (EAnt / SimEmbodiedAnt / SimEmbodiedAntDR / HwEmbodiedAnt) or Gymnasium "
              "MuJoCo id (Hopper-v5, Walker2d-v5, Humanoid-v5, Ant-v5, ...)",
     )
     parser.add_argument("--total_timesteps", type=int, default=60_000)
