@@ -1,0 +1,4 @@
+mini_pi_mass_fric_20
+mini_pi_mass_fric_40
+mini_pi_mass_fric_60
+mini_pi_mass_fric_80

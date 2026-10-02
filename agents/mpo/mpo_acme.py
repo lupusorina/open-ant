@@ -332,9 +332,21 @@ class MPO:
                 metrics["utd"] = num_updates
         return metrics
 
-    def agent_step_eval(self, next_obs):
+    def agent_step_eval(self, next_obs, rewards, terminations, truncations, infos):
+        terminations = terminations.bool()
+        truncations = truncations.bool()
+        boundaries = terminations | truncations
+
+        if "autoreset" in infos:
+            autoreset_now = torch.as_tensor(infos["autoreset"], dtype=torch.bool, device=self.device)
+        else:
+            autoreset_now = self.pending_autoreset
+
+        self._update_episode_returns(infos, rewards, boundaries, autoreset_now)
+
         self.global_step += 1
         self.obs = next_obs
+        self.pending_autoreset = boundaries.detach().clone()
 
     def _learn(self):
         with torch.no_grad():
@@ -735,7 +747,8 @@ class MPO:
         self.info_log_buffer.append(row)
 
 
-        if metrics is not None:
+        if metrics is not None or self.args.eval:
+            m = metrics if metrics is not None else {}
             elapsed_time = max(time.time() - self.start_time,1e-8)
             # global_step counts vector-environment steps, so multiply
             # by num_envs to obtain total environment transitions.
@@ -743,34 +756,34 @@ class MPO:
             reward_value = float(rewards.reshape(-1)[0].item())
             agent_vars_row = {
                 "step": global_step,
-                "critic_loss": metrics.get("critic_loss"),
-                "policy_loss": metrics.get("policy_loss"),
-                "dual_alpha_mean": metrics.get("dual_alpha_mean"),
-                "dual_alpha_stddev": metrics.get("dual_alpha_stddev"),
-                "dual_temperature": metrics.get("dual_temperature"),
-                "loss_alpha": metrics.get("loss_alpha"),
-                "loss_temperature": metrics.get("loss_temperature"),
-                "loss_policy_cross_entropy": metrics.get("loss_policy_cross_entropy"),
-                "loss_kl_penalty": metrics.get("loss_kl_penalty"),
-                "kl_q_rel": metrics.get("kl_q_rel"),
-                "kl_mean_rel": metrics.get("kl_mean_rel"),
-                "kl_stddev_rel": metrics.get("kl_stddev_rel"),
-                "q_min": metrics.get("q_min"),
-                "q_max": metrics.get("q_max"),
-                "pi_stddev_min": metrics.get("pi_stddev_min"),
-                "pi_stddev_max": metrics.get("pi_stddev_max"),
-                "pi_stddev_cond": metrics.get("pi_stddev_cond"),
-                "utd": metrics.get("utd"),
+                "critic_loss": m.get("critic_loss"),
+                "policy_loss": m.get("policy_loss"),
+                "dual_alpha_mean": m.get("dual_alpha_mean"),
+                "dual_alpha_stddev": m.get("dual_alpha_stddev"),
+                "dual_temperature": m.get("dual_temperature"),
+                "loss_alpha": m.get("loss_alpha"),
+                "loss_temperature": m.get("loss_temperature"),
+                "loss_policy_cross_entropy": m.get("loss_policy_cross_entropy"),
+                "loss_kl_penalty": m.get("loss_kl_penalty"),
+                "kl_q_rel": m.get("kl_q_rel"),
+                "kl_mean_rel": m.get("kl_mean_rel"),
+                "kl_stddev_rel": m.get("kl_stddev_rel"),
+                "q_min": m.get("q_min"),
+                "q_max": m.get("q_max"),
+                "pi_stddev_min": m.get("pi_stddev_min"),
+                "pi_stddev_max": m.get("pi_stddev_max"),
+                "pi_stddev_cond": m.get("pi_stddev_cond"),
+                "utd": m.get("utd"),
                 "SPS": sps,
                 "average_reward_per_second": (self.reward_tracker.average_reward_per_second),
                 "reward": reward_value,
                 "mean_return": self.reward_tracker.mean_return,
             }
             for idx in range(self.act_dim):
-                agent_vars_row[f"dual_alpha_mean_{idx}"] = metrics.get(f"dual_alpha_mean_{idx}")
-                agent_vars_row[f"dual_alpha_stddev_{idx}"] = metrics.get(f"dual_alpha_stddev_{idx}")
-                agent_vars_row[f"pi_stddev_{idx}"] = metrics.get(f"pi_stddev_{idx}")
-            
+                agent_vars_row[f"dual_alpha_mean_{idx}"] = m.get(f"dual_alpha_mean_{idx}")
+                agent_vars_row[f"dual_alpha_stddev_{idx}"] = m.get(f"dual_alpha_stddev_{idx}")
+                agent_vars_row[f"pi_stddev_{idx}"] = m.get(f"pi_stddev_{idx}")
+
             self.agent_vars_buffer.append(agent_vars_row)
 
         if global_step % self.args.save_every_n_steps == 0:
@@ -1019,6 +1032,11 @@ def parse_args(argv=None):
     parser.add_argument("--torch_deterministic", action="store_true", default=False)
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--capture_video", action="store_true")
+    parser.add_argument("--capture_video_steps", type=int, default=None,
+                        help="If set, record one continuous video from step 0 through this "
+                             "many steps, instead of the recurring save_every_n_steps clips.")
+    parser.add_argument("--capture_video_every", type=int, default=None,
+                        help="Start a capture_video_steps-long clip every N env steps (default: only at step 0)")
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
     parser.add_argument("--log_every_n_steps", type=int, default=4000)
@@ -1224,8 +1242,19 @@ def main():
     agent.initialize_logging(info, append=args.resume_in_place)
     
     if args.resume_in_place:
-        # RewardTracker has its own counter, so continue it from the checkpoint.
-        agent.reward_tracker.step = agent.global_step
+        # RewardTracker has its own counter. Continue it from the last row already
+        # written to its CSV (not from agent.global_step) because global_step can
+        # include an offset inherited from an earlier phase (e.g. sim1 weights
+        # loaded before a continual-learning run), while the CSV's own "step"
+        # column is always local to this run.
+        reward_csv_path = agent.reward_tracker.csv_path
+        last_local_step = 0.0
+        if os.path.exists(reward_csv_path):
+            with open(reward_csv_path, "r", newline="") as f:
+                rows = list(csv.reader(f))
+            if len(rows) > 1:
+                last_local_step = float(rows[-1][0])
+        agent.reward_tracker.step = last_local_step
 
     # try:
     #     from torch.utils.tensorboard import SummaryWriter
@@ -1246,7 +1275,7 @@ def main():
             next_obs, rewards, terminations, truncations, infos = envs.step(selected_actions)
 
             if args.eval:
-                agent.agent_step_eval(next_obs)
+                agent.agent_step_eval(next_obs, rewards, terminations, truncations, infos)
                 metrics = None
             else:
                 metrics = agent.agent_step(next_obs, selected_actions, rewards, terminations, truncations, infos)

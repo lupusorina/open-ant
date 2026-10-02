@@ -22,6 +22,7 @@ from ant_mujoco import AntEnv
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../embodied_ant_env")))
 from embodied_ant_env import make_ant_env
+import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0 (sim/ is on sys.path above)
 
 # Embodied / custom Ant IDs used by this repo (not Gymnasium registry entries).
 EMBODIED_ANT_ENV_IDS = {
@@ -63,11 +64,20 @@ def _unwrap_base_env(env):
 
 def _maybe_record_video(env, args, idx, disk_folder, run_name, runs_directory):
     if args.capture_video and idx == 0:
+        if args.capture_video_steps is not None:
+            # Clips of capture_video_steps each, starting every capture_video_every
+            # steps (default: one clip at step 0 only, as before).
+            every = getattr(args, "capture_video_every", None)
+            step_trigger = (lambda x: x == 0) if every is None else (lambda x: x % every == 0)
+            video_length = args.capture_video_steps
+        else:
+            step_trigger = lambda x: x % args.save_every_n_steps == 0
+            video_length = args.save_every_n_steps
         env = gym.wrappers.RecordVideo(
             env,
             os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
-            step_trigger=lambda x: x % args.save_every_n_steps == 0,
-            video_length=args.save_every_n_steps,
+            step_trigger=step_trigger,
+            video_length=video_length,
         )
     return env
 
