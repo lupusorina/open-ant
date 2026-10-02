@@ -35,10 +35,12 @@ from reward import RewardTracker
 
 try:
     from .nn import (AcmeActor, AcmeCritic, DiscreteValuedDistribution,  # imported as package
-                     ScalarAcmeCritic, categorical, td_learning)
+                     ScalarAcmeCritic, QuantileCritic, categorical, td_learning,
+                     quantile_huber_loss)
 except ImportError:
     from nn import (AcmeActor, AcmeCritic, DiscreteValuedDistribution,   # run standalone
-                    ScalarAcmeCritic, categorical, td_learning)
+                    ScalarAcmeCritic, QuantileCritic, categorical, td_learning, 
+                    quantile_huber_loss)
 
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -119,6 +121,11 @@ class MPO:
                 vmax=args.vmax,
                 num_atoms=args.num_atoms,
             )
+        elif self.args.critic_type == "quantile":
+            if self.args.ensemble != 1:
+                raise ValueError("Quantile critic currently supports --ensemble 1 only.")
+            critic_cls = QuantileCritic
+            critic_kwargs = dict(num_quantiles=args.num_quantiles)
         else:
             critic_cls = ScalarAcmeCritic
             critic_kwargs = {}
@@ -446,6 +453,40 @@ class MPO:
                     q_t=target_q_distribution,
                 ).mean()
                 for critic in self.critics], dim=0)
+        elif self.args.critic_type == "quantile":
+            with torch.no_grad():
+                num_quantiles = self.args.num_quantiles
+                next_quantiles = self.target_critics[0](
+                    tiled_states, flat_actions).reshape(N, B, num_quantiles)
+                #  for nonparametric q(a|s) in E step of MPO. get q_value for each of N actions
+                q_values = next_quantiles.mean(dim=-1) # [N, B]
+
+                # find loss for each of M next actions separately, then average 
+                # the losses by multiplying each with the corresponding action's
+                # probability
+                M = self.args.quantile_target_action_num
+                target_quantiles = r_t.unsqueeze(0).unsqueeze(-1) + pcont_t.unsqueeze(0).unsqueeze(-1) * next_quantiles[:M]
+            losses = []
+            current_quantiles = self.critics[0](s_tm1, a_tm1)
+            for n in range(M):                
+                loss_n = quantile_huber_loss(
+                    current_quantiles,
+                    target_quantiles[n],
+                    sum_over_quantiles=self.args.sum_over_quantiles,
+                    huber_param=self.args.quantile_huber_param,
+                )
+                losses.append(loss_n)
+                # just use one of the sampled a_t+1 from pi_target(s_t+1) to compute target?
+                # [B, 201]  -> for 1 action, has 201 quantiles.
+                # target_quantiles = r_t.unsqueeze(-1) + pcont_t.unsqueeze(-1) * best_target_quantiles #next_quantiles[0]
+            critic_loss_per_critic = torch.stack(losses).mean()
+            # critic_loss_per_critic = quantile_huber_loss(
+            #     current_quantiles,
+            #     target_quantiles,
+            #     sum_over_quantiles=self.args.sum_over_quantiles,
+            #     huber_param=self.args.quantile_huber_param,
+            # )
+
         else:
             with torch.no_grad():
                 sampled_q_t = torch.stack([
@@ -1040,7 +1081,7 @@ def parse_args(argv=None):
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
     parser.add_argument("--log_every_n_steps", type=int, default=4000)
-    parser.add_argument("--critic_type", type=str, default="scalar", choices=["scalar", "categorical"], help="The 'scalar' critic is regular MPO, whereas 'categorical' distributional critic is for DMPO")
+    parser.add_argument("--critic_type", type=str, default="scalar", choices=["scalar", "categorical", "quantile"], help="Critic type: scalar MPO, categorical/C51 DMPO, or quantile-regression distributional critic")
     parser.add_argument("--ensemble", type=int, default=1, help="Number of critics in the ensemble, where 1 reproduces the single-critic agent")
 
     parser.add_argument(
@@ -1059,10 +1100,20 @@ def parse_args(argv=None):
     # Categorical distributional critic
     parser.add_argument("--vmin", type=float, default=-500.0,
                         help="Minimum atom value for distributional critic")
-    parser.add_argument("--vmax", type=float, default=20.0,
+    parser.add_argument("--vmax", type=float, default=50.0,
                         help="Maximum atom value for distributional critic")
     parser.add_argument("--num_atoms", type=int, default=101,
                         help="Number of categorical atoms for distributional critic")
+
+    # Quantile-regression distributional critic
+    parser.add_argument("--num_quantiles", type=int, default=201,
+                        help="Number of learned return quantiles for quantile critic")
+    parser.add_argument("--quantile_target_action_num", type=int, default=4,
+                        help="Number of sampled next-actions (M) averaged over when computing the quantile critic TD-target loss")
+    parser.add_argument("--quantile_huber_param", type=float, default=1.0,
+                        help="Huber threshold for quantile regression; 0 uses absolute loss")
+    parser.add_argument("--sum_over_quantiles", action=argparse.BooleanOptionalAction, default=True,
+                        help="Sum the quantile-huber loss over quantiles before averaging over batch, vs. averaging over both")
 
     parser.add_argument("--log_interval", type=int, default=100,
                         help="env steps between TensorBoard scalar writes")
@@ -1108,6 +1159,10 @@ def parse_args(argv=None):
 
     # Environment.
     parser.add_argument("--dt", type=float, default=0.12)
+    # RC car (--env_id RCCarSim1-v0 = kinematic bicycle, RCCarSim2-v0 = tire-force blend).
+    parser.add_argument("--rccar_domain_randomization", type=str, default="per_env",
+                        choices=["off", "per_env", "per_episode"])
+    parser.add_argument("--rccar_episode_length", type=int, default=250)
     parser.add_argument("--hw_config", type=str, default=None)
     parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)

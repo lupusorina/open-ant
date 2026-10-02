@@ -260,6 +260,108 @@ def td_learning(v_tm1, r_t, pcont_t, v_t):
     return loss, target, td_error
 
 
+# def quantile_regression_loss(
+#     dist_src: torch.Tensor,
+#     tau_src: torch.Tensor,
+#     dist_target: torch.Tensor,
+#     huber_param: float = 0.0,
+# ) -> torch.Tensor:
+#     """RLax-style quantile regression loss, batched over dimension 0.
+
+#     dist_src:    (B, K) current quantile locations.
+#     tau_src:     (K,) fixed quantile midpoints.
+#     dist_target: (B, K_target) Bellman target return samples.
+#     returns:     (B,) one QR loss per replay item.
+#     """
+#     # find delta between every target & prediction quantile pair
+#     delta = dist_target[:, None, :] - dist_src[:, :, None]  # (B, K, K_target)
+#     # which deltas < 0 (when is target y < predicted return)
+#     delta_neg = (delta < 0.0).to(delta.dtype).detach()
+#     # [B, K, ]
+#     weight = torch.abs(tau_src.view(1, -1, 1) - delta_neg)
+
+#     if huber_param > 0.0:
+#         abs_delta = delta.abs()
+#         quadratic = torch.clamp(abs_delta, max=huber_param)
+#         loss = 0.5 * quadratic.square() + huber_param * (abs_delta - quadratic)
+#     else:
+#         loss = delta.abs()
+
+#     loss = loss * weight
+#     return loss.mean(dim=-1).sum(dim=-1)
+
+def quantile_huber_loss(
+    current_quantiles: torch.Tensor,
+    target_quantiles: torch.Tensor,
+    cum_prob: torch.Tensor | None = None,
+    sum_over_quantiles: bool = False,
+    huber_param: float = 1.0,
+) -> torch.Tensor:
+    """
+    The quantile-regression loss, as described in the QR-DQN and TQC papers.
+    Partially taken from https://github.com/bayesgroup/tqc_pytorch.
+
+    :param current_quantiles: current estimate of quantiles, must be either
+        (batch_size, n_quantiles) or (batch_size, n_critics, n_quantiles)
+    :param target_quantiles: target of quantiles, must be either (batch_size, n_target_quantiles),
+        (batch_size, 1, n_target_quantiles), or (batch_size, n_critics, n_target_quantiles)
+    :param cum_prob: cumulative probabilities to calculate quantiles (also called midpoints in QR-DQN paper),
+        must be either (batch_size, n_quantiles), (batch_size, 1, n_quantiles), or (batch_size, n_critics, n_quantiles).
+        (if None, calculating unit quantiles)
+    :param sum_over_quantiles: if summing over the quantile dimension or not
+    :param huber_param: the Huber loss threshold (kappa); 1.0 recovers the original fixed-kappa loss
+    :return: the loss
+    """
+    if current_quantiles.ndim != target_quantiles.ndim:
+        raise ValueError(
+            f"Error: The dimension of curremt_quantile ({current_quantiles.ndim}) needs to match "
+            f"the dimension of target_quantiles ({target_quantiles.ndim})."
+        )
+    if current_quantiles.shape[0] != target_quantiles.shape[0]:
+        raise ValueError(
+            f"Error: The batch size of curremt_quantile ({current_quantiles.shape[0]}) needs to match "
+            f"the batch size of target_quantiles ({target_quantiles.shape[0]})."
+        )
+    if current_quantiles.ndim not in (2, 3):
+        raise ValueError(f"Error: The dimension of current_quantiles ({current_quantiles.ndim}) needs to be either 2 or 3.")
+
+    if cum_prob is None:
+        n_quantiles = current_quantiles.shape[-1]
+        # Cumulative probabilities to calculate quantiles.
+        cum_prob = (torch.arange(n_quantiles, device=current_quantiles.device, dtype=current_quantiles.dtype) + 0.5) / n_quantiles
+        if current_quantiles.ndim == 2:
+            # For QR-DQN, current_quantiles have a shape (batch_size, n_quantiles), and make cum_prob
+            # broadcastable to (batch_size, n_quantiles, n_target_quantiles)
+            cum_prob = cum_prob.view(1, -1, 1)
+        elif current_quantiles.ndim == 3:
+            # For TQC, current_quantiles have a shape (batch_size, n_critics, n_quantiles), and make cum_prob
+            # broadcastable to (batch_size, n_critics, n_quantiles, n_target_quantiles)
+            cum_prob = cum_prob.view(1, 1, -1, 1)
+
+    # QR-DQN
+    # target_quantiles: (batch_size, n_target_quantiles) -> (batch_size, 1, n_target_quantiles)
+    # current_quantiles: (batch_size, n_quantiles) -> (batch_size, n_quantiles, 1)
+    # pairwise_delta: (batch_size, n_target_quantiles, n_quantiles)
+    # TQC
+    # target_quantiles: (batch_size, 1, n_target_quantiles) -> (batch_size, 1, 1, n_target_quantiles)
+    # current_quantiles: (batch_size, n_critics, n_quantiles) -> (batch_size, n_critics, n_quantiles, 1)
+    # pairwise_delta: (batch_size, n_critics, n_quantiles, n_target_quantiles)
+    # Note: in both cases, the loss has the same shape as pairwise_delta
+    pairwise_delta = target_quantiles.unsqueeze(-2) - current_quantiles.unsqueeze(-1)
+    abs_pairwise_delta = torch.abs(pairwise_delta)
+    huber_loss = torch.where(
+        abs_pairwise_delta > huber_param,
+        huber_param * (abs_pairwise_delta - 0.5 * huber_param),
+        pairwise_delta**2 * 0.5,
+    )
+    loss = torch.abs(cum_prob - (pairwise_delta.detach() < 0).float()) * huber_loss
+    if sum_over_quantiles:
+        loss = loss.sum(dim=-2).mean()
+    else:
+        loss = loss.mean()
+    return loss
+
+
 class DiscreteValuedHead(nn.Module):
     ''' maps hidden features to logits over a fixed support of return atoms,
     then returns a discretevalueddistribution '''
@@ -385,7 +487,43 @@ class ScalarAcmeCritic(nn.Module):
         torso_output = self.torso(inputs)  # (B, 256)
         value = self.value_head(torso_output)
         return value
+class QuantileCritic(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        layer_sizes: Sequence[int] = (512, 512, 256),
+        num_quantiles: int = 201,
+    ) -> None:
+        super().__init__()
 
+        self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
+        self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
+        
+        self.torso = AcmeLayerNormMLP(
+            input_size=obs_dim + act_dim,
+            layer_sizes=layer_sizes,
+            activate_final=True)
+
+        self.quantile_head = nn.Linear(
+            in_features=layer_sizes[-1],
+            out_features=num_quantiles)
+           # scale=1e-4)
+    
+    def forward(self,observation: torch.Tensor,action: torch.Tensor) -> torch.Tensor:
+        # Clip action
+        observation = observation.reshape(observation.shape[0],-1)
+        action = action.reshape(action.shape[0],-1)
+
+        action = torch.clamp(action,self.action_low,self.action_high)
+        action = action.to(dtype=observation.dtype,device=observation.device)
+        inputs = torch.cat([observation, action],dim=-1)
+
+        torso_output = self.torso(inputs)  # (B, 256)
+        quantiles = self.quantile_head(torso_output)
+        return quantiles
 class AcmeCritic(nn.Module):
     def __init__(
         self,
