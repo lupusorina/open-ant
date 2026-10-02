@@ -5,9 +5,11 @@
 #   bash runall_mixbuff_asym.sh continual  # continual only, reusing existing sim1 checkpoints
 
 # ← Edit this list to whatever seeds you want
-SEEDS=(1 2 3 4 5 6 7 8 9 10)
-
-RUNS_DIR="runs/sac_mixbuff_asym_freq2"
+SEEDS=(26 27 28 29 30)
+#  6 7 13 14 18
+#  
+# 19 20 23 24 25
+RUNS_DIR="/data2/serenaliu_data/2sac_mixbuf_asym"
 
 MODE="${1:-all}"
 
