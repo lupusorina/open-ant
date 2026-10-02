@@ -1,0 +1,15 @@
+# Both groups draw: some collision primitives extend outside their mesh.
+# A body assignment covers its mesh and its own visible primitives together.
+groups: [0, 1]
+panel:
+  bodies: [torso_link, head_pitch_link, r_thigh_link, l_thigh_link,
+           r_calf_link, l_calf_link, r_shoulder_pitch_link, l_shoulder_pitch_link,
+           r_upper_arm_link, l_upper_arm_link]
+housing:
+  bodies: [base_link, waist_yaw_link, head_yaw_link, camera_link,
+           r_hip_pitch_link, l_hip_pitch_link, r_hip_roll_link, l_hip_roll_link,
+           r_shoulder_roll_link, l_shoulder_roll_link, r_elbow_link, l_elbow_link]
+metal:
+  bodies: [r_ankle_pitch_link, l_ankle_pitch_link]
+rubber:
+  bodies: [r_ankle_roll_link, l_ankle_roll_link, r_wrist_link, l_wrist_link]
