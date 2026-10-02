@@ -180,7 +180,10 @@ def _maybe_record_video(env, args, idx, disk_folder, run_name, runs_directory):
             video_length = args.save_every_n_steps
         env = gym.wrappers.RecordVideo(
             env,
-            os.path.join(disk_folder, runs_directory, run_name, "videos", run_name),
+            # On --resume_in_place, video_subdir points at a fresh folder so the
+            # restarted step counter doesn't overwrite earlier clips.
+            os.path.join(disk_folder, runs_directory, run_name, "videos",
+                         getattr(args, "video_subdir", None) or run_name),
             step_trigger=step_trigger,
             video_length=video_length,
         )
@@ -669,6 +672,12 @@ def parse_args():
     parser.add_argument("--load_buffer", action="store_true", default=False,
                     help="force-load the replay buffer from weights_path even when --offline_buffer_path is set "
                          "(e.g. resuming a crashed offline-mixing run); the buffer is always loaded otherwise")
+    parser.add_argument("--resume_in_place", action="store_true", default=False,
+                    help="continue the run in --weights_path (an existing run dir) in place: same dir, "
+                         "same replay buffer, appending to its logs")
+    parser.add_argument("--resume_discard_reward_steps", type=int, default=1000,
+                    help="with --resume_in_place, leave the first N steps' rewards (and any episode that "
+                         "started in them) out of the reward logs, to skip restart artifacts")
     parser.add_argument(
         "--asymmetric_updates",
         action="store_true",
@@ -691,9 +700,20 @@ if __name__ == "__main__":
     # Set up folders for environment creation.
     date = datetime.now().strftime("%Y%m%d-%H%M%S")
     disk_folder = ''
-    os.makedirs(args.runs_directory, exist_ok=True)
-    run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
-    os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
+    if args.resume_in_place:
+        if args.weights_path is None:
+            raise ValueError("--resume_in_place requires --weights_path")
+        run_dir = os.path.abspath(args.weights_path.rstrip("/"))
+        args.runs_directory = os.path.dirname(run_dir)
+        run_name = os.path.basename(run_dir)
+        resume_step = torch.load(os.path.join(run_dir, "weights.pth"),
+                                 map_location="cpu", weights_only=False)["global_step"]
+        args.video_subdir = f"{run_name}_resume_{resume_step}"
+        print(f"[√] Resuming in existing run directory: {run_dir} (step {resume_step})")
+    else:
+        os.makedirs(args.runs_directory, exist_ok=True)
+        run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
+        os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
     # Create task.
     if args.task_type == "forward":
@@ -717,8 +737,10 @@ if __name__ == "__main__":
                          runs_directory=args.runs_directory)
 
     # Save the args (after env creation, since dt/reward_scale may be synced from the env).
-    with open(os.path.join(args.runs_directory, run_name, "args.json"), "w") as f:
-        json.dump(args.__dict__, f)
+    # On resume keep the original args.json (its total_timesteps is the run's target).
+    if not args.resume_in_place:
+        with open(os.path.join(args.runs_directory, run_name, "args.json"), "w") as f:
+            json.dump(args.__dict__, f)
 
     # Setup device.
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
@@ -759,7 +781,8 @@ if __name__ == "__main__":
         # Always resume the online replay buffer, unless we're doing the offline-mixing
         # trick (offline_buffer_path set), in which case start with a fresh online buffer
         # -- pass --load_buffer explicitly to override this (e.g. resuming a crashed trick run).
-        if args.load_buffer or args.offline_buffer_path is None:
+        # --resume_in_place always reloads the run's own buffer.
+        if args.load_buffer or args.offline_buffer_path is None or args.resume_in_place:
             agent.load_replay_buffer(os.path.join(args.weights_path, f"replay_buffer"))
 
     if args.offline_buffer_path is not None:
@@ -784,9 +807,30 @@ if __name__ == "__main__":
     info_sac = None
     episode_return = 0.0
 
-    obs, info = envs.reset(seed=args.seed)
-
     sim2_start_step = step
+
+    # Resume in place: continue the existing logs instead of overwriting them.
+    info_sac_prev = None
+    discard_until = step  # steps before this are left out of the reward logs
+    if args.resume_in_place:
+        info_path = os.path.join(args.runs_directory, run_name, "info_sac_logs.csv")
+        if os.path.exists(info_path) and os.path.getsize(info_path) > 0:
+            info_sac_prev = pd.read_csv(info_path)
+            info_sac_prev = info_sac_prev[info_sac_prev["global_step"] <= step]
+            # Keep the offline-mix anneal measured from the original Sim2 start.
+            if agent.rb_offline is not None and len(info_sac_prev) > 0:
+                sim2_start_step = int(info_sac_prev["global_step"].iloc[0]) - 1
+        # RewardTracker appends to its CSV; continue its local step counter.
+        if os.path.exists(reward_tracker.csv_path):
+            with open(reward_tracker.csv_path, "r", newline="") as f:
+                rows = list(csv.reader(f))
+            if len(rows) > 1:
+                reward_tracker.step = float(rows[-1][0])
+        discard_until = step + args.resume_discard_reward_steps
+        print(f"Resuming: rewards before step {discard_until} are left out of the reward logs")
+    discard_episode = step < discard_until
+
+    obs, info = envs.reset(seed=args.seed)
 
     for step in tqdm(range(step, args.total_timesteps), initial=step, total=args.total_timesteps):
 
@@ -815,15 +859,20 @@ if __name__ == "__main__":
                 info_sac["online_fraction"] = agent.mix_alpha
                 info_sac["offline_fraction"] = 1.0 - agent.mix_alpha
 
-        reward_tracker.update(infos['original_reward'][0])
+        if step < discard_until:
+            reward_tracker.step += 1  # keep the step axis aligned, but log nothing
+        else:
+            reward_tracker.update(infos['original_reward'][0])
         episode_return += infos['original_reward'][0]
 
         if info_sac is not None:
             info_sac_logs.append(info_sac)
 
         if any(truncations) or any(terminations):
-            reward_tracker.record_episode_return(episode_return)
+            if not discard_episode:
+                reward_tracker.record_episode_return(episode_return)
             episode_return = 0.0
+            discard_episode = step + 1 < discard_until
             # The agent acts on (and stores transitions from) agent.obs, so it must
             # see the new episode's first observation, not the terminal one.
             obs, _ = envs.reset()
@@ -841,5 +890,7 @@ if __name__ == "__main__":
 
             # Save to csv.
             df_info_sac_logs = pd.DataFrame(info_sac_logs)
+            if info_sac_prev is not None:
+                df_info_sac_logs = pd.concat([info_sac_prev, df_info_sac_logs], ignore_index=True)
             df_info_sac_logs.to_csv(os.path.join(args.runs_directory, run_name, "info_sac_logs.csv"), index=False)
 
