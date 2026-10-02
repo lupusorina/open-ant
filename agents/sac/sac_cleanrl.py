@@ -503,7 +503,7 @@ def parse_args():
                         help="origin of the back and forth task")
     parser.add_argument("--reward_scale", type=float, default=100.0,
                         help="reward scale factor")
-    parser.add_argument("--model_path", type=str, default="../../sim/assets/ant_with_camera_after_sys_id.xml",
+    parser.add_argument("--model_path", type=str, default="../../sim/assets/open-ant/ant_with_camera_after_sys_id_real_less_aggresive.xml",
                         help="XML file to use for the environment")
 
     parser.set_defaults(

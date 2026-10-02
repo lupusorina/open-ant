@@ -24,7 +24,7 @@ class AntEnv(gym.Env):
     }
     def __init__(
         self,
-        model_path: str = os.path.join(os.path.dirname(__file__), "assets/ant_with_camera_after_sys_id.xml"),
+        model_path: str = os.path.join(os.path.dirname(__file__), "assets/open-ant/ant_with_camera_after_sys_id_real_less_aggresive.xml"),
         render_mode: str | None = None,
         control_dt: float = 0.02,
         terminate_on_upside_down: bool = False,
@@ -257,7 +257,7 @@ class AntEnv(gym.Env):
 
 def main():
     current_path = os.path.dirname(os.path.abspath(__file__))
-    env = AntEnv(model_path=os.path.join(current_path, "assets/ant_with_camera_after_sys_id.xml"),
+    env = AntEnv(model_path=os.path.join(current_path, "assets/open-ant/ant_with_camera_after_sys_id_real_less_aggresive.xml"),
                  render_mode="human",
                  control_dt=0.05)
 
