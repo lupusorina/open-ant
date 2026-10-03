@@ -31,8 +31,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'hightorque_mini_pi')))
-import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0 / MiniPiBackAndForth-v0
+# sim/ is already on the path (ant_mujoco). This registers MiniPiWalk-v0.
+import mini_pi_walk_env  # noqa: F401
 
 class SoftQNetwork(nn.Module):
     def __init__(self, env, use_layer_norm=False):
