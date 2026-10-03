@@ -24,6 +24,13 @@ What differs from Humanoid-v5, and why:
   to drop it.
 * **Health also checks tilt**, not just base height: a 0.37 m robot that falls
   onto its knees can stay above a pure height threshold.
+* **Orientation and roll/pitch-rate costs**, taken from the Caltech biped
+  reward (``orientation``, ``ang_vel_xy``). The healthy check is only a hard
+  cutoff near 57°, so a leaned gait that still shifts the centre of mass
+  scores the same as an upright one. ``orientation`` is ``||g_xy||^2`` of
+  gravity in the base frame (0 when upright); ``ang_vel_xy`` damps rocking
+  into that lean. Both are heading-independent, so they apply to
+  ``back_and_forth`` as well.
 * **Reward weights are rescaled** for a robot ~1/4 the height of Humanoid; see
   the comment on ``forward_reward_weight``.
 
@@ -38,7 +45,8 @@ Tasks (``task=``):
   the direction in the robot's body frame is appended to the observation (as
   the Ant task does). The base also starts at a random yaw, so the direction is
   not always "straight ahead". Everything else -- healthy bonus, fall
-  termination, control/contact/action-rate costs -- is the same as "forward":
+  termination, control/contact/action-rate/orientation/ang-vel costs -- is the
+  same as "forward":
   a biped, unlike the Ant, can fall, so those terms stay.
 """
 
@@ -122,6 +130,14 @@ class MiniPiWalkEnv(MujocoEnv, utils.EzPickle):
         contact_cost_weight: float = 5e-7,
         contact_cost_range: tuple[float, float] = (-np.inf, 10.0),
         action_rate_cost_weight: float = 0.01,
+        # Caltech uses -1 * ||g_xy||^2 and -0.15 * ||w_xy||^2, then multiplies
+        # the whole reward by dt and sets it against a tracking term of order
+        # 2. This env does not scale by dt, and a walk is worth ~1 per step
+        # (forward_reward_weight 2.5 at 0.4 m/s). A 20° lean has ||g_xy||^2 ≈
+        # 0.12, so weight 4 costs ~0.5 -- about 0.2 m/s of forward reward --
+        # while a 10° walking pitch stays cheap (~0.12).
+        orientation_cost_weight: float = 4.0,
+        ang_vel_xy_cost_weight: float = 0.1,
         terminate_when_unhealthy: bool = True,
         # Humanoid-v5: (1.0, 2.0) around a 1.4 m start, i.e. down to ~0.7x.
         healthy_z_range: tuple[float, float] = (0.25, 0.6),
@@ -159,6 +175,8 @@ class MiniPiWalkEnv(MujocoEnv, utils.EzPickle):
             contact_cost_weight,
             contact_cost_range,
             action_rate_cost_weight,
+            orientation_cost_weight,
+            ang_vel_xy_cost_weight,
             terminate_when_unhealthy,
             healthy_z_range,
             healthy_max_tilt,
@@ -182,6 +200,8 @@ class MiniPiWalkEnv(MujocoEnv, utils.EzPickle):
         self._contact_cost_weight = contact_cost_weight
         self._contact_cost_range = contact_cost_range
         self._action_rate_cost_weight = action_rate_cost_weight
+        self._orientation_cost_weight = orientation_cost_weight
+        self._ang_vel_xy_cost_weight = ang_vel_xy_cost_weight
         self._terminate_when_unhealthy = terminate_when_unhealthy
         self._healthy_z_range = healthy_z_range
         self._healthy_min_up = np.cos(healthy_max_tilt)
@@ -302,20 +322,44 @@ class MiniPiWalkEnv(MujocoEnv, utils.EzPickle):
     def action_rate_cost(self, action):
         return self._action_rate_cost_weight * np.sum(np.square(action - self._prev_action))
 
+    def orientation_cost(self):
+        # Gravity in the base frame. xy is 0 upright, and ||g_xy||^2 = sin^2
+        # of the tilt angle. Same quantity as Caltech's `orientation` term.
+        grav_body = -self.data.xmat[1].reshape(3, 3)[2]
+        return self._orientation_cost_weight * float(np.sum(np.square(grav_body[:2])))
+
+    def ang_vel_xy_cost(self):
+        # Free-joint angular velocity is in the base frame; qvel[3:5] is the
+        # roll/pitch rate. Yaw (qvel[5]) is left alone so the robot can still
+        # turn toward the reward direction.
+        return self._ang_vel_xy_cost_weight * float(np.sum(np.square(self.data.qvel[3:5])))
+
     def _get_rew(self, progress_velocity, action):
         forward_reward = self._forward_reward_weight * progress_velocity
         healthy_reward = self.healthy_reward
         ctrl_cost = self.control_cost()
         contact_cost = self.contact_cost
         action_rate_cost = self.action_rate_cost(action)
+        orientation_cost = self.orientation_cost()
+        ang_vel_xy_cost = self.ang_vel_xy_cost()
 
-        reward = forward_reward + healthy_reward - ctrl_cost - contact_cost - action_rate_cost
+        reward = (
+            forward_reward
+            + healthy_reward
+            - ctrl_cost
+            - contact_cost
+            - action_rate_cost
+            - orientation_cost
+            - ang_vel_xy_cost
+        )
         reward_info = {
             "reward_survive": healthy_reward,
             "reward_forward": forward_reward,
             "reward_ctrl": -ctrl_cost,
             "reward_contact": -contact_cost,
             "reward_action_rate": -action_rate_cost,
+            "reward_orientation": -orientation_cost,
+            "reward_ang_vel_xy": -ang_vel_xy_cost,
         }
         return reward, reward_info
 
