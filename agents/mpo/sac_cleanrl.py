@@ -34,7 +34,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../'
 from reward import RewardTracker
 from early_stopping import StopTrainingOnNoImprovement, StopTrainingOnRewardThreshold
 from sb3_eval import Evaluator
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'hightorque_mini_pi')))
 import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0 / MiniPiBackAndForth-v0
 
 class SoftQNetwork(nn.Module):
