@@ -28,18 +28,18 @@ PY="${PY:-python3}"
 SCRIPT="mpo_acme.py"
 
 # ---- edit these ----
-GPU_LIST=(2)                     # physical GPU ids to use, e.g. (0 1 2 3)
-PER_GPU=1                       # concurrent runs per GPU
-SEEDS=(1)                      # one job per (variant, seed); spread over the GPU workers
+GPU_LIST=(2 3)                     # physical GPU ids to use, e.g. (0 1 2 3)
+PER_GPU=2                       # concurrent runs per GPU
+SEEDS=(3 4 5)                      # one job per (variant, seed); spread over the GPU workers
 VARIANTS=(dens2_foot0.5)                      # empty = all in manifest; or e.g. (dens2 foot0.2 all_hard)
 SIM1_RUN_DIR=""                  # empty = auto-detect latest sim1 run PER SEED; or pin one run dir (single seed only)
 # --------------------
 
 SIM1_EXP_NAME="mpo_walker"
-GLOBAL_TOTAL_TIMESTEPS="1_500_000"
-RUNS_DIR="/data2/serenaliu_data/1walker_moreaggressive/2dmpo_walker"
+GLOBAL_TOTAL_TIMESTEPS="2_500_000"
+RUNS_DIR="/data2/serenaliu_data/1walker_moreaggressive/2mpo_walker"
 
-CRITIC_TYPE="categorical"
+CRITIC_TYPE="scalar"
 ENSEMBLE=1
 
 GEN_SCRIPT="../sac/make_walker_variants.py"

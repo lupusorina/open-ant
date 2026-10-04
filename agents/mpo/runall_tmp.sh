@@ -8,14 +8,21 @@ set -euo pipefail
 #   bash run-dmpo-ant.sh hw
 
 # Seeds run in this exact order.
-SEEDS=(13 15 17 19)
+SEEDS=(1)
+# 3 5 6 7
+# 8 9 10 11 12 13 14 15
+
+# for qrdqn: 7 8 9 10 11 has been submitted. 
+# so has 12 13 14 15 16 17 18
+# submtited 27 28
+# then 29 30
 
 # The ensemble agent is now a configuration of the merged agent.
-SCRIPT="mpo_acme.py"
-ENSEMBLE=3
+SCRIPT="mpo_qrdqn.py"
+ENSEMBLE=1
 
 # Sim1 and Sim2 both save under this same parent directory.
-RUNS_DIR="runs/2empo"
+RUNS_DIR="/data2/serenaliu_data/rccar"
 
 # Sim1 output folders:
 #   runs-ant/dmpo_retrace_YYYYMMDD-HHMMSS_seed_3
@@ -59,6 +66,7 @@ run_sim () {
         --seed "${seed}" \
         --critic_type scalar \
         --cuda \
+        --num_quantiles 201 
         $(video_flag)
 
     local sim_run_dir
@@ -144,7 +152,7 @@ run_continual () {
     python3 "${SCRIPT}" \
         --ensemble "${ENSEMBLE}" \
         --render_mode rgb_array \
-        --total_timesteps 200000 \
+        --total_timesteps 150000 \
         --dt 0.12 \
         --env_id SimEmbodiedAnt \
         --runs_directory "${RUNS_DIR}" \
@@ -152,9 +160,9 @@ run_continual () {
         --exp_name "${CONT_EXP_NAME}" \
         --weights_path "${weights_path}" \
         --model_path ../../sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml \
-        --critic_type scalar \
+        --critic_type scala \
+        --num_quantiles 201 \
         --cuda 
-        $(video_flag)
 
     echo "Continual learning complete for seed ${seed}."
     # -gamma 0.955 \

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# SAC (sac_cleanrl.py) on the Mini Pi+ Pro walking task, Sim1 -> Sim2 sweep.
-#   Sim1: MiniPiWalk-v0 on hightorque_mini_pi/scene.xml, one run per seed, until the stop rule fires.
-#   Sim2: per (variant, seed), continue from Sim1's best eval on the XMLs MPO generated
-#         in hightorque_mini_pi/generated/ (not regenerated here).
+# MPO (mpo_acme_threshold.py, scalar critic) on the Mini Pi+ Pro walking task, Sim1 -> Sim2 sweep.
+#   Sim1: MiniPiWalk-v0 on hightorque_mini_pi/scene.xml, one run per seed, until the reward threshold or SIM1_TOTAL_TIMESTEPS.
+#   Sim2: per (variant, seed), continue from Sim1's best eval on a generated XML
+#         (hightorque_mini_pi/make_mini_pi_variants.py: mass x(1+s), friction x(1-s), s = 20..80%).
 #
 # Default: every launch starts NEW timestamped runs. --resume picks up existing runs instead:
 #   Sim1 finished -> Sim2 | Sim1 still running -> wait | Sim1 stopped part-way -> resume it
@@ -11,10 +11,10 @@
 # capped at PER_GPU runs per GPU.
 #
 # Usage:
-#   bash run_minipi_sac.sh                          # Sim1, then Sim2 (default)
-#   bash run_minipi_sac.sh sim                      # Sim1 only
-#   bash run_minipi_sac.sh sim_continual_learning   # Sim2 only, from the newest Sim1 checkpoint as-is
-#   bash run_minipi_sac.sh [mode] --resume          # resume existing runs instead of starting new ones
+#   bash run_minipiall_threshold.sh                          # Sim1, then Sim2 (default)
+#   bash run_minipiall_threshold.sh sim                      # Sim1 only
+#   bash run_minipiall_threshold.sh sim_continual_learning   # Sim2 only, from the newest Sim1 checkpoint as-is
+#   bash run_minipiall_threshold.sh [mode] --resume          # resume existing runs instead of starting new ones
 # Logs: ${RUNS_DIR}/logs/<exp_name>_seed<seed>.log
 
 set -euo pipefail
@@ -31,7 +31,7 @@ done
 case "${RUN_MODE}" in
     sim|sim_continual_learning|sim_then_continual) ;;
     *)
-        echo "Usage: bash run_minipi_sac.sh [sim|sim_continual_learning|sim_then_continual] [--resume]" >&2
+        echo "Usage: bash run_minipiall_threshold.sh [sim|sim_continual_learning|sim_then_continual] [--resume]" >&2
         exit 1
         ;;
 esac
@@ -40,42 +40,38 @@ esac
 export MUJOCO_GL=egl
 
 PY="${PY:-python3}"
-SCRIPT="sac_cleanrl.py"
+SCRIPT="mpo_acme_threshold.py"
 
 # ---- edit these ----
-GPU_LIST=(3)                 # physical GPU ids (nvidia-smi numbering)
-PER_GPU=4                   # max concurrent runs this script starts per GPU
+GPU_LIST=(2)                 # physical GPU ids (nvidia-smi numbering)
+PER_GPU=4                    # max concurrent runs this script starts per GPU
 SEEDS=(1)
 VARIANTS=()                  # empty = all in manifest; e.g. (mini_pi_mass_fric_20 mini_pi_mass_fric_80)
 # --------------------
 
-RUNS_DIR="/data2/serenaliu_data/sac_minipi"
+RUNS_DIR="/data2/serenaliu_data/mpo_minipi"
 
-SIM1_EXP_NAME="sac_minipi"
-SIM1_TOTAL_TIMESTEPS=500000
+SIM1_EXP_NAME="mpo_minipi"
+SIM1_TOTAL_TIMESTEPS="1_000_000"
 SIM1_MODEL_PATH="hightorque_mini_pi/scene.xml"
-# Sim1 stops on ONE --stop_rule, judged by the deterministic eval return (mean of
-# 5 fixed-seed episodes every save_every_n_steps; ../sb3_eval.py, ../early_stopping.py):
-#   reward_threshold: best eval return >= --stop_reward_threshold
-#   no_improvement:   no new best for more than es_patience evals (after es_min_evals)
-# Either writes <run_dir>/converged.json (= "Sim1 finished") and keeps the best eval as best_weights.pth.
+# Sim1 stops at SIM1_TOTAL_TIMESTEPS, or earlier once the best deterministic eval return (mean of
+# 5 fixed-seed episodes every save_every_n_steps; ../sb3_eval.py, ../early_stopping.py) reaches
+# --stop_reward_threshold. Reaching it writes <run_dir>/converged.json (= "Sim1 finished").
+# The best eval is kept as best_checkpoint.pth either way.
+SIM1_EARLY_STOP_ARGS=(--stop_reward_threshold 2000 --n_eval_episodes 5)
 
-SIM1_EARLY_STOP_ARGS=(--stop_rule reward_threshold --stop_reward_threshold 2700 --n_eval_episodes 5)
-# SIM1_EARLY_STOP_ARGS=(--stop_rule no_improvement --n_eval_episodes 5 --es_patience 3 --es_min_evals 4 --es_min_delta_pct 0)
-
-# 1 = no step cap: Sim1 runs until the rule fires (with reward_threshold, forever if never reached).
-# 0 = Sim1 also stops at SIM1_TOTAL_TIMESTEPS.
-SIM1_UNTIL_CONVERGED=1
-(( SIM1_UNTIL_CONVERGED )) && SIM1_EARLY_STOP_ARGS+=(--until_converged)
-
-SIM2_PREFIX="continual_sac_minipi"   # Sim2 exp_name = ${SIM2_PREFIX}_<variant>
-# 1 = Sim2 starts from Sim1's best eval: best_weights.pth, best_replay_buffer/ and the step
+SIM2_PREFIX="continual_minipi"   # Sim2 exp_name = ${SIM2_PREFIX}_<variant>
+# 1 = Sim2 starts from Sim1's best eval: best_checkpoint.pth, best_replay_buffer.npz and the step
 # counter as they were then; Sim2 runs best step -> best step + SIM2_STEPS. Older runs without
-# best_replay_buffer/: last buffer and step. No best_weights.pth: last checkpoint (with a warning).
+# best_replay_buffer.npz: last buffer and step. No best_checkpoint.pth: last checkpoint (with a warning).
 SIM2_LOAD_BEST=1
-SIM2_STEPS=1500000
+SIM2_STEPS="1_500_000"
 
-GEN_DIR="hightorque_mini_pi/generated"   # variants already generated by the MPO run
+CRITIC_TYPE="scalar"
+ENSEMBLE=1
+
+GEN_SCRIPT="hightorque_mini_pi/make_mini_pi_variants.py"
+GEN_DIR="hightorque_mini_pi/generated"
 
 POLL_SECONDS=600             # how often to re-check a Sim1 that is still training
 
@@ -83,13 +79,26 @@ COMMON_ARGS=(
     --env_id MiniPiWalk-v0
     --render_mode rgb_array
     --cuda
-    --gamma 0.99                 # per step, same as MPO
-    --num_envs 1
+    --critic_type "${CRITIC_TYPE}"
+    --ensemble "${ENSEMBLE}"
+    --gamma 0.99
+    --dual_lr 1e-2
+    --policy_lr 3e-4
+    --q_lr 3e-4
+    --batch_size 256
+    --td_horizon 4
+    --critic_layer_sizes 256 256 256
+    --policy_init_scale 0.5
+    --learning_starts 1000
+    --epsilon_mu_kl 0.01
+    --samples_per_insert 64 # 256
+    --sample_action_num 20
+    --policy_min_scale 1e-6
     --save_every_n_steps 25000
+    --log_every_n_steps 10000
     --capture_video
     --capture_video_steps 1000
     --capture_video_every 50000
-    --learning_starts 5000
 )
 
 
@@ -125,11 +134,12 @@ latest_run_dir() {
         -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-
 }
 
-# global_step stored in <run_dir>/weights.pth, or empty.
-weights_step() {
+# Highest checkpoint step in <run_dir>/weights_and_args, or empty.
+latest_ckpt_step() {
     local run_dir="$1"
-    [[ -n "${run_dir}" && -f "${run_dir}/weights.pth" ]] || return 0
-    pth_step "${run_dir}/weights.pth"
+    [[ -n "${run_dir}" && -d "${run_dir}/weights_and_args" ]] || return 0
+    find "${run_dir}/weights_and_args" -maxdepth 1 -name 'checkpoint_*.pth' \
+        | sed -E 's/.*checkpoint_([0-9]+)\.pth/\1/' | sort -n | tail -n 1
 }
 
 # global_step stored in a .pth checkpoint.
@@ -140,7 +150,7 @@ pth_step() {
 # --total_timesteps the run was started with (from its args.json).
 run_total_timesteps() {
     "${PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["total_timesteps"])' \
-        "$1/args.json"
+        "$1/weights_and_args/args.json"
 }
 
 # True if a run with this exp_name and seed is alive (from any launch).
@@ -180,33 +190,35 @@ run_on_gpu() {
 
 ensure_sim1() {
     local seed="$1"
-    local target="${SIM1_TOTAL_TIMESTEPS}"
-    # No step limit: only converged.json means Sim1 is done.
-    (( SIM1_UNTIL_CONVERGED )) && target=999999999999
+    local target="${SIM1_TOTAL_TIMESTEPS//_/}"
     local log_file="${RUNS_DIR}/logs/${SIM1_EXP_NAME}_seed${seed}.log"
-    local sim1_args=(
-        --exp_name "${SIM1_EXP_NAME}" --seed "${seed}"
-        --total_timesteps "${SIM1_TOTAL_TIMESTEPS}"
-        --runs_directory "${RUNS_DIR}"
-        --model_path "${SIM1_MODEL_PATH}"
-        "${SIM1_EARLY_STOP_ARGS[@]}"
-        "${COMMON_ARGS[@]}"
-    )
-    local attempts=0 dir step
+    local attempts=0
 
     if (( ! RESUME )); then
         echo "[seed ${seed}] Sim1: starting new run"
-        if ! run_on_gpu "${log_file}" "${sim1_args[@]}"; then
-            echo "[seed ${seed}] ERROR: Sim1 failed; see ${log_file} (re-launch with --resume to continue it)" >&2
+        run_on_gpu "${log_file}" \
+            --exp_name "${SIM1_EXP_NAME}" --seed "${seed}" \
+            --total_timesteps "${SIM1_TOTAL_TIMESTEPS}" \
+            --runs_directory "${RUNS_DIR}" \
+            --model_path "${SIM1_MODEL_PATH}" \
+            "${SIM1_EARLY_STOP_ARGS[@]}" \
+            "${COMMON_ARGS[@]}" || true
+        local dir step
+        dir="$(latest_run_dir "${SIM1_EXP_NAME}" "${seed}")"
+        step="$(latest_ckpt_step "${dir}")"
+        if [[ -z "${step}" ]] || { (( step < target )) && [[ ! -f "${dir}/converged.json" ]]; }; then
+            echo "[seed ${seed}] ERROR: Sim1 stopped at step ${step:-0}/${target}; see ${log_file} (re-launch with --resume to continue it)" >&2
             return 1
         fi
-        use_latest_sim1 "${seed}"
-        return
+        SIM1_DIR="${dir}"; SIM1_STEP="${step}"
+        echo "[seed ${seed}] Sim1 done: ${dir} (step ${step})"
+        return 0
     fi
 
     while true; do
+        local dir step
         dir="$(latest_run_dir "${SIM1_EXP_NAME}" "${seed}")"
-        step="$(weights_step "${dir}")"
+        step="$(latest_ckpt_step "${dir}")"
 
         if [[ -n "${step}" ]] && { (( step >= target )) || [[ -f "${dir}/converged.json" ]]; }; then
             SIM1_DIR="${dir}"; SIM1_STEP="${step}"
@@ -229,27 +241,25 @@ ensure_sim1() {
 
         if [[ -n "${step}" ]]; then
             echo "[seed ${seed}] Sim1 stopped at step ${step}; resuming ${dir}"
-            run_on_gpu "${log_file}" "${sim1_args[@]}" \
-                --resume_in_place --weights_path "${dir}" || true
+            run_on_gpu "${log_file}" \
+                --exp_name "${SIM1_EXP_NAME}" --seed "${seed}" \
+                --total_timesteps "${SIM1_TOTAL_TIMESTEPS}" \
+                --runs_directory "${RUNS_DIR}" \
+                --model_path "${SIM1_MODEL_PATH}" \
+                --resume_in_place --weights_path "${dir}/weights_and_args" \
+                "${SIM1_EARLY_STOP_ARGS[@]}" \
+                "${COMMON_ARGS[@]}" || true
         else
             echo "[seed ${seed}] Sim1: starting from scratch"
-            run_on_gpu "${log_file}" "${sim1_args[@]}" || true
+            run_on_gpu "${log_file}" \
+                --exp_name "${SIM1_EXP_NAME}" --seed "${seed}" \
+                --total_timesteps "${SIM1_TOTAL_TIMESTEPS}" \
+                --runs_directory "${RUNS_DIR}" \
+                --model_path "${SIM1_MODEL_PATH}" \
+                "${SIM1_EARLY_STOP_ARGS[@]}" \
+                "${COMMON_ARGS[@]}" || true
         fi
     done
-}
-
-# Newest Sim1 run's weights.pth as it is now (finished or not).
-# Sets SIM1_DIR and SIM1_STEP on success.
-use_latest_sim1() {
-    local seed="$1" dir step
-    dir="$(latest_run_dir "${SIM1_EXP_NAME}" "${seed}")"
-    step="$(weights_step "${dir}")"
-    if [[ -z "${step}" ]]; then
-        echo "[seed ${seed}] ERROR: no Sim1 weights.pth found for ${SIM1_EXP_NAME} seed ${seed} in ${RUNS_DIR}" >&2
-        return 1
-    fi
-    SIM1_DIR="${dir}"; SIM1_STEP="${step}"
-    echo "[seed ${seed}] Sim1: using ${dir} (step ${step})"
 }
 
 
@@ -270,7 +280,7 @@ run_sim2() {
             return 0
         fi
         dir="$(latest_run_dir "${name}" "${seed}")"
-        step="$(weights_step "${dir}")"
+        step="$(latest_ckpt_step "${dir}")"
     fi
 
     if [[ -n "${step}" ]]; then
@@ -287,36 +297,53 @@ run_sim2() {
             --total_timesteps "${total}" \
             --runs_directory "${RUNS_DIR}" \
             --model_path "${xml}" \
-            --resume_in_place --weights_path "${dir}" \
+            --resume_in_place --weights_path "${dir}/weights_and_args" \
             "${COMMON_ARGS[@]}"
-        echo "[seed ${seed}] ${variant}: done"
-        return
-    fi
-
-    # Fresh Sim2: Sim1's best-eval weights + buffer + step (or the last ones).
-    local start="${SIM1_STEP}"
-    local load_args=() source="weights.pth + replay_buffer"
-    if (( SIM2_LOAD_BEST )); then
-        if [[ -f "${SIM1_DIR}/best_weights.pth" ]]; then
-            load_args=(--load_best) source="best_weights.pth + replay_buffer"
-            if [[ -d "${SIM1_DIR}/best_replay_buffer" ]]; then
-                start="$(pth_step "${SIM1_DIR}/best_weights.pth")" source="best_weights.pth + best_replay_buffer"
+    else
+        # Fresh Sim2: Sim1's best-eval checkpoint + buffer + step (or the last ones).
+        local start="${SIM1_STEP}"
+        local load_args=(--checkpoint_step "${SIM1_STEP}") source="last checkpoint + last buffer"
+        if (( SIM2_LOAD_BEST )); then
+            if [[ -f "${SIM1_DIR}/best_checkpoint.pth" ]]; then
+                load_args=(--load_best) source="best checkpoint + last buffer"
+                if [[ -f "${SIM1_DIR}/best_replay_buffer.npz" ]]; then
+                    start="$(pth_step "${SIM1_DIR}/best_checkpoint.pth")" source="best checkpoint + best buffer"
+                fi
+            else
+                echo "[seed ${seed}] WARNING: ${SIM1_DIR}/best_checkpoint.pth not found; ${variant} starts from the last checkpoint" >&2
             fi
-        else
-            echo "[seed ${seed}] WARNING: ${SIM1_DIR}/best_weights.pth not found; ${variant} starts from weights.pth" >&2
         fi
+        local total=$(( start + ${SIM2_STEPS//_/} ))
+        echo "[seed ${seed}] ${variant}: warm start from ${SIM1_DIR} ${source}, steps ${start} -> ${total}"
+        run_on_gpu "${log_file}" \
+            --exp_name "${name}" --seed "${seed}" \
+            --total_timesteps "${total}" \
+            --runs_directory "${RUNS_DIR}" \
+            --model_path "${xml}" \
+            --weights_path "${SIM1_DIR}/weights_and_args" \
+            "${load_args[@]}" \
+            "${COMMON_ARGS[@]}"
     fi
-    local total=$(( start + SIM2_STEPS ))
-    echo "[seed ${seed}] ${variant}: warm start from ${SIM1_DIR} ${source}, steps ${start} -> ${total}"
-    run_on_gpu "${log_file}" \
-        --exp_name "${name}" --seed "${seed}" \
-        --total_timesteps "${total}" \
-        --runs_directory "${RUNS_DIR}" \
-        --model_path "${xml}" \
-        --weights_path "${SIM1_DIR}" \
-        "${load_args[@]}" \
-        "${COMMON_ARGS[@]}"
     echo "[seed ${seed}] ${variant}: done"
+}
+
+
+# Sim2-only mode: newest Sim1 checkpoint as it is now (skips ones <1 min old). Sets SIM1_DIR/SIM1_STEP.
+use_latest_sim1() {
+    local seed="$1" dir step
+    dir="$(latest_run_dir "${SIM1_EXP_NAME}" "${seed}")"
+    if [[ -n "${dir}" && -d "${dir}/weights_and_args" ]]; then
+        step="$(find "${dir}/weights_and_args" -maxdepth 1 -name 'checkpoint_*.pth' -mmin +1 \
+            | sed -E 's/.*checkpoint_([0-9]+)\.pth/\1/' | sort -n | tail -n 1)"
+    fi
+    if [[ -z "${step:-}" ]]; then
+        echo "[seed ${seed}] ERROR: no Sim1 checkpoint found for ${SIM1_EXP_NAME} seed ${seed} in ${RUNS_DIR}" >&2
+        return 1
+    fi
+    SIM1_DIR="${dir}"; SIM1_STEP="${step}"
+    local note=""
+    is_running "${SIM1_EXP_NAME}" "${seed}" && note=" (Sim1 still training; using its current checkpoint)"
+    echo "[seed ${seed}] Sim1: using ${dir} checkpoint ${step}${note}"
 }
 
 
@@ -343,11 +370,8 @@ seed_pipeline() {
 
 mkdir -p "${RUNS_DIR}/logs"
 
+"${PY}" "${GEN_SCRIPT}" > /dev/null
 if [[ ${#VARIANTS[@]} -eq 0 ]]; then
-    [[ -f "${GEN_DIR}/manifest.txt" ]] || {
-        echo "ERROR: ${GEN_DIR}/manifest.txt not found (run hightorque_mini_pi/make_mini_pi_variants.py once)" >&2
-        exit 1
-    }
     mapfile -t VARIANTS < "${GEN_DIR}/manifest.txt"
 fi
 
@@ -372,6 +396,6 @@ fi
 
 echo
 echo "============================================================"
-echo "All SAC Mini Pi runs finished (mode: ${RUN_MODE})."
+echo "All Mini Pi runs finished (mode: ${RUN_MODE})."
 echo "Logs: ${RUNS_DIR}/logs/"
 echo "============================================================"

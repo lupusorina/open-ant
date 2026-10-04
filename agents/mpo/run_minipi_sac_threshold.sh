@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# SAC (sac_cleanrl.py) on the Mini Pi+ Pro walking task, Sim1 -> Sim2 sweep.
-#   Sim1: MiniPiWalk-v0 on hightorque_mini_pi/scene.xml, one run per seed, until the stop rule fires.
+# SAC (sac_cleanrl_threshold.py) on the Mini Pi+ Pro walking task, Sim1 -> Sim2 sweep.
+#   Sim1: MiniPiWalk-v0 on hightorque_mini_pi/scene.xml, one run per seed, until the reward threshold or SIM1_TOTAL_TIMESTEPS.
 #   Sim2: per (variant, seed), continue from Sim1's best eval on the XMLs MPO generated
 #         in hightorque_mini_pi/generated/ (not regenerated here).
 #
@@ -11,10 +11,10 @@
 # capped at PER_GPU runs per GPU.
 #
 # Usage:
-#   bash run_minipi_sac.sh                          # Sim1, then Sim2 (default)
-#   bash run_minipi_sac.sh sim                      # Sim1 only
-#   bash run_minipi_sac.sh sim_continual_learning   # Sim2 only, from the newest Sim1 checkpoint as-is
-#   bash run_minipi_sac.sh [mode] --resume          # resume existing runs instead of starting new ones
+#   bash run_minipi_sac_threshold.sh                          # Sim1, then Sim2 (default)
+#   bash run_minipi_sac_threshold.sh sim                      # Sim1 only
+#   bash run_minipi_sac_threshold.sh sim_continual_learning   # Sim2 only, from the newest Sim1 checkpoint as-is
+#   bash run_minipi_sac_threshold.sh [mode] --resume          # resume existing runs instead of starting new ones
 # Logs: ${RUNS_DIR}/logs/<exp_name>_seed<seed>.log
 
 set -euo pipefail
@@ -31,7 +31,7 @@ done
 case "${RUN_MODE}" in
     sim|sim_continual_learning|sim_then_continual) ;;
     *)
-        echo "Usage: bash run_minipi_sac.sh [sim|sim_continual_learning|sim_then_continual] [--resume]" >&2
+        echo "Usage: bash run_minipi_sac_threshold.sh [sim|sim_continual_learning|sim_then_continual] [--resume]" >&2
         exit 1
         ;;
 esac
@@ -40,7 +40,7 @@ esac
 export MUJOCO_GL=egl
 
 PY="${PY:-python3}"
-SCRIPT="sac_cleanrl.py"
+SCRIPT="sac_cleanrl_threshold.py"
 
 # ---- edit these ----
 GPU_LIST=(3)                 # physical GPU ids (nvidia-smi numbering)
@@ -52,21 +52,13 @@ VARIANTS=()                  # empty = all in manifest; e.g. (mini_pi_mass_fric_
 RUNS_DIR="/data2/serenaliu_data/sac_minipi"
 
 SIM1_EXP_NAME="sac_minipi"
-SIM1_TOTAL_TIMESTEPS=500000
+SIM1_TOTAL_TIMESTEPS=1000000
 SIM1_MODEL_PATH="hightorque_mini_pi/scene.xml"
-# Sim1 stops on ONE --stop_rule, judged by the deterministic eval return (mean of
-# 5 fixed-seed episodes every save_every_n_steps; ../sb3_eval.py, ../early_stopping.py):
-#   reward_threshold: best eval return >= --stop_reward_threshold
-#   no_improvement:   no new best for more than es_patience evals (after es_min_evals)
-# Either writes <run_dir>/converged.json (= "Sim1 finished") and keeps the best eval as best_weights.pth.
-
-SIM1_EARLY_STOP_ARGS=(--stop_rule reward_threshold --stop_reward_threshold 2700 --n_eval_episodes 5)
-# SIM1_EARLY_STOP_ARGS=(--stop_rule no_improvement --n_eval_episodes 5 --es_patience 3 --es_min_evals 4 --es_min_delta_pct 0)
-
-# 1 = no step cap: Sim1 runs until the rule fires (with reward_threshold, forever if never reached).
-# 0 = Sim1 also stops at SIM1_TOTAL_TIMESTEPS.
-SIM1_UNTIL_CONVERGED=1
-(( SIM1_UNTIL_CONVERGED )) && SIM1_EARLY_STOP_ARGS+=(--until_converged)
+# Sim1 stops at SIM1_TOTAL_TIMESTEPS, or earlier once the best deterministic eval return (mean of
+# 5 fixed-seed episodes every save_every_n_steps; ../sb3_eval.py, ../early_stopping.py) reaches
+# --stop_reward_threshold. Reaching it writes <run_dir>/converged.json (= "Sim1 finished").
+# The best eval is kept as best_weights.pth either way.
+SIM1_EARLY_STOP_ARGS=(--stop_reward_threshold 4000 --n_eval_episodes 5)
 
 SIM2_PREFIX="continual_sac_minipi"   # Sim2 exp_name = ${SIM2_PREFIX}_<variant>
 # 1 = Sim2 starts from Sim1's best eval: best_weights.pth, best_replay_buffer/ and the step
@@ -181,8 +173,6 @@ run_on_gpu() {
 ensure_sim1() {
     local seed="$1"
     local target="${SIM1_TOTAL_TIMESTEPS}"
-    # No step limit: only converged.json means Sim1 is done.
-    (( SIM1_UNTIL_CONVERGED )) && target=999999999999
     local log_file="${RUNS_DIR}/logs/${SIM1_EXP_NAME}_seed${seed}.log"
     local sim1_args=(
         --exp_name "${SIM1_EXP_NAME}" --seed "${seed}"

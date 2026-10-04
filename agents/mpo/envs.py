@@ -22,6 +22,10 @@ from ant_mujoco import AntEnv
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../embodied_ant_env")))
 from embodied_ant_env import make_ant_env
+from rccar_env import RCCarEnv
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "hightorque_mini_pi")))
+import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0
 
 # Embodied / custom Ant IDs used by this repo (not Gymnasium registry entries).
 EMBODIED_ANT_ENV_IDS = {
@@ -29,6 +33,13 @@ EMBODIED_ANT_ENV_IDS = {
     "SimEmbodiedAnt",
     "HwEmbodiedAnt",
     "CustomAnt-v0",
+}
+
+# RC car (numpy port of safe-learning's rccar). Sim1 = semi-kinematic bicycle model,
+# Sim2 = kinematic/tire-force blend.
+RCCAR_ENV_IDS = {
+    "RCCarSim1-v0": "sim1",
+    "RCCarSim2-v0": "sim2",
 }
 
 
@@ -52,7 +63,7 @@ def is_gymnasium_env(env_id: str) -> bool:
 def effective_reward_scale(args) -> float:
     if args.reward_scale is not None:
         return float(args.reward_scale)
-    return 1.0 if is_gymnasium_env(args.env_id) else 100.0
+    return 1.0 if (is_gymnasium_env(args.env_id) or args.env_id in RCCAR_ENV_IDS) else 100.0
 
 
 def _unwrap_base_env(env):
@@ -64,9 +75,10 @@ def _unwrap_base_env(env):
 def _maybe_record_video(env, args, idx, disk_folder, run_name, runs_directory):
     if args.capture_video and idx == 0:
         if args.capture_video_steps is not None:
-            # One continuous clip covering step 0 through capture_video_steps,
-            # independent of save_every_n_steps (which also drives checkpointing).
-            step_trigger = lambda x: x == 0
+            # Clips of capture_video_steps each, starting every capture_video_every
+            # steps (default: one clip at step 0 only, as before).
+            every = getattr(args, "capture_video_every", None)
+            step_trigger = (lambda x: x == 0) if every is None else (lambda x: x % every == 0)
             video_length = args.capture_video_steps
         else:
             step_trigger = lambda x: x % args.save_every_n_steps == 0
@@ -157,6 +169,19 @@ def _make_embodied_ant_env(args, task, seed, idx, disk_folder, run_name, runs_di
     return env
 
 
+def _make_rccar_env(args, seed, reward_scale):
+    env = RCCarEnv(
+        dynamics=RCCAR_ENV_IDS[args.env_id],
+        domain_randomization=getattr(args, "rccar_domain_randomization", "per_env"),
+        max_episode_steps=getattr(args, "rccar_episode_length", 250),
+    )
+    env.action_space.seed(seed)
+    env.reset(seed=seed)  # seeds this env's per-env parameter draw and init states
+    env = OriginalRewardWrapper(env)
+    env = gym.wrappers.TransformReward(env, lambda r, scale=reward_scale: r * scale)
+    return env
+
+
 def make_envs(
     args,
     task,
@@ -175,8 +200,15 @@ def make_envs(
     reward_scale = effective_reward_scale(args)
     args.reward_scale = reward_scale
     use_gym = is_gymnasium_env(args.env_id)
+    use_rccar = args.env_id in RCCAR_ENV_IDS
 
-    if use_gym:
+    if use_rccar:
+        print(f"[√] Using RC car env_id={args.env_id} (reward_scale={reward_scale})")
+        if task is not None:
+            print("[!] Ignoring --task_type for RC car environments")
+        if args.capture_video:
+            print("[!] --capture_video is not supported for RC car environments; ignoring")
+    elif use_gym:
         print(f"[√] Using Gymnasium env_id={args.env_id} (reward_scale={reward_scale})")
         if task is not None:
             print("[!] Ignoring --task_type for Gymnasium environments")
@@ -187,6 +219,8 @@ def make_envs(
 
     def make_env(seed, idx):
         def _init():
+            if use_rccar:
+                return _make_rccar_env(args, seed, reward_scale)
             if use_gym:
                 return _make_gymnasium_env(
                     args, seed, idx, disk_folder, run_name, runs_directory, reward_scale
@@ -209,7 +243,10 @@ def make_envs(
         "[!] Only continuous action space is supported."
     )
 
-    if use_gym:
+    if use_rccar:
+        args.dt = float(_unwrap_base_env(env_raw.envs[0]).dt)
+        print(f"[√] Synced args.dt to RC car env dt={args.dt}")
+    elif use_gym:
         base = _unwrap_base_env(env_raw.envs[0])
         if hasattr(base, "dt"):
             args.dt = float(base.dt)

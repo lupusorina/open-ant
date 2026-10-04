@@ -2,7 +2,8 @@
 
     ant_env/bin/python sim/view.py                   # ant
     ant_env/bin/python sim/view.py --scene crane     # electric crane
-    (also accepts snapshot.py's options, e.g. --light_floor, --fovy, --port 8001)
+    ant_env/bin/python sim/view.py --scene crane --traj figure8   # + payload reference path
+    (also accepts snapshot.py's options, e.g. --style technical, --light_floor, --fovy, --port 8001)
 
 Then open http://localhost:8000 in your browser. Over SSH, forward the port first:
     ssh -L 8000:localhost:8000 <this machine>
@@ -32,8 +33,8 @@ os.environ["MUJOCO_GL"] = "egl"
 import mujoco
 from PIL import Image
 
-from scenes import HERE, apply_quality
-from snapshot import default_camera, make_parser, make_renderer, scene_option
+from scenes import HERE
+from snapshot import build_model, default_camera, make_parser, make_renderer, render_frame, scene_option
 
 PREVIEW_W, PREVIEW_H = 1280, 720
 
@@ -153,8 +154,7 @@ def main():
         i = passthrough.index("--port")
         del passthrough[i:i + 2]
 
-    model = scene.build(args)
-    apply_quality(model, scene, args, offscreen_size=(PREVIEW_W, PREVIEW_H))
+    model = build_model(scene, args, offscreen_size=(PREVIEW_W, PREVIEW_H))
     data = mujoco.MjData(model)
     scene.reset(model, data, args)
     cam = default_camera(scene, model, data, args)
@@ -199,9 +199,10 @@ def main():
             cam.lookat[:] = [float(v) for v in q["lookat"].split(",")]
             model.vis.global_.fovy = float(q["fovy"])
 
-            renderer.update_scene(data, camera=cam, scene_option=opt)
+            # line_px is relative to a 3840-wide image, so the preview matches the saved figure
+            frame = render_frame(renderer, model, data, cam, opt, args, PREVIEW_W / 3840)
             buf = io.BytesIO()
-            Image.fromarray(renderer.render()).save(buf, "JPEG", quality=90)
+            Image.fromarray(frame).save(buf, "JPEG", quality=90)
             self._send(buf.getvalue(), "image/jpeg")
 
         def do_POST(self):

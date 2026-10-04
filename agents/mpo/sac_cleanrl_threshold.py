@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from embodied_ant_env import make_ant_env, ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
-from early_stopping import StopTrainingOnNoImprovement, StopTrainingOnRewardThreshold
+from early_stopping import StopTrainingOnRewardThreshold
 from sb3_eval import Evaluator
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'hightorque_mini_pi')))
 import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0 / MiniPiBackAndForth-v0
@@ -614,29 +614,16 @@ def parse_args():
                              "best_replay_buffer, continuing from the best eval's step")
     parser.add_argument("--save_every_n_steps", type=int, default=4000,
                         help="save every n steps")
-    parser.add_argument("--stop_rule", type=str, default=None, choices=["no_improvement", "reward_threshold"],
-                        help="Sim1 early stopping, decided by the deterministic eval return (every --eval_freq): "
-                             "no_improvement = SB3 StopTrainingOnNoModelImprovement (--es_* args), "
-                             "reward_threshold = SB3 StopTrainingOnRewardThreshold (--stop_reward_threshold)")
-    parser.add_argument("--stop_on_no_improvement", "--early_stop", dest="stop_rule",
-                        action="store_const", const="no_improvement",
-                        help="same as --stop_rule no_improvement")
     parser.add_argument("--stop_reward_threshold", type=float, default=None,
-                        help="--stop_rule reward_threshold: stop once the best eval return reaches this")
+                        help="Sim1 early stopping (SB3 StopTrainingOnRewardThreshold): stop once the best "
+                             "deterministic eval return (every --eval_freq) reaches this; --total_timesteps "
+                             "is still the step cap. None = no eval, train for --total_timesteps")
     parser.add_argument("--eval_freq", type=int, default=None,
                         help="run a deterministic evaluation every N steps (default: save_every_n_steps)")
     parser.add_argument("--n_eval_episodes", type=int, default=5,
                         help="episodes per evaluation, one per parallel eval env (SB3 EvalCallback default: 5)")
     parser.add_argument("--eval_max_episode_steps", type=int, default=None,
                         help="cap eval episode length (needed if the env never truncates on its own)")
-    parser.add_argument("--es_patience", type=int, default=3,
-                        help="stop on no improvement: max consecutive checks without a new best")
-    parser.add_argument("--es_min_evals", type=int, default=4,
-                        help="stop on no improvement: checks before patience starts counting")
-    parser.add_argument("--es_min_delta_pct", type=float, default=0.0,
-                        help="stop on no improvement: relative improvement needed to count as a new best")
-    parser.add_argument("--until_converged", action="store_true", default=False,
-                        help="ignore --total_timesteps; train until the --stop_rule rule fires")
 
     # Algorithm.
     parser.add_argument("--env_id", type=str, default="EAnt",
@@ -727,12 +714,6 @@ def parse_args():
             parser.error("--load_best requires --weights_path")
         if args.resume_in_place:
             parser.error("--load_best can't be used with --resume_in_place (resume needs the latest weights.pth)")
-    if (args.stop_rule == "reward_threshold") != (args.stop_reward_threshold is not None):
-        parser.error("--stop_rule reward_threshold and --stop_reward_threshold go together")
-    if args.until_converged:
-        if args.stop_rule is None:
-            parser.error("--until_converged requires --stop_rule")
-        args.total_timesteps = sys.maxsize  # no step limit; only the --stop_rule rule ends the run
     return args
 
 if __name__ == "__main__":
@@ -856,14 +837,11 @@ if __name__ == "__main__":
                                    )
     stopper = None
     evaluator = None
-    if args.stop_rule is not None and not args.eval:
+    if args.stop_reward_threshold is not None and not args.eval:
         if args.hw_config is not None:
-            raise ValueError("--stop_rule needs a separate sim eval env; not supported with --hw_config")
+            raise ValueError("--stop_reward_threshold needs a separate sim eval env; not supported with --hw_config")
         run_dir = os.path.join(args.runs_directory, run_name)
-        if args.stop_rule == "no_improvement":
-            stopper = StopTrainingOnNoImprovement(run_dir, args.es_patience, args.es_min_evals, args.es_min_delta_pct)
-        else:
-            stopper = StopTrainingOnRewardThreshold(run_dir, args.stop_reward_threshold)
+        stopper = StopTrainingOnRewardThreshold(run_dir, args.stop_reward_threshold)
 
         # Separate eval envs (as in SB3's EvalCallback): n_eval_episodes envs, each
         # with its own task instance, run in parallel for one episode each, no video.
@@ -940,7 +918,7 @@ if __name__ == "__main__":
     obs, info = envs.reset(seed=args.seed)
 
     for step in tqdm(range(step, args.total_timesteps), initial=step,
-                     total=float("inf") if args.until_converged else args.total_timesteps):
+                     total=args.total_timesteps):
 
         # Get action.
         selected_actions = agent.get_action(obs, args.eval)
@@ -996,8 +974,7 @@ if __name__ == "__main__":
             if is_new_best:
                 torch.save(agent.get_state(), os.path.join(args.runs_directory, run_name, "best_weights.pth"))
                 agent.get_replay_buffer().dumps(os.path.join(args.runs_directory, run_name, "best_replay_buffer"))
-            score = mean_reward if args.stop_rule == "no_improvement" else evaluator.best_mean_reward
-            if not stopper.check(step, score):
+            if not stopper.check(step, evaluator.best_mean_reward):
                 stopped_early = True
                 break
 

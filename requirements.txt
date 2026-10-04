@@ -17,6 +17,7 @@ torch
 torchrl
 matplotlib
 skrl
+stable-baselines3  # evaluate_policy for eval-based early stopping (agents/sb3_eval.py)
 
 # others
 tyro

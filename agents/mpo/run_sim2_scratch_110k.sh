@@ -11,15 +11,15 @@ set -euo pipefail
 
 ENV_NAME="${1:-ant}"
 SCRIPT="mpo_acme.py"
-ENSEMBLE=3
-CRITIC_TYPE="scalar"
+ENSEMBLE=1
+CRITIC_TYPE="categorical"
 
 # GPU to use for each seed, in order. Edit this list directly, e.g.
 # GPUS=(0 2) to alternate GPU 0 and 2 across seeds.
-GPUS=(1)
+GPUS=(0)
 
-# Which seeds to run. Edit directly, e.g. SEEDS=(1 2 3).
-SEEDS=(1)
+# Which seedqs to run. Edit directly, e.g. SEEDS=(1 2 3).
+SEEDS=(10)
 #for empo
 # 10 11 12 15
 # 23 24 25 26 27 28 29 30
@@ -41,9 +41,9 @@ case "${ENV_NAME}" in
     ant)
         ENV_ID="SimEmbodiedAnt"
         MODEL_PATH="../../sim/assets/ant_with_camera_after_sys_id_real_less_aggresive.xml"
-        RUNS_DIR="/data2/serenaliu_data/2empo"
+        RUNS_DIR="/data2/serenaliu_data/1ant_sim_all/2qrdqn_avg4actions"
         EXP_NAME="scratch_sim2"
-        DEFAULT_TOTAL_TIMESTEPS=190000
+        DEFAULT_TOTAL_TIMESTEPS=110000
         EXTRA_ARGS=(--dt 0.12)
         ;;
     humanoid)
@@ -57,10 +57,10 @@ case "${ENV_NAME}" in
     walker)
         ENV_ID="Walker2d-v5"
         MODEL_PATH="../../sim/assets/walker2d_sim2_massfric.xml"
-        RUNS_DIR="/data2/serenaliu_data/2empo_walker_impfast_spi192"
+        RUNS_DIR="/data2/serenaliu_data/1walker_sim_all/2dmpo_walker_650"
         EXP_NAME="scratch_sim2_walker"
-        DEFAULT_TOTAL_TIMESTEPS=2_500_000
-        EXTRA_ARGS=(--gamma 0.99 --dual_lr 0.005 --policy_init_scale 0.5 --samples_per_insert 192)
+        DEFAULT_TOTAL_TIMESTEPS=1_500_000
+        EXTRA_ARGS=(--gamma 0.99 --dual_lr 0.005 --policy_init_scale 0.5 --samples_per_insert 192 --vmin -650 --vmax 650) #--num_quantiles 201)
         ;;
     *)
         echo "Usage: bash run_sim2_scratch_110k.sh {ant|humanoid|walker} [total_timesteps]" >&2

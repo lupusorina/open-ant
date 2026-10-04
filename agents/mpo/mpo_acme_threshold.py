@@ -32,13 +32,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from embodied_ant_env import ForwardTask, BackAndForthTask
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from reward import RewardTracker
+from early_stopping import StopTrainingOnRewardThreshold
+from sb3_eval import Evaluator
 
 try:
     from .nn import (AcmeActor, AcmeCritic, DiscreteValuedDistribution,  # imported as package
-                     ScalarAcmeCritic, categorical, td_learning)
+                     ScalarAcmeCritic, QuantileCritic, categorical, td_learning,
+                     quantile_huber_loss)
 except ImportError:
     from nn import (AcmeActor, AcmeCritic, DiscreteValuedDistribution,   # run standalone
-                    ScalarAcmeCritic, categorical, td_learning)
+                    ScalarAcmeCritic, QuantileCritic, categorical, td_learning, 
+                    quantile_huber_loss)
 
 def arr_to_str(x):
     if isinstance(x, np.ndarray):
@@ -119,6 +123,11 @@ class MPO:
                 vmax=args.vmax,
                 num_atoms=args.num_atoms,
             )
+        elif self.args.critic_type == "quantile":
+            if self.args.ensemble != 1:
+                raise ValueError("Quantile critic currently supports --ensemble 1 only.")
+            critic_cls = QuantileCritic
+            critic_kwargs = dict(num_quantiles=args.num_quantiles)
         else:
             critic_cls = ScalarAcmeCritic
             critic_kwargs = {}
@@ -433,28 +442,9 @@ class MPO:
                     values=subset_atom_values,
                     logits=averaged_target_logits,
                 )
-                entropic_lambda = 0.0008
-                entropic_q_values = []
-                for d in sampled_q_t_distributions:
-                    log_probs = F.log_softmax(
-                        d.logits.reshape(N, B, num_atoms),
-                        dim=-1,
-                    )
-                    atoms = d.values.reshape(1, 1, num_atoms)
-                    # -(1/lambda) log sum_k p_k exp(-lambda z_k)
-                    entropic_q = (
-                        -(1.0 / entropic_lambda)
-                        * torch.logsumexp(
-                            log_probs - entropic_lambda * atoms,
-                            dim=-1,
-                        )
-                    )
-                    entropic_q_values.append(entropic_q)
-        
-                q_values = torch.stack(entropic_q_values, dim=0).mean(dim=0)
-                # q_values = torch.stack([
-                #     d.mean().reshape(N, B)
-                #     for d in sampled_q_t_distributions], dim=0).mean(dim=0)
+                q_values = torch.stack([
+                    d.mean().reshape(N, B)
+                    for d in sampled_q_t_distributions], dim=0).mean(dim=0)
 
             # Cross-entropy loss per critic
             critic_loss_per_critic = torch.stack([
@@ -465,6 +455,40 @@ class MPO:
                     q_t=target_q_distribution,
                 ).mean()
                 for critic in self.critics], dim=0)
+        elif self.args.critic_type == "quantile":
+            with torch.no_grad():
+                num_quantiles = self.args.num_quantiles
+                next_quantiles = self.target_critics[0](
+                    tiled_states, flat_actions).reshape(N, B, num_quantiles)
+                #  for nonparametric q(a|s) in E step of MPO. get q_value for each of N actions
+                q_values = next_quantiles.mean(dim=-1) # [N, B]
+
+                # find loss for each of M next actions separately, then average 
+                # the losses by multiplying each with the corresponding action's
+                # probability
+                M = self.args.quantile_target_action_num
+                target_quantiles = r_t.unsqueeze(0).unsqueeze(-1) + pcont_t.unsqueeze(0).unsqueeze(-1) * next_quantiles[:M]
+            losses = []
+            current_quantiles = self.critics[0](s_tm1, a_tm1)
+            for n in range(M):                
+                loss_n = quantile_huber_loss(
+                    current_quantiles,
+                    target_quantiles[n],
+                    sum_over_quantiles=self.args.sum_over_quantiles,
+                    huber_param=self.args.quantile_huber_param,
+                )
+                losses.append(loss_n)
+                # just use one of the sampled a_t+1 from pi_target(s_t+1) to compute target?
+                # [B, 201]  -> for 1 action, has 201 quantiles.
+                # target_quantiles = r_t.unsqueeze(-1) + pcont_t.unsqueeze(-1) * best_target_quantiles #next_quantiles[0]
+            critic_loss_per_critic = torch.stack(losses).mean()
+            # critic_loss_per_critic = quantile_huber_loss(
+            #     current_quantiles,
+            #     target_quantiles,
+            #     sum_over_quantiles=self.args.sum_over_quantiles,
+            #     huber_param=self.args.quantile_huber_param,
+            # )
+
         else:
             with torch.no_grad():
                 sampled_q_t = torch.stack([
@@ -802,7 +826,7 @@ class MPO:
                 agent_vars_row[f"dual_alpha_mean_{idx}"] = m.get(f"dual_alpha_mean_{idx}")
                 agent_vars_row[f"dual_alpha_stddev_{idx}"] = m.get(f"dual_alpha_stddev_{idx}")
                 agent_vars_row[f"pi_stddev_{idx}"] = m.get(f"pi_stddev_{idx}")
-            
+
             self.agent_vars_buffer.append(agent_vars_row)
 
         if global_step % self.args.save_every_n_steps == 0:
@@ -817,7 +841,11 @@ class MPO:
             self.csv_file_agent_vars.flush()
             self.agent_vars_buffer = []
     
-    def save_checkpoint(self):
+    def save_checkpoint(self, filename=None):
+        """filename=None: periodic weights_and_args/checkpoint_<step>.pth + replay buffer.
+        filename given (best_checkpoint.pth): saved in the run dir with the replay buffer
+        as best_replay_buffer.npz, not weights_and_args/ (load_checkpoint parses a step
+        out of every .pth there)."""
         checkpoint = {
             "actor": self.actor.state_dict(),
             "actor_target": self.actor_target.state_dict(),
@@ -841,15 +869,24 @@ class MPO:
             checkpoint["critic"] = checkpoint["critics"][0]
             checkpoint["target_critic"] = checkpoint["target_critics"][0]
             checkpoint["critic_optimizer"] = checkpoint["critic_optimizers"][0]
+        if filename is not None:
+            run_dir = os.path.dirname(self.weights_folder)
+            torch.save(checkpoint, os.path.join(run_dir, filename))
+            self.rb.save(os.path.join(run_dir, "best_replay_buffer.npz"))
+            return
         torch.save(checkpoint, os.path.join(self.weights_folder, f"checkpoint_{self.global_step}.pth"))
-        # if global_step % self.args.save_every_n_steps == 0:
         self.rb.save(os.path.join(self.weights_folder, "replay_buffer.npz"))
 
-    def load_checkpoint(self, weights_path, checkpoint_step=None):
+    def load_checkpoint(self, weights_path, checkpoint_step=None, load_best=False):
         checkpoint_files = [f for f in os.listdir(weights_path) if f.endswith(".pth")]
         checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
 
-        if checkpoint_step is None:
+        if load_best:
+            # best_checkpoint.pth sits in the run dir, one level above weights_and_args/.
+            checkpoint_file = os.path.join("..", "best_checkpoint.pth")
+            if not os.path.exists(os.path.join(weights_path, checkpoint_file)):
+                raise FileNotFoundError(f"--load_best: no best_checkpoint.pth next to {weights_path}")
+        elif checkpoint_step is None:
             checkpoint_file = checkpoint_files[-1]
         else:
             checkpoint_file = f"checkpoint_{checkpoint_step}.pth"
@@ -905,12 +942,21 @@ class MPO:
                 self.log_penalty_eta.copy_(torch.as_tensor(checkpoint["log_penalty_eta"],dtype=self.log_penalty_eta.dtype,device=self.device,).reshape_as(self.log_penalty_eta))
         self.global_step = int(checkpoint.get("global_step", 0))
         self.learner_step = int(checkpoint.get("learner_step", 0))
+        buffer_path = os.path.join(weights_path, "replay_buffer.npz")
+        if load_best:
+            # Weights, step counter and replay buffer all as they were at the best eval.
+            best_buffer_path = os.path.join(weights_path, "..", "best_replay_buffer.npz")
+            if os.path.exists(best_buffer_path):
+                buffer_path = best_buffer_path
+            else:  # older runs saved no best buffer: latest buffer and step instead
+                print(f"[!] No best_replay_buffer.npz; best weights are from step {self.global_step}, "
+                      f"but the replay buffer and step counter are the latest")
+                self.global_step = int(checkpoint_files[-1].split("_")[-1].split(".")[0])
         print(f"[√] Loaded checkpoint from {weights_path}, global_step={self.global_step}")
 
-        buffer_path = os.path.join(weights_path, "replay_buffer.npz")
         if os.path.exists(buffer_path):
             self.rb.load(buffer_path, self.device)
-            print(f"[√] Loaded replay buffer.")
+            print(f"[√] Loaded replay buffer {os.path.basename(buffer_path)}")
     
     def cleanup(self):
         if self.writer_raw_actions is not None and self.raw_action_buffer:
@@ -1054,10 +1100,22 @@ def parse_args(argv=None):
     parser.add_argument("--capture_video_steps", type=int, default=None,
                         help="If set, record one continuous video from step 0 through this "
                              "many steps, instead of the recurring save_every_n_steps clips.")
+    parser.add_argument("--capture_video_every", type=int, default=None,
+                        help="Start a capture_video_steps-long clip every N env steps (default: only at step 0)")
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
+    parser.add_argument("--stop_reward_threshold", type=float, default=None,
+                        help="Sim1 early stopping (SB3 StopTrainingOnRewardThreshold): stop once the best "
+                             "deterministic eval return (every --eval_freq) reaches this; --total_timesteps "
+                             "is still the step cap. None = no eval, train for --total_timesteps")
+    parser.add_argument("--eval_freq", type=int, default=None,
+                        help="run a deterministic evaluation every N steps (default: save_every_n_steps)")
+    parser.add_argument("--n_eval_episodes", type=int, default=5,
+                        help="episodes per evaluation, one per parallel eval env (SB3 EvalCallback default: 5)")
+    parser.add_argument("--eval_max_episode_steps", type=int, default=None,
+                        help="cap eval episode length (needed if the env never truncates on its own)")
     parser.add_argument("--log_every_n_steps", type=int, default=4000)
-    parser.add_argument("--critic_type", type=str, default="scalar", choices=["scalar", "categorical"], help="The 'scalar' critic is regular MPO, whereas 'categorical' distributional critic is for DMPO")
+    parser.add_argument("--critic_type", type=str, default="scalar", choices=["scalar", "categorical", "quantile"], help="Critic type: scalar MPO, categorical/C51 DMPO, or quantile-regression distributional critic")
     parser.add_argument("--ensemble", type=int, default=1, help="Number of critics in the ensemble, where 1 reproduces the single-critic agent")
 
     parser.add_argument(
@@ -1080,6 +1138,16 @@ def parse_args(argv=None):
                         help="Maximum atom value for distributional critic")
     parser.add_argument("--num_atoms", type=int, default=101,
                         help="Number of categorical atoms for distributional critic")
+
+    # Quantile-regression distributional critic
+    parser.add_argument("--num_quantiles", type=int, default=201,
+                        help="Number of learned return quantiles for quantile critic")
+    parser.add_argument("--quantile_target_action_num", type=int, default=4,
+                        help="Number of sampled next-actions (M) averaged over when computing the quantile critic TD-target loss")
+    parser.add_argument("--quantile_huber_param", type=float, default=1.0,
+                        help="Huber threshold for quantile regression; 0 uses absolute loss")
+    parser.add_argument("--sum_over_quantiles", action=argparse.BooleanOptionalAction, default=True,
+                        help="Sum the quantile-huber loss over quantiles before averaging over batch, vs. averaging over both")
 
     parser.add_argument("--log_interval", type=int, default=100,
                         help="env steps between TensorBoard scalar writes")
@@ -1112,6 +1180,9 @@ def parse_args(argv=None):
     parser.add_argument("--td_horizon", type=int, default=5,
                         help="number of steps collapsed into each replay transition")
     
+    parser.add_argument("--load_best", action="store_true", default=False,
+                        help="with --weights_path: load <run_dir>/best_checkpoint.pth (best eval return) "
+                             "and best_replay_buffer.npz, continuing from the best eval's step")
     parser.add_argument("--checkpoint_step",type=int,default=None,
                             help="Specific checkpoint step to load, e.g. 95000. If omitted, loads latest.")
 
@@ -1125,6 +1196,10 @@ def parse_args(argv=None):
 
     # Environment.
     parser.add_argument("--dt", type=float, default=0.12)
+    # RC car (--env_id RCCarSim1-v0 = kinematic bicycle, RCCarSim2-v0 = tire-force blend).
+    parser.add_argument("--rccar_domain_randomization", type=str, default="per_env",
+                        choices=["off", "per_env", "per_episode"])
+    parser.add_argument("--rccar_episode_length", type=int, default=250)
     parser.add_argument("--hw_config", type=str, default=None)
     parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
@@ -1156,6 +1231,13 @@ def parse_args(argv=None):
     parser.add_argument("--policy_min_scale", type=float, default=1e-4)
 
     args = parser.parse_args(argv)
+    if args.load_best:
+        if args.weights_path is None:
+            parser.error("--load_best requires --weights_path")
+        if args.checkpoint_step is not None:
+            parser.error("--load_best and --checkpoint_step are mutually exclusive")
+        if args.resume_in_place:
+            parser.error("--load_best can't be used with --resume_in_place (resume needs the latest checkpoint)")
 
     assert args.ensemble >= 1
 
@@ -1219,17 +1301,17 @@ def main():
         run_name = f"{args.exp_name}_{date}_seed_{args.seed}"
         os.makedirs(os.path.join(args.runs_directory, run_name), exist_ok=True)
 
-    task = None
     print(f"args.env_id: {args.env_id}")
-    if args.task_type == "forward":
-        task = ForwardTask()
-    elif args.task_type == "back_and_forth":
-        RADIUS = args.radius_back_and_forth
-        ORIGIN = np.array(args.origin_back_and_forth)
-        task = BackAndForthTask(radius=RADIUS, origin=ORIGIN)
-        print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
-    else:
+    def make_task():  # called again for the eval env so it gets its own task state
+        if args.task_type == "forward":
+            return ForwardTask()
+        elif args.task_type == "back_and_forth":
+            RADIUS = args.radius_back_and_forth
+            ORIGIN = np.array(args.origin_back_and_forth)
+            print(f"BackAndForthTask: radius={RADIUS}, origin={ORIGIN}")
+            return BackAndForthTask(radius=RADIUS, origin=ORIGIN)
         raise ValueError(f"Invalid task type: {args.task_type}")
+    task = make_task()
 
     raw_env, envs = make_envs(args, task, disk_folder, run_name, runs_directory=args.runs_directory)
     
@@ -1247,6 +1329,7 @@ def main():
     if args.weights_path is not None:
         agent.load_checkpoint(args.weights_path,
             checkpoint_step=args.checkpoint_step,
+            load_best=args.load_best,
         )
         if args.eval:
             agent.global_step = 0
@@ -1257,6 +1340,41 @@ def main():
 
     obs, info = envs.reset()
     agent.initialize_logging(info, append=args.resume_in_place)
+
+    stopper = None
+    evaluator = None
+    if args.stop_reward_threshold is not None and not args.eval:
+        if args.hw_config is not None:
+            raise ValueError("--stop_reward_threshold needs a separate sim eval env; not supported with --hw_config")
+        run_dir = os.path.join(args.runs_directory, run_name)
+        stopper = StopTrainingOnRewardThreshold(run_dir, args.stop_reward_threshold)
+
+        # Separate eval envs (as in SB3's EvalCallback): n_eval_episodes envs, each
+        # with its own task instance, run in parallel for one episode each. Env i is
+        # re-seeded with args.seed + i before every evaluation (sb3_eval.Evaluator),
+        # so every evaluation starts from the same initial states. Only env 0
+        # records video.
+        eval_envs = []
+        for i in range(args.n_eval_episodes):
+            eval_args = copy.copy(args)
+            eval_args.num_envs = 1
+            eval_args.seed = args.seed + i
+            eval_args.capture_video = (i == 0)
+            eval_raw_env, _ = make_envs(eval_args, make_task(), disk_folder, run_name,
+                                        runs_directory=args.runs_directory, wrap_skrl=False)
+            eval_envs.append(eval_raw_env.envs[0])
+        evaluator = Evaluator(
+            eval_envs,
+            act_fn=lambda o: agent.actor(o).mean,  # deterministic: the policy mean
+            action_space=raw_env.single_action_space,
+            run_dir=run_dir,
+            device=agent.device,
+            n_eval_episodes=args.n_eval_episodes,
+            reward_scale=args.reward_scale,
+            max_episode_steps=args.eval_max_episode_steps,
+            seed=args.seed,
+        )
+        eval_freq = args.eval_freq or args.save_every_n_steps
     
     if args.resume_in_place:
         # RewardTracker has its own counter. Continue it from the last row already
@@ -1317,6 +1435,13 @@ def main():
                 agent.save_checkpoint()
                 if writer is not None:
                     writer.flush()
+            # Deterministic eval on the separate env decides convergence (was: rolling train return).
+            if evaluator is not None and current_step % eval_freq == 0:
+                mean_reward, is_new_best = evaluator.evaluate(current_step)
+                if is_new_best:
+                    agent.save_checkpoint("best_checkpoint.pth")
+                if not stopper.check(current_step, evaluator.best_mean_reward):
+                    break
             step_times.append(f"{current_step},{time.time() - time_now}\n")
 
         # with open(os.path.join(args.runs_directory, run_name, "step_times.csv"), "w") as f:
@@ -1332,6 +1457,8 @@ def main():
 
         if writer is not None:
             writer.close()
+        if evaluator is not None:
+            evaluator.close()
     
     agent.cleanup()
 if __name__ == "__main__":

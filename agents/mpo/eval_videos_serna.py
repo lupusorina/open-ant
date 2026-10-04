@@ -16,12 +16,12 @@ from types import SimpleNamespace
 
 # A single training-run folder containing weights_and_args/.
 # You may also point directly to the weights_and_args folder.
-INPUT_DIR = "/n/holylfs05/LABS/hankyang_lab/Lab/serenaliu/walker2d_v5/EMPO/mpo_walker_20260909-172213_seed_1/weights_and_args"
+INPUT_DIR = "/home/serenaliu/caltech_linc_home/open-ant/agents/mpo/runs/mpo_minipi/mpo_minipi_20260930-181410_seed_1/weights_and_args"
 
 # Modified XML to use during evaluation. Set to None to use the
 # XML/environment configuration saved during training.
-XML_FILE = None
-
+#XML_FILE = "/home/serenaliu/caltech_linc_home/rl_workspace/open-ant/sim/assets/robot_walk.xml"
+XML_FILE = "/home/serenaliu/caltech_linc_home/open-ant/agents/mpo/hightorque_mini_pi/scene.xml"
 # Folder in which the generated MP4 files will be written.
 # Set to None to use INPUT_DIR/videos/.
 OUTPUT_DIR = None

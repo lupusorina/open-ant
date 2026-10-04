@@ -249,14 +249,14 @@ def main():
                 critic_loss_sum += 0.5 * (delta.item() ** 2)
 
     # IDBD critic Update
-            # clear old gradients
+                # clear old gradients
                 critic.zero_grad()
             
-            # compute ∇w Vw(s_t) for every w critic parameter. Now, every critic parameter
-            # has a p.grad attached that = ∂Vw(s_t) / ∂ that parameter
+                # compute ∇w Vw(s_t) for every w critic parameter. Now, every critic parameter
+                # has a p.grad attached that = ∂Vw(s_t) / ∂ that parameter
                 v_s.backward(retain_graph=True)
 
-            # save the gradients into a list. 
+                # save the gradients into a list. 
                 critic_grads = [
                     p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
                     for p in critic.parameters()

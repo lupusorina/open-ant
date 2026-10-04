@@ -10,14 +10,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SCRIPT="mpo_acme.py"
+SCRIPT="mpo_qrdqn.py"
 
-GPU_LIST=(1)
+GPU_LIST=(3)
 
 SEEDS=(5)
-# empo walker: 1, 2, 
-# 3, 4
-# now 5.
+# qrdqn walker: 2 3 4 5
+# 6 7 8 
+
 RUN_MODE="${1:-sim_then_continual}"
 
 case "${RUN_MODE}" in
@@ -31,13 +31,13 @@ SIM1_EXP_NAME="mpo_walker"
 SIM1_TOTAL_TIMESTEPS="1_000_000"
 GLOBAL_TOTAL_TIMESTEPS="2_500_000"
 
-RUNS_DIR="/data2/serenaliu_data/2empo_walker_impfast_spi192"
+RUNS_DIR="/data2/serenaliu_data/1walker_moreaggressive/2qrdqn_walker"
 
 MODEL1_PATH="../../sim/assets/walker2d_v5.xml"
-MODEL2_PATH="../../sim/assets/walker2d_sim2_massfric.xml"
+MODEL2_PATH="../../sim/assets/walker2d_sim2_lessfootfric_delay.xml"
 
-CRITIC_TYPE="scalar"
-ENSEMBLE=3
+CRITIC_TYPE="quantile"
+ENSEMBLE=1
 
 CONT_EXP_NAME="continual_mpo_walker"
 
@@ -74,7 +74,10 @@ run_seed_pipeline() {
             --gamma 0.99 \
             --dual_lr 0.005 \
             --policy_init_scale 0.5 \
-            --samples_per_insert 192
+            --samples_per_insert 192 \
+            --num_quantiles 201
+            # --vmin -650 \
+            # --vmax 650
 
 
         sim1_run_dir="$(
@@ -149,7 +152,10 @@ run_seed_pipeline() {
         --gamma 0.99 \
         --dual_lr 0.005 \
         --policy_init_scale 0.5 \
-        --samples_per_insert 192
+        --samples_per_insert 192 
+        # --num_quantiles 201
+        # --vmin -650 \
+        # --vmax 650
     echo
     echo "Seed ${seed}: Sim1 and Sim2 both finished on GPU ${physical_gpu}."
 
