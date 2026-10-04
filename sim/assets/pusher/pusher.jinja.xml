@@ -1,10 +1,13 @@
+{% set shift = shift | default(0.0) %}
+{% set mass_scale = 1.0 + shift %}
+{% set fric_scale = 1.0 - shift %}
 <mujoco model="arm3d">
   <compiler inertiafromgeom="true" angle="radian" coordinate="local"/>
   <option timestep="0.01" gravity="0 0 0" iterations="20" integrator="implicitfast" />
 
   <default>
     <joint armature='0.04' damping="1" limited="true"/>
-    <geom friction=".8 .1 .1" density="300" margin="0.002" condim="1" contype="0" conaffinity="0"/>
+    <geom friction="{{ (0.8 * fric_scale) | round(6) }} .1 .1" density="{{ (300 * mass_scale) | round(6) }}" margin="0.002" condim="1" contype="0" conaffinity="0"/>
   </default>
 
   <worldbody>
@@ -66,14 +69,14 @@
 
     <!--<body name="object" pos="0.55 -0.3 -0.275" >-->
     <body name="object" pos="0.45 -0.05 -0.275" >
-      <geom rgba="1 1 1 0" type="sphere" size="0.05 0.05 0.05" density="0.00001" conaffinity="0"/>
-      <geom rgba="1 1 1 1" type="cylinder" size="0.05 0.05 0.05" density="0.00001" contype="1" conaffinity="0"/>
+      <geom rgba="1 1 1 0" type="sphere" size="0.05 0.05 0.05" density="{{ 0.00001 * mass_scale }}" conaffinity="0"/>
+      <geom rgba="1 1 1 1" type="cylinder" size="0.05 0.05 0.05" density="{{ 0.00001 * mass_scale }}" contype="1" conaffinity="0"/>
       <joint name="obj_slidey" type="slide" pos="0 0 0" axis="0 1 0" range="-10.3213 10.3" damping="0.5"/>
       <joint name="obj_slidex" type="slide" pos="0 0 0" axis="1 0 0" range="-10.3213 10.3" damping="0.5"/>
     </body>
 
     <body name="goal" pos="0.45 -0.05 -0.3230">
-      <geom rgba="1 0 0 1" type="cylinder" size="0.08 0.001 0.1" density='0.00001' contype="0" conaffinity="0"/>
+      <geom rgba="1 0 0 1" type="cylinder" size="0.08 0.001 0.1" density="{{ 0.00001 * mass_scale }}" contype="0" conaffinity="0"/>
       <joint name="goal_slidey" type="slide" pos="0 0 0" axis="0 1 0" range="-10.3213 10.3" damping="0.5"/>
       <joint name="goal_slidex" type="slide" pos="0 0 0" axis="1 0 0" range="-10.3213 10.3" damping="0.5"/>
     </body>

@@ -1,8 +1,11 @@
+{% set shift = shift | default(0.0) %}
+{% set mass_scale = 1.0 + shift %}
+{% set fric_scale = 1.0 - shift %}
 <mujoco model="reacher">
 	<compiler angle="radian" inertiafromgeom="true"/>
 	<default>
 		<joint armature="1" damping="1" limited="true"/>
-		<geom contype="0" friction="1 0.1 0.1" rgba="0.7 0.7 0 1"/>
+		<geom contype="0" density="{{ (1000 * mass_scale) | round(6) }}" friction="{{ (1.0 * fric_scale) | round(6) }} 0.1 0.1" rgba="0.7 0.7 0 1"/>
 	</default>
 	<option gravity="0 0 -9.81" integrator="implicitfast" timestep="0.01"/>
 	<worldbody>
