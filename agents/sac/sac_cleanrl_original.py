@@ -1,10 +1,16 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
 import random
+import sys
 import time
 from dataclasses import dataclass
 
 import gymnasium as gym
+
+# Register MiniPiWalk-v0 / MiniPiBackAndForth-v0 (High Torque Mini Pi).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../sim")))
+import mini_pi_walk_env  # noqa: F401
+import caltech_biped  # noqa: F401  registers CaltechBiped-v0
 import numpy as np
 import torch
 import torch.nn as nn
@@ -38,6 +44,8 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
+    xml_file: str | None = None
+    """optional MuJoCo model path passed to gym.make as xml_file"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     num_envs: int = 1
@@ -66,13 +74,23 @@ class Args:
     """automatic tuning of the entropy coefficient"""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, seed, idx, capture_video, run_name, xml_file):
     def thunk():
+        env_kwargs = {}
+        if xml_file is not None:
+            env_kwargs["xml_file"] = xml_file
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            env = gym.make(env_id, render_mode="rgb_array", **env_kwargs)
+            # Full episode every 10th episode, played back slightly slower than control rate.
+            env = gym.wrappers.RecordVideo(
+                env,
+                f"videos/{run_name}",
+                episode_trigger=lambda episode_id: episode_id % 10 == 0,
+                name_prefix="training",
+                fps=50,
+            )
         else:
-            env = gym.make(env_id)
+            env = gym.make(env_id, **env_kwargs)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
         return env
@@ -90,11 +108,13 @@ class SoftQNetwork(nn.Module):
         )
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
+        self.ln1 = nn.LayerNorm(256)
+        self.ln2 = nn.LayerNorm(256)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = F.relu(self.ln1(self.fc1(x)))
+        x = F.relu(self.ln2(self.fc2(x)))
         x = self.fc3(x)
         return x
 
@@ -110,6 +130,8 @@ class Actor(nn.Module):
         self.fc2 = nn.Linear(256, 256)
         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.ln1 = nn.LayerNorm(256)
+        self.ln2 = nn.LayerNorm(256)
         # action rescaling
         self.register_buffer(
             "action_scale",
@@ -127,8 +149,8 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = F.relu(self.ln1(self.fc1(x)))
+        x = F.relu(self.ln2(self.fc2(x)))
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
@@ -183,7 +205,8 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, args.xml_file) for i in range(args.num_envs)],
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -232,20 +255,24 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info is not None:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                    break
+        # Record rewards for plotting. Gymnasium 1.x SAME_STEP autoreset
+        # stores the episode dict under final_info rather than a list of infos.
+        if "final_info" in infos and "episode" in infos["final_info"]:
+            episode = infos["final_info"]["episode"]
+            for idx, finished in enumerate(infos["final_info"]["_episode"]):
+                if finished:
+                    episodic_return = float(episode["r"][idx])
+                    episodic_length = float(episode["l"][idx])
+                    print(f"global_step={global_step}, episodic_return={episodic_return}")
+                    writer.add_scalar("charts/episodic_return", episodic_return, global_step)
+                    writer.add_scalar("charts/episodic_length", episodic_length, global_step)
 
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+        # Save data to the replay buffer. On time-limit truncation the vector
+        # env has already reset, so use the pre-reset observation for bootstrapping.
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
+                real_next_obs[idx] = infos["final_obs"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -319,6 +346,10 @@ if __name__ == "__main__":
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+
+    model_path = f"runs/{run_name}/actor.pt"
+    torch.save(actor.state_dict(), model_path)
+    print(f"saved actor to {model_path}")
 
     envs.close()
     writer.close()

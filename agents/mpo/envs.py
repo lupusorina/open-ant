@@ -24,8 +24,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from embodied_ant_env import make_ant_env
 from rccar_env import RCCarEnv
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "hightorque_mini_pi")))
-import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0
+import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0 (sim/ is on sys.path above)
 
 # Embodied / custom Ant IDs used by this repo (not Gymnasium registry entries).
 EMBODIED_ANT_ENV_IDS = {

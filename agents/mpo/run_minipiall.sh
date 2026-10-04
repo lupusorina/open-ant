@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # MPO (mpo_acme.py, scalar critic) on the Mini Pi+ Pro walking task, Sim1 -> Sim2 sweep.
-#   Sim1: MiniPiWalk-v0 on hightorque_mini_pi/scene.xml, one run per seed, until the stop rule fires.
+#   Sim1: MiniPiWalk-v0 on ../../sim/assets/hightorque/scene.xml, one run per seed, until the stop rule fires.
 #   Sim2: per (variant, seed), continue from Sim1's best eval on a generated XML
-#         (hightorque_mini_pi/make_mini_pi_variants.py: mass x(1+s), friction x(1-s), s = 20..80%).
+#         (../../sim/assets/hightorque/make_mini_pi_variants.py: mass x(1+s), friction x(1-s), s = 20..80%).
 #
 # Default: every launch starts NEW timestamped runs. --resume picks up existing runs instead:
 #   Sim1 finished -> Sim2 | Sim1 still running -> wait | Sim1 stopped part-way -> resume it
@@ -53,7 +53,7 @@ RUNS_DIR="/data2/serenaliu_data/qrdqn_minipi"
 
 SIM1_EXP_NAME="mpo_minipi"
 SIM1_TOTAL_TIMESTEPS="500_000"
-SIM1_MODEL_PATH="hightorque_mini_pi/scene.xml"
+SIM1_MODEL_PATH="../../sim/assets/hightorque/scene.xml"
 # Sim1 stops on ONE --stop_rule, judged by the deterministic eval return (mean of
 # 5 fixed-seed episodes every save_every_n_steps; ../sb3_eval.py, ../early_stopping.py):
 #   reward_threshold: best eval return >= --stop_reward_threshold
@@ -76,8 +76,8 @@ SIM2_STEPS="1_500_000"
 CRITIC_TYPE="quantile"
 ENSEMBLE=1
 
-GEN_SCRIPT="hightorque_mini_pi/make_mini_pi_variants.py"
-GEN_DIR="hightorque_mini_pi/generated"
+GEN_SCRIPT="../../sim/assets/hightorque/make_mini_pi_variants.py"
+GEN_DIR="../../sim/assets/hightorque/generated"
 
 POLL_SECONDS=600             # how often to re-check a Sim1 that is still training
 
