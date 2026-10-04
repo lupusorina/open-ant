@@ -18,24 +18,25 @@
 #   bash run_envs.sh sim                      # Sim1 only
 #   bash run_envs.sh sim_continual_learning   # Sim2 only, from the newest Sim1 checkpoint as-is
 #   bash run_envs.sh [mode] --resume          # resume existing runs instead of starting new ones
+#   bash run_envs.sh [mode] --seeds 3,5       # run these seeds instead of SEEDS below
 # Logs: ${RUNS_DIR}/logs/<exp_name>_seed<seed>.log
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 # ======================== edit these ========================
-ENV="pusher"                # swimmer | reacher | pusher | mini_pi
+ENV="swimmer"                # swimmer | reacher | pusher | mini_pi
 ALGO="qmpo"                   # sac | mpo (scalar critic) | dmpo (categorical) | qmpo (quantile)
 ENSEMBLE=1                   # MPO variants only: number of critics
 GPU_LIST=(2)                 # physical GPU ids (nvidia-smi numbering)
 PER_GPU=4                    # max concurrent runs this script starts per GPU
-NUM_SEEDS=1                  # runs seeds 1..NUM_SEEDS
+SEEDS=(1)                  # seeds to run, e.g. (3) or (4 5 6); override with --seeds 3,5
 # Sim1 stops once the best deterministic eval return (mean of N_EVAL_EPISODES fixed-seed
 # episodes every save_every_n_steps; ../sb3_eval.py, ../early_stopping.py) reaches this.
 # Reaching it writes <run_dir>/converged.json (= "Sim1 finished"). Empty = no eval, no early
 # stop: Sim1 always runs SIM1_TOTAL_TIMESTEPS. Returns differ a lot per env (Reacher/Pusher
 # returns are negative), so set it for the env you pick.
-REWARD_THRESHOLD=-10
+REWARD_THRESHOLD=280
 N_EVAL_EPISODES=5
 RUNS_DIR="/data2/serenaliu_data/2_${ALGO}_${ENV}"
 SIM1_TOTAL_TIMESTEPS=1000000
@@ -52,16 +53,20 @@ VARIANTS=()
 
 RESUME=0
 RUN_MODE="sim_then_continual"
-for arg in "$@"; do
-    case "${arg}" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --resume) RESUME=1 ;;
-        *) RUN_MODE="${arg}" ;;
+        --seeds)
+            [[ $# -ge 2 ]] || { echo "ERROR: --seeds needs a value, e.g. --seeds 3,5" >&2; exit 1; }
+            IFS=',' read -ra SEEDS <<< "$2"; shift ;;
+        *) RUN_MODE="$1" ;;
     esac
+    shift
 done
 case "${RUN_MODE}" in
     sim|sim_continual_learning|sim_then_continual) ;;
     *)
-        echo "Usage: bash run_envs.sh [sim|sim_continual_learning|sim_then_continual] [--resume]" >&2
+        echo "Usage: bash run_envs.sh [sim|sim_continual_learning|sim_then_continual] [--resume] [--seeds 1,2,...]" >&2
         exit 1
         ;;
 esac
@@ -70,10 +75,12 @@ esac
 # Sim2 variants come from one of:
 #   SIM2_TEMPLATE: jinja template rendered at launch, one XML per SIM2_SHIFTS entry
 #   GEN_DIR:       folder with manifest.txt + <variant>.xml (GEN_SCRIPT creates it if missing)
-SIM2_TEMPLATE="" GEN_DIR="" GEN_SCRIPT=""
+# GAMMA: per-step discount, used by both SAC and MPO (Sim1 and Sim2).
+SIM2_TEMPLATE="" GEN_DIR="" GEN_SCRIPT="" GAMMA=0.99
 case "${ENV}" in
     swimmer)
         ENV_ID="Swimmer-v5"
+        GAMMA=0.999                  # swimmer needs a longer horizon
         SIM1_MODEL_PATH="../../sim/assets/swimmer/swimmer.xml"
         SIM2_TEMPLATE="../../sim/assets/swimmer/swimmer.jinja.xml"
         ;;
@@ -84,7 +91,7 @@ case "${ENV}" in
         ;;
     pusher)
         ENV_ID="Pusher-v5"
-        SIM1_MODEL_PATH="../../sim/assets/pusher/pusher.xml"
+        SIM1_MODEL_PATH="../../sim/assets/pusher/pusher_v5.xml"
         SIM2_TEMPLATE="../../sim/assets/pusher/pusher.jinja.xml"
         ;;
     mini_pi)
@@ -106,8 +113,6 @@ SIM1_EARLY_STOP_ARGS=()
 [[ -n "${REWARD_THRESHOLD}" ]] && \
     SIM1_EARLY_STOP_ARGS=(--stop_reward_threshold "${REWARD_THRESHOLD}" --n_eval_episodes "${N_EVAL_EPISODES}")
 
-SEEDS=($(seq 1 "${NUM_SEEDS}"))
-
 # ---- Per-algorithm settings ----
 case "${ALGO}" in
     sac)
@@ -116,7 +121,7 @@ case "${ALGO}" in
             --env_id "${ENV_ID}"
             --render_mode rgb_array
             --cuda
-            --gamma 0.99                 # per step, same as MPO
+            --gamma "${GAMMA}"           # per step, same as MPO
             --num_envs 1
             --save_every_n_steps 25000
             --capture_video
@@ -138,7 +143,7 @@ case "${ALGO}" in
             --cuda
             --critic_type "${CRITIC_TYPE}"
             --ensemble "${ENSEMBLE}"
-            --gamma 0.99
+            --gamma "${GAMMA}"
             --dual_lr 1e-2
             --policy_lr 3e-4
             --q_lr 3e-4
@@ -491,7 +496,7 @@ PY
 fi
 
 echo "Env:      ${ENV} (${ENV_ID}, ${SIM1_MODEL_PATH})"
-echo "Algo:     ${ALGO} (${SCRIPT})"
+echo "Algo:     ${ALGO} (${SCRIPT}), gamma ${GAMMA}"
 echo "Mode:     ${RUN_MODE}$( (( RESUME )) && echo ' (--resume)' || echo ' (new runs)')"
 echo "Stop:     ${REWARD_THRESHOLD:+eval return >= ${REWARD_THRESHOLD} or }${SIM1_TOTAL_TIMESTEPS} steps"
 echo "Seeds:    ${SEEDS[*]}"
