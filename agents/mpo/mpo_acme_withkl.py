@@ -169,6 +169,9 @@ class MPO:
             torch.full((self.act_dim,), self._init_log_alpha_mean, dtype=torch.float32, device=self.device))
         self.log_alpha_stddev = nn.Parameter(
             torch.full((self.act_dim,), self._init_log_alpha_stddev, dtype=torch.float32, device=self.device))
+        # Per-dim dual for the joint (full-policy) KL constraint, used only with --kl_constraint joint.
+        self.log_alpha = nn.Parameter(
+            torch.full((self.act_dim,), args.init_log_alpha, dtype=torch.float32, device=self.device))
         self.log_penalty_eta = nn.Parameter(torch.full((1,),self._init_log_eta,dtype=torch.float32,device=self.device))
         self.dual_optimizer = optim.Adam(
             [
@@ -176,6 +179,8 @@ class MPO:
                 self.log_alpha_mean,
                 self.log_alpha_stddev,
                 self.log_penalty_eta,
+                # only when M-step KL is NOT decoupled between mean & std dev 
+                *([self.log_alpha] if args.kl_constraint == "joint" else []),
             ],
             lr=args.dual_lr,
         )
@@ -232,12 +237,18 @@ class MPO:
                     f"pi_stddev_{idx}",
                 ]
             )
+        if args.kl_constraint == "joint":
+            self.keys_agent_vars.extend(["dual_alpha", "kl_joint_rel"])
+            self.keys_agent_vars.extend([f"dual_alpha_{idx}" for idx in range(self.act_dim)])
         self.info_log_buffer = []
         self.agent_vars_buffer = []
 
         self._epsilon = args.epsilon_eta
         self._epsilon_mean = args.epsilon_mu_kl
         self._epsilon_stddev = args.epsilon_sigma_kl
+        
+        self._kl_constraint = args.kl_constraint
+        self._epsilon_kl = args.epsilon_kl
         
         # a variable that tracks when reset happens - the transition after boundary = true is
         # when transitioning from terminal state to reset state - this is when pending_autoreset=1,
@@ -523,12 +534,14 @@ class MPO:
             self.log_eta.clamp_(min=-18.0)
             self.log_alpha_mean.clamp_(min=-18.0)
             self.log_alpha_stddev.clamp_(min=-18.0)
+            self.log_alpha.clamp_(min=-18.0)  # if M-step KL is coupled instead
 
         # Transform dual variables from log-space.
         # using softplus instead of exponential for numerical stability
         temperature = F.softplus(self.log_eta) + _MPO_FLOAT_EPSILON
         alpha_mean = F.softplus(self.log_alpha_mean) + _MPO_FLOAT_EPSILON
         alpha_stddev = F.softplus(self.log_alpha_stddev) + _MPO_FLOAT_EPSILON
+        alpha = F.softplus(self.log_alpha) + _MPO_FLOAT_EPSILON
 
         # Get online and target means and stddevs in preparation for decomposition.
         target_mu = target_policy.base_dist.loc
@@ -582,23 +595,49 @@ class MPO:
         loss_policy_stddev = compute_cross_entropy_loss(
             sampled_actions, normalized_weights, fixed_mean_distribution)
         
-        # BELOW IS NOT USED.
         kl_mean = torch.distributions.kl_divergence(target_policy.base_dist,
             fixed_stddev_distribution.base_dist)  # Shape [B, D].
         kl_stddev = torch.distributions.kl_divergence(target_policy.base_dist,
             fixed_mean_distribution.base_dist)  # Shape [B, D]
+        # Full, coupled per-dim KL between target and online policy
+        kl_joint = torch.distributions.kl_divergence(target_policy.base_dist,
+            online_policy.base_dist)  # Shape [B, D]
 
-        
-        # Compute the alpha-weighted KL-penalty and dual losses to adapt the alphas.
-        loss_kl_mean, loss_alpha_mean = compute_parametric_kl_penalty_and_dual_loss(
-            kl_mean, alpha_mean, self._epsilon_mean)
-        loss_kl_stddev, loss_alpha_stddev = compute_parametric_kl_penalty_and_dual_loss(
-            kl_stddev, alpha_stddev, self._epsilon_stddev)
-        
+        if self._kl_constraint == "decoupled":
+            # Compute mean & stddev separately: alpha-weighted KL-penalty and dual losses
+            loss_kl_mean, loss_alpha_mean = compute_parametric_kl_penalty_and_dual_loss(
+                kl_mean, alpha_mean, self._epsilon_mean)
+            loss_kl_stddev, loss_alpha_stddev = compute_parametric_kl_penalty_and_dual_loss(
+                kl_stddev, alpha_stddev, self._epsilon_stddev)
+            loss_policy = loss_policy_mean + loss_policy_stddev
+            loss_kl_penalty = loss_kl_mean + loss_kl_stddev
+            loss_alpha_total = loss_alpha_mean + loss_alpha_stddev
+        elif self._kl_constraint == "soft":
+            # Soft constraint: decoupled Cross entropy & fixed (non-dual) KL coefficients.
+            # "dual_alpha_*"" logs show fixed values
+            alpha_mean = F.softplus(torch.full_like(
+                self.log_alpha_mean, self.args.log_alpha_mean_fixed)) + _MPO_FLOAT_EPSILON
+            alpha_stddev = F.softplus(torch.full_like(
+                self.log_alpha_stddev, self.args.log_alpha_stddev_fixed)) + _MPO_FLOAT_EPSILON
+            
+            # Only the KL penalty is used; the dual losses are dropped
+            loss_kl_mean, _ = compute_parametric_kl_penalty_and_dual_loss(
+                kl_mean, alpha_mean, self._epsilon_mean)
+            loss_kl_stddev, _ = compute_parametric_kl_penalty_and_dual_loss(
+                kl_stddev, alpha_stddev, self._epsilon_stddev)
+            loss_policy = loss_policy_mean + loss_policy_stddev
+            loss_kl_penalty = loss_kl_mean + loss_kl_stddev
+            loss_alpha_total = torch.zeros((), device=self.device)
+        else:
+            # Coupled M-step: cross-entropy on the full online policy, and one
+            # per-dim dual alpha constraining the full per-dim KL.
+            loss_policy = compute_cross_entropy_loss(
+                sampled_actions, normalized_weights, online_policy)
+            loss_kl_penalty, loss_alpha_total = compute_parametric_kl_penalty_and_dual_loss(
+                kl_joint, alpha, self._epsilon_kl)
+
         # Combine losses.
-        loss_policy = loss_policy_mean + loss_policy_stddev
-        loss_kl_penalty = loss_kl_mean + loss_kl_stddev
-        loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature
+        loss_dual = loss_alpha_total + loss_temperature
         total_mpo_loss = (loss_policy + loss_kl_penalty + loss_dual)
             # DO i i need to do requires grad=True here or anywhere else..
         # critic_trainable_variables = self.__critic_network.trainable_variables
@@ -618,8 +657,7 @@ class MPO:
 
             # ACME's loss_policy statistic is the complete MPO loss
             "total_mpo_loss": total_mpo_loss.detach().mean().item(),
-            "loss_alpha": (
-                loss_alpha_mean.detach() + loss_alpha_stddev.detach()).mean().item(),
+            "loss_alpha": loss_alpha_total.detach().mean().item(),
             "loss_temperature": loss_temperature.detach().mean().item(),
             "loss_policy_cross_entropy": loss_policy.detach().mean().item(),
             "loss_kl_penalty": loss_kl_penalty.detach().mean().item(),
@@ -640,6 +678,11 @@ class MPO:
 
             "pi_stddev_cond": (pi_stddev_max_per_state/ pi_stddev_min_per_state.clamp_min(_MPO_FLOAT_EPSILON)).detach().mean().item(),
         }
+        if self._kl_constraint == "joint":
+            policy_stats["dual_alpha"] = alpha.detach().mean().item()
+            policy_stats["kl_joint_rel"] = (kl_joint.detach().mean() / self._epsilon_kl).item()
+            for j in range(self.act_dim):
+                policy_stats[f"dual_alpha_{j}"] = alpha[j].detach().item()
         if self._action_penalization:
             policy_stats["penalty_kl_q_rel"] = (
                 penalty_kl_nonparametric.detach().mean() / self._epsilon_penalty).item()  # pyrefly: ignore[unbound-name]
@@ -793,7 +836,8 @@ class MPO:
         self.info_log_buffer.append(row)
 
 
-        if metrics is not None:
+        if metrics is not None or self.args.eval:
+            m = metrics if metrics is not None else {}
             elapsed_time = max(time.time() - self.start_time,1e-8)
             # global_step counts vector-environment steps, so multiply
             # by num_envs to obtain total environment transitions.
@@ -801,33 +845,38 @@ class MPO:
             reward_value = float(rewards.reshape(-1)[0].item())
             agent_vars_row = {
                 "step": global_step,
-                "critic_loss": metrics.get("critic_loss"),
-                "policy_loss": metrics.get("policy_loss"),
-                "dual_alpha_mean": metrics.get("dual_alpha_mean"),
-                "dual_alpha_stddev": metrics.get("dual_alpha_stddev"),
-                "dual_temperature": metrics.get("dual_temperature"),
-                "loss_alpha": metrics.get("loss_alpha"),
-                "loss_temperature": metrics.get("loss_temperature"),
-                "loss_policy_cross_entropy": metrics.get("loss_policy_cross_entropy"),
-                "loss_kl_penalty": metrics.get("loss_kl_penalty"),
-                "kl_q_rel": metrics.get("kl_q_rel"),
-                "kl_mean_rel": metrics.get("kl_mean_rel"),
-                "kl_stddev_rel": metrics.get("kl_stddev_rel"),
-                "q_min": metrics.get("q_min"),
-                "q_max": metrics.get("q_max"),
-                "pi_stddev_min": metrics.get("pi_stddev_min"),
-                "pi_stddev_max": metrics.get("pi_stddev_max"),
-                "pi_stddev_cond": metrics.get("pi_stddev_cond"),
-                "utd": metrics.get("utd"),
+                "critic_loss": m.get("critic_loss"),
+                "policy_loss": m.get("policy_loss"),
+                "dual_alpha_mean": m.get("dual_alpha_mean"),
+                "dual_alpha_stddev": m.get("dual_alpha_stddev"),
+                "dual_temperature": m.get("dual_temperature"),
+                "loss_alpha": m.get("loss_alpha"),
+                "loss_temperature": m.get("loss_temperature"),
+                "loss_policy_cross_entropy": m.get("loss_policy_cross_entropy"),
+                "loss_kl_penalty": m.get("loss_kl_penalty"),
+                "kl_q_rel": m.get("kl_q_rel"),
+                "kl_mean_rel": m.get("kl_mean_rel"),
+                "kl_stddev_rel": m.get("kl_stddev_rel"),
+                "q_min": m.get("q_min"),
+                "q_max": m.get("q_max"),
+                "pi_stddev_min": m.get("pi_stddev_min"),
+                "pi_stddev_max": m.get("pi_stddev_max"),
+                "pi_stddev_cond": m.get("pi_stddev_cond"),
+                "utd": m.get("utd"),
                 "SPS": sps,
                 "average_reward_per_second": (self.reward_tracker.average_reward_per_second),
                 "reward": reward_value,
                 "mean_return": self.reward_tracker.mean_return,
             }
             for idx in range(self.act_dim):
-                agent_vars_row[f"dual_alpha_mean_{idx}"] = metrics.get(f"dual_alpha_mean_{idx}")
-                agent_vars_row[f"dual_alpha_stddev_{idx}"] = metrics.get(f"dual_alpha_stddev_{idx}")
-                agent_vars_row[f"pi_stddev_{idx}"] = metrics.get(f"pi_stddev_{idx}")
+                agent_vars_row[f"dual_alpha_mean_{idx}"] = m.get(f"dual_alpha_mean_{idx}")
+                agent_vars_row[f"dual_alpha_stddev_{idx}"] = m.get(f"dual_alpha_stddev_{idx}")
+                agent_vars_row[f"pi_stddev_{idx}"] = m.get(f"pi_stddev_{idx}")
+            if self._kl_constraint == "joint":
+                agent_vars_row["dual_alpha"] = m.get("dual_alpha")
+                agent_vars_row["kl_joint_rel"] = m.get("kl_joint_rel")
+                for idx in range(self.act_dim):
+                    agent_vars_row[f"dual_alpha_{idx}"] = m.get(f"dual_alpha_{idx}")
             
             self.agent_vars_buffer.append(agent_vars_row)
 
@@ -857,6 +906,7 @@ class MPO:
             "log_eta": self.log_eta.detach().cpu().clone(),
             "log_alpha_mean": (self.log_alpha_mean.detach().cpu().clone()),
             "log_alpha_stddev": (self.log_alpha_stddev.detach().cpu().clone()),
+            "log_alpha": (self.log_alpha.detach().cpu().clone()),
             "log_penalty_eta": (self.log_penalty_eta.detach().cpu().clone()),
             "global_step": self.global_step,
             "learner_step": self.learner_step,
@@ -927,6 +977,8 @@ class MPO:
                 self.log_alpha_mean.copy_(torch.as_tensor(checkpoint["log_alpha_mean"],dtype=self.log_alpha_mean.dtype,device=self.device).reshape_as(self.log_alpha_mean))
             if "log_alpha_stddev" in checkpoint:
                 self.log_alpha_stddev.copy_(torch.as_tensor(checkpoint["log_alpha_stddev"],dtype=self.log_alpha_stddev.dtype,device=self.device).reshape_as(self.log_alpha_stddev))
+            if "log_alpha" in checkpoint:
+                self.log_alpha.copy_(torch.as_tensor(checkpoint["log_alpha"],dtype=self.log_alpha.dtype,device=self.device).reshape_as(self.log_alpha))
             if "log_penalty_eta" in checkpoint:
                 self.log_penalty_eta.copy_(torch.as_tensor(checkpoint["log_penalty_eta"],dtype=self.log_penalty_eta.dtype,device=self.device,).reshape_as(self.log_penalty_eta))
         self.global_step = int(checkpoint.get("global_step", 0))
@@ -936,7 +988,7 @@ class MPO:
         buffer_path = os.path.join(weights_path, "replay_buffer.npz")
         if os.path.exists(buffer_path):
             self.rb.load(buffer_path, self.device)
-            print(f"[√] Loaded replay buffer.")
+            print(f"[√] Loaded replay buffer {os.path.basename(buffer_path)}")
     
     def cleanup(self):
         if self.writer_raw_actions is not None and self.raw_action_buffer:
@@ -1077,10 +1129,12 @@ def parse_args(argv=None):
     parser.add_argument("--torch_deterministic", action="store_true", default=False)
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--capture_video", action="store_true")
+    parser.add_argument("--capture_video_every", type=int, default=None,
+                        help="Start a capture_video_steps-long clip every N env steps (default: only at step 0)")
     parser.add_argument("--eval", action="store_true", default=False)
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
     parser.add_argument("--log_every_n_steps", type=int, default=4000)
-    parser.add_argument("--critic_type", type=str, default="scalar", choices=["scalar", "categorical"], help="The 'scalar' critic is regular MPO, whereas 'categorical' distributional critic is for DMPO")
+    parser.add_argument("--critic_type", type=str, default="scalar", choices=["scalar", "categorical", "quantile"], help="Critic type: scalar MPO, categorical/C51 DMPO, or quantile-regression distributional critic")
     parser.add_argument("--ensemble", type=int, default=1, help="Number of critics in the ensemble, where 1 reproduces the single-critic agent")
 
     parser.add_argument(
@@ -1123,6 +1177,18 @@ def parse_args(argv=None):
                         help="epsilon_mu for M-step mean KL")
     parser.add_argument("--epsilon_sigma_kl", type=float, default=1e-6,
                         help="epsilon_sigma for M-step covariance KL")
+    parser.add_argument("--kl_constraint", type=str, default="decoupled", choices=["decoupled", "joint", "soft"],
+                        help="'decoupled': decoupled CE + separate per-dim alpha_mu/alpha_sigma; 'joint': full-policy CE + one per-dim alpha on the full per-dim KL; "
+                             "'soft': decoupled CE + fixed alpha_mu/alpha_sigma (no dual update)")
+ 
+    # if solving soft KL constraint in M-step, dual variables log alpha are fixed. 
+    parser.add_argument("--log_alpha_mean_fixed", type=float, default=-17.0,
+                        help="fixed log KL coefficient on the mean (only with --kl_constraint soft)")
+    parser.add_argument("--log_alpha_stddev_fixed", type=float, default=935.0,
+                        help="fixed log KL coefficient on the stddev (only with --kl_constraint soft)")
+    # if solving coupled mean & stddev KL constraint in M-step:
+    parser.add_argument("--epsilon_kl", type=float, default=2.5e-3,
+                        help="per-dim epsilon for the joint M-step KL (only with --kl_constraint joint)")
   
     parser.add_argument("--sample_action_num", type=int, default=64,
                         help="actions sampled per state in E-step")
@@ -1155,6 +1221,8 @@ def parse_args(argv=None):
     parser.add_argument("--init_log_temperature", type=float, default=10.0)
     parser.add_argument("--init_log_alpha_mean", type=float, default=10.0)
     parser.add_argument("--init_log_alpha_stddev", type=float, default=1000.0)
+    parser.add_argument("--init_log_alpha", type=float, default=10.0,
+                        help="init log dual for the coupled mean stddev KL (only with --kl_constraint joint)")
 
     # Environment.
     parser.add_argument("--dt", type=float, default=0.12)
