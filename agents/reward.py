@@ -28,21 +28,19 @@ class RewardTracker:
         self._csv_file_exists = os.path.exists(self.csv_path) # Cache file existence check.
 
     def update(self, reward):
-        self.step += 1
-
         reward_per_second = reward / self.env_dt
         if len(self.queue) == self.window_size:
             # Queue is full, remove oldest value
             self._queue_sum -= self.queue[0]
         self.queue.append(reward_per_second)
         self._queue_sum += reward_per_second
-        # Average over however many samples we have so far, so the curve
-        # isn't blank for the first `window_size` steps of every run.
-        self._average_reward_per_second = self._queue_sum / len(self.queue)
 
-        self.buffer.append(
-            [self.step, reward, self._average_reward_per_second, self._mean_return]
-        )
+        self.step += 1
+        if len(self.queue) == self.window_size:
+            self._average_reward_per_second = self._queue_sum / self.window_size
+            self.buffer.append(
+                [self.step, reward, self._average_reward_per_second, self._mean_return]
+            )
 
     def record_episode_return(self, episode_return):
         """Record a completed episode return and refresh the running mean."""
