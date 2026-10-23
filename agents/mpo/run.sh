@@ -1,4 +1,22 @@
-SCRIPT="mpo_acme.py"
+SCRIPT="mpo_acme_withkl_cudagraph.py"
+
+# Learn on sim.
+if [ "$1" == "sim" ]; then
+    python3 "${SCRIPT}" \
+        --render_mode rgb_array \
+        --dt 0.12 \
+        --env_id SimEmbodiedAnt \
+        --learning_starts 2000 \
+        --task_type back_and_forth \
+        --runs_directory runs_sim_new_refactored_code \
+        --exp_name trial_1 \
+        --seed 1 \
+        --cuda \
+        --radius 1.0 \
+        --origin_back_and_forth 0 0 \
+        --model_path ../../sim/assets/open-ant/ant_with_camera_after_sys_id.xml
+        # --eval True
+fi
 
 # Learn on hardware.
 if [ "$1" == "hw" ]; then
@@ -12,7 +30,9 @@ if [ "$1" == "hw" ]; then
         --runs_directory runs_hw_new_refactored_code \
         --exp_name trial_1 \
         --seed 1 \
-        --cuda
+        --cuda \
+        --radius 1.0 \
+        --origin 0,0
         # --eval True
 fi
 
