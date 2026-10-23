@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Callable, Sequence
+from typing import List, Optional, Callable, Sequence
 import numpy as np
 import torch.distributions as dist
 from torch.distributions import Independent, Normal, MultivariateNormal
@@ -293,8 +293,7 @@ def td_learning(v_tm1, r_t, pcont_t, v_t):
 def quantile_huber_loss(
     current_quantiles: torch.Tensor,
     target_quantiles: torch.Tensor,
-    cum_prob: torch.Tensor | None = None,
-    sum_over_quantiles: bool = False,
+    sum_over_quantiles: bool = True,
     huber_param: float = 1.0,
 ) -> torch.Tensor:
     """
@@ -325,18 +324,21 @@ def quantile_huber_loss(
     if current_quantiles.ndim not in (2, 3):
         raise ValueError(f"Error: The dimension of current_quantiles ({current_quantiles.ndim}) needs to be either 2 or 3.")
 
-    if cum_prob is None:
-        n_quantiles = current_quantiles.shape[-1]
-        # Cumulative probabilities to calculate quantiles.
-        cum_prob = (torch.arange(n_quantiles, device=current_quantiles.device, dtype=current_quantiles.dtype) + 0.5) / n_quantiles
-        if current_quantiles.ndim == 2:
+    
+   
+    n_quantiles = current_quantiles.shape[-1]
+    # Cumulative probabilities to calculate quantiles.
+    tau = (torch.arange(n_quantiles, device=current_quantiles.device, dtype=current_quantiles.dtype) + 0.5) / n_quantiles
+        # if a single critic
+    if current_quantiles.ndim == 2:
             # For QR-DQN, current_quantiles have a shape (batch_size, n_quantiles), and make cum_prob
             # broadcastable to (batch_size, n_quantiles, n_target_quantiles)
-            cum_prob = cum_prob.view(1, -1, 1)
-        elif current_quantiles.ndim == 3:
-            # For TQC, current_quantiles have a shape (batch_size, n_critics, n_quantiles), and make cum_prob
-            # broadcastable to (batch_size, n_critics, n_quantiles, n_target_quantiles)
-            cum_prob = cum_prob.view(1, 1, -1, 1)
+        tau = tau.view(1, -1, 1)
+    # if multiple critics?
+    elif current_quantiles.ndim == 3:
+        # For TQC, current_quantiles have a shape (batch_size, n_critics, n_quantiles), and make cum_prob
+        # broadcastable to (batch_size, n_critics, n_quantiles, n_target_quantiles)
+        tau = tau.view(1, 1, -1, 1)
 
     # QR-DQN
     # target_quantiles: (batch_size, n_target_quantiles) -> (batch_size, 1, n_target_quantiles)
@@ -354,7 +356,7 @@ def quantile_huber_loss(
         huber_param * (abs_pairwise_delta - 0.5 * huber_param),
         pairwise_delta**2 * 0.5,
     )
-    loss = torch.abs(cum_prob - (pairwise_delta.detach() < 0).float()) * huber_loss
+    loss = torch.abs(tau - (pairwise_delta.detach() < 0).float()) * huber_loss
     if sum_over_quantiles:
         loss = loss.sum(dim=-2).mean()
     else:
@@ -458,11 +460,13 @@ class ScalarAcmeCritic(nn.Module):
         action_low: np.ndarray,
         action_high: np.ndarray,
         layer_sizes: Sequence[int] = (512, 512, 256),
+        clip_action: bool = True,
     ) -> None:
         super().__init__()
 
         self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
         self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
+        self.clip_action = clip_action
         
         self.torso = AcmeLayerNormMLP(
             input_size=obs_dim + act_dim,
@@ -479,7 +483,8 @@ class ScalarAcmeCritic(nn.Module):
         observation = observation.reshape(observation.shape[0],-1)
         action = action.reshape(action.shape[0],-1)
 
-        action = torch.clamp(action,self.action_low,self.action_high)
+        if self.clip_action:
+            action = torch.clamp(action,self.action_low,self.action_high)
         action = action.to(dtype=observation.dtype,device=observation.device)
         inputs = torch.cat([observation, action],dim=-1)
 
@@ -496,11 +501,13 @@ class QuantileCritic(nn.Module):
         action_high: np.ndarray,
         layer_sizes: Sequence[int] = (512, 512, 256),
         num_quantiles: int = 201,
+        clip_action: bool = True,
     ) -> None:
         super().__init__()
 
         self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
         self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
+        self.clip_action = clip_action
         
         self.torso = AcmeLayerNormMLP(
             input_size=obs_dim + act_dim,
@@ -517,13 +524,58 @@ class QuantileCritic(nn.Module):
         observation = observation.reshape(observation.shape[0],-1)
         action = action.reshape(action.shape[0],-1)
 
-        action = torch.clamp(action,self.action_low,self.action_high)
+        if self.clip_action:
+            action = torch.clamp(action,self.action_low,self.action_high)
         action = action.to(dtype=observation.dtype,device=observation.device)
         inputs = torch.cat([observation, action],dim=-1)
 
         torso_output = self.torso(inputs)  # (B, 256)
         quantiles = self.quantile_head(torso_output)
         return quantiles
+
+
+class TQCCritic(nn.Module):
+    """
+    Quantile critic matching tqc_pytorch (tqc/structures.py: Critic + Mlp):
+    n_nets independent MLPs on cat(obs, act), each hidden_sizes with ReLU,
+    PyTorch default init, no LayerNorm, no action clamping, linear output of n_quantiles.
+    Returns (B, n_nets, n_quantiles).
+    """
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        n_quantiles: int = 125,
+        n_nets: int = 1,
+        hidden_sizes: Sequence[int] = (512, 512, 512),
+    ) -> None:
+        super().__init__()
+        self.n_quantiles = n_quantiles
+        self.n_nets = n_nets
+
+        nets = []
+        for _ in range(n_nets):
+            layers: list[nn.Module] = []
+            in_size = obs_dim + act_dim
+            for hidden_size in hidden_sizes:
+                layers.extend([nn.Linear(in_size, hidden_size), nn.ReLU()])
+                in_size = hidden_size
+            # add n_quantiles as output layer
+            layers.append(nn.Linear(in_size, n_quantiles))
+            nets.append(nn.Sequential(*layers))
+        self.nets = nn.ModuleList(nets)
+
+    def forward(self, observation: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        observation = observation.reshape(observation.shape[0], -1)
+        action = action.reshape(action.shape[0], -1)
+        # no action clipping before inputting into critic for tqc critic
+        sa = torch.cat([observation, action], dim=1)
+    
+        # number of nets = num of quantile critics. test 1 for now.
+        quantiles = torch.stack([net(sa) for net in self.nets], dim=1)  # (B, n_nets, n_quantiles)
+        return quantiles # shape [B, n_nets, n_quantiles]
+
+
 class AcmeCritic(nn.Module):
     def __init__(
         self,
@@ -535,11 +587,13 @@ class AcmeCritic(nn.Module):
         vmin: float = -500.0,
         vmax: float = 20.0,
         num_atoms: int = 101,
+        clip_action: bool = True,
     ) -> None:
         super().__init__()
 
         self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
         self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
+        self.clip_action = clip_action
         
         self.torso = AcmeLayerNormMLP(
             input_size=obs_dim + act_dim,
@@ -560,7 +614,8 @@ class AcmeCritic(nn.Module):
         observation = observation.reshape(observation.shape[0],-1)
         action = action.reshape(action.shape[0],-1)
 
-        action = torch.clamp(action,self.action_low,self.action_high)
+        if self.clip_action:
+            action = torch.clamp(action,self.action_low,self.action_high)
         action = action.to(dtype=observation.dtype,device=observation.device)
         inputs = torch.cat([observation, action],dim=-1)
 
@@ -568,3 +623,145 @@ class AcmeCritic(nn.Module):
         torso_output = self.torso(inputs)  # (B, 256)
         distribution = self.distributional_head(torso_output)
         return distribution
+
+class DefaultActor(nn.Module):
+    def __init__(self,
+                 env,
+                 hidden_dims: List[int] = [256, 256, 256],
+                 use_layer_norm: bool = False,
+                 min_scale: float = 1e-3,
+                 init_scale: float = 0.5,):
+        super().__init__()
+        obs_dim = int(np.array(env.single_observation_space.shape).prod())
+        act_dim = int(np.prod(env.single_action_space.shape))
+        self.min_scale = min_scale
+
+        self.register_buffer("action_low",torch.tensor(env.single_action_space.low, dtype=torch.float32))
+        self.register_buffer("action_high",torch.tensor(env.single_action_space.high, dtype=torch.float32))
+        
+        layers = []
+        prev = obs_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev, h))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(h))
+            layers.append(nn.ReLU())
+            prev = h
+        self.net = nn.Sequential(*layers)
+        self.mu_head = nn.Linear(prev, act_dim)
+        self.log_sigma_head = nn.Linear(prev, act_dim)
+
+        self._softplus_bias = float(np.log(np.exp(init_scale - min_scale) - 1.0))
+
+        self.apply(self._init_weights)
+        with torch.no_grad():
+            self.log_sigma_head.bias.fill_(self._softplus_bias)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> dist.Independent:
+        logits = self.net(x)
+        mu = self.action_low + (self.action_high - self.action_low) * torch.sigmoid(self.mu_head(logits))
+        sigma = F.softplus(self.log_sigma_head(logits)) + self.min_scale
+        return dist.Independent(dist.Normal(mu, sigma), 1)
+
+    def get_log_probs(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        d = self.forward(obs)
+        return d.log_prob(action).unsqueeze(-1)
+
+class Actor(nn.Module):
+    def __init__(
+            self,
+            obs_dim: int,
+            act_dim: int,
+            act_low: np.ndarray,
+            act_high: np.ndarray,
+            layer_sizes: Sequence[int] = (256, 256, 256),
+            init_scale: float = 0.3,   
+            min_scale: float = 1e-6,    # originally 1e-6
+            use_layer_norm: bool = True,
+    ) -> None:
+        # Same mean/stddev formulation as AcmeActor's MultivariateNormalDiagHead,
+        # but every nn.Linear keeps PyTorch's default weight init. Biases are zeroed, as in AcmeActor.
+        super().__init__()
+        self.register_buffer("action_low",torch.as_tensor(act_low, dtype=torch.float32))
+        self.register_buffer("action_high",torch.as_tensor(act_high, dtype=torch.float32))
+        self.init_scale = float(init_scale)
+        self.min_scale = float(min_scale)
+
+        layers = []
+        prev = obs_dim
+        for h in layer_sizes:
+            layers.append(nn.Linear(prev, h))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(h))
+            layers.append(nn.ReLU())
+            prev = h
+        self.net = nn.Sequential(*layers)
+        self.mu_head = nn.Linear(prev, act_dim)
+        self.sigma_head = nn.Linear(prev, act_dim)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> dist.Independent:
+        x = x.reshape(x.shape[0], -1)
+        features = self.net(x)
+        # unsquashed raw output = mean
+        mu = self.mu_head(features)
+        # some transformation to output. sigma = init_scale when the raw output is 0
+        sigma = F.softplus(self.sigma_head(features)) * self.init_scale / math.log(2.0) + self.min_scale
+        return dist.Independent(dist.Normal(mu, sigma), 1)
+
+    def get_log_probs(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        d = self.forward(obs)
+        return d.log_prob(action).unsqueeze(-1)
+    
+class Critic(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        layer_sizes: Sequence[int] = (512, 512, 256),
+        use_layer_norm: bool = False,
+        clip_action: bool = True,
+    ) -> None: 
+        super().__init__()
+        self.register_buffer("action_low",torch.as_tensor(action_low, dtype=torch.float32))
+        self.register_buffer("action_high",torch.as_tensor(action_high, dtype=torch.float32))
+        self.clip_action = clip_action
+        
+        layers = []
+        prev = obs_dim + act_dim
+        for h in layer_sizes:
+            layers.append(nn.Linear(prev, h))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(h))
+            layers.append(nn.ReLU())
+            prev = h
+        layers.append(nn.Linear(prev, 1))
+        self.net = nn.Sequential(*layers)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.constant_(m.bias, 0.0)
+
+    def forward(self,observation: torch.Tensor,action: torch.Tensor) -> torch.Tensor:
+        # Clip action
+        observation = observation.reshape(observation.shape[0],-1)
+        action = action.reshape(action.shape[0],-1)
+
+        if self.clip_action:
+            action = torch.clamp(action,self.action_low,self.action_high)
+        action = action.to(dtype=observation.dtype,device=observation.device)
+        inputs = torch.cat([observation, action],dim=-1)
+        
+        return self.net(inputs)
