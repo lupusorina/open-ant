@@ -14,7 +14,8 @@ if [ "$1" == "sim" ]; then
         --cuda \
         --radius 1.0 \
         --origin_back_and_forth 0 0 \
-        --model_path ../../sim/assets/open-ant/ant_with_camera_after_sys_id.xml
+        --model_path ../../sim/assets/open-ant/ant_sim_2.xml \
+        --weights_path runs_sim_new_refactored_code/trial_1_20261023-135205_seed_1/weights_and_args
         # --eval True
 fi
 

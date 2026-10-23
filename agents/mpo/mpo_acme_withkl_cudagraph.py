@@ -1090,8 +1090,19 @@ class MPO:
             self.rb.save(os.path.join(self.weights_folder, f"replay_buffer_{self.global_step}.npz"))
 
     def load_checkpoint(self, weights_path, checkpoint_step=None):
+        weights_path = os.path.abspath(weights_path.rstrip("/"))
+        if os.path.basename(weights_path) != "weights_and_args":
+            nested = os.path.join(weights_path, "weights_and_args")
+            if os.path.isdir(nested):
+                weights_path = nested
         checkpoint_files = [f for f in os.listdir(weights_path) if f.endswith(".pth")]
         checkpoint_files.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
+
+        if not checkpoint_files:
+            raise FileNotFoundError(
+                f"No .pth checkpoints in {weights_path}. "
+                "--weights_path must be a weights_and_args directory."
+            )
 
         if checkpoint_step is None:
             checkpoint_file = checkpoint_files[-1]
@@ -1338,7 +1349,7 @@ def parse_args(argv=None):
         help="Embodied Ant id (EAnt / SimEmbodiedAnt / HwEmbodiedAnt) or Gymnasium "
              "MuJoCo id (Hopper-v5, Walker2d-v5, Humanoid-v5, Ant-v5, ...)",
     )
-    parser.add_argument("--total_timesteps", type=int, default=60_000)
+    parser.add_argument("--total_timesteps", type=int, default=120_000)
     parser.add_argument("--num_envs", type=int, default=1)
 
     parser.add_argument("--buffer_size", type=int, default=int(1e6))

@@ -17,12 +17,13 @@ try:
     gym.register_envs(shimmy)
 except ImportError:
     shimmy = None
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../sim")))
+# This module lives in agents/mpo/envs/. sim/ and embodied_ant_env/ are siblings of agents/.
+_MPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.abspath(os.path.join(_MPO_DIR, "../../sim")))
 from ant_mujoco import AntEnv
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../embodied_ant_env")))
+sys.path.insert(0, os.path.abspath(os.path.join(_MPO_DIR, "../../embodied_ant_env")))
 from embodied_ant_env import make_ant_env
-from rccar_env import RCCarEnv
 
 import mini_pi_walk_env  # noqa: F401  registers MiniPiWalk-v0 (sim/ is on sys.path above)
 
@@ -150,7 +151,7 @@ def _make_embodied_ant_env(args, task, seed, idx, disk_folder, run_name, runs_di
             terminate_on_upside_down=args.terminate_on_upside_down,
             task=task,
             joint_config=joint_config,
-            model_path=os.path.join(os.path.dirname(__file__), args.model_path),
+            model_path=os.path.join(_MPO_DIR, args.model_path),
         )
     else:
         with open(args.hw_config, "r") as f:
@@ -169,6 +170,8 @@ def _make_embodied_ant_env(args, task, seed, idx, disk_folder, run_name, runs_di
 
 
 def _make_rccar_env(args, seed, reward_scale):
+    from rccar_env import RCCarEnv
+
     env = RCCarEnv(
         dynamics=RCCAR_ENV_IDS[args.env_id],
         domain_randomization=getattr(args, "rccar_domain_randomization", "per_env"),
