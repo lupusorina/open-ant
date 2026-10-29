@@ -1,23 +1,63 @@
 SCRIPT="mpo_acme_withkl_cudagraph.py"
 
 # Learn on sim.
-if [ "$1" == "sim" ]; then
+if [ "$1" == "sim_60_000" ]; then
     python3 "${SCRIPT}" \
         --render_mode rgb_array \
         --dt 0.12 \
         --env_id SimEmbodiedAnt \
         --learning_starts 2000 \
         --task_type back_and_forth \
-        --runs_directory runs_sim_new_refactored_code \
-        --exp_name trial_1 \
+        --runs_directory runs_compare_acme_total_timesteps \
+        --exp_name trial_1_60_000_continual \
         --seed 1 \
         --cuda \
         --radius 1.0 \
         --origin_back_and_forth 0 0 \
+        --total_timesteps 120_000 \
         --model_path ../../sim/assets/open-ant/ant_sim_2.xml \
-        --weights_path runs_sim_new_refactored_code/trial_1_20261023-135205_seed_1/weights_and_args
+        --weights_path runs_compare_acme_total_timesteps/trial_1_60_000_20261027-112728_seed_1/weights_and_args
         # --eval True
 fi
+
+if [ "$1" == "sim_100_000" ]; then
+    python3 "${SCRIPT}" \
+        --render_mode rgb_array \
+        --dt 0.12 \
+        --env_id SimEmbodiedAnt \
+        --learning_starts 2000 \
+        --task_type back_and_forth \
+        --runs_directory runs_compare_acme_total_timesteps \
+        --exp_name trial_1_100_000_continual \
+        --seed 1 \
+        --cuda \
+        --radius 1.0 \
+        --origin_back_and_forth 0 0 \
+        --total_timesteps 200_000 \
+        --model_path ../../sim/assets/open-ant/ant_sim_2.xml \
+        --weights_path runs_compare_acme_total_timesteps/trial_1_100_000_20261027-112739_seed_1/weights_and_args
+        # --eval True
+fi
+
+if [ "$1" == "sim_150_000" ]; then
+    python3 "${SCRIPT}" \
+        --render_mode rgb_array \
+        --dt 0.12 \
+        --env_id SimEmbodiedAnt \
+        --learning_starts 2000 \
+        --task_type back_and_forth \
+        --runs_directory runs_compare_acme_total_timesteps \
+        --exp_name trial_1_150_000_continual \
+        --seed 1 \
+        --cuda \
+        --radius 1.0 \
+        --origin_back_and_forth 0 0 \
+        --total_timesteps 300_000 \
+        --model_path ../../sim/assets/open-ant/ant_sim_2.xml \
+        --weights_path runs_compare_acme_total_timesteps/trial_1_150_000_20261027-112743_seed_1/weights_and_args
+        # --eval True
+fi
+
 
 # Learn on hardware.
 if [ "$1" == "hw" ]; then
