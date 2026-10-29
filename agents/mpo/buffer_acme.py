@@ -51,25 +51,20 @@ class ReplayBufferSamples(NamedTuple):
     rewards: th.Tensor
 
 class NStepReplayBufferSamples(NamedTuple):
-    # observations: th.Tensor           # (B, obs_dim) 
-    # actions: th.Tensor                
-    # next_observations: th.Tensor      
-    # dones: th.Tensor                  # (B, n_step, 1)
-
-    # # episode boundary done: termination OR truncation
-    # # Used to stop retrace/n-step continuation across resets
-    # episode_dones: th.Tensor          # (B, n_step, 1)
-
-    # rewards: th.Tensor                
-    # all_observations: th.Tensor       # (B, n_step, obs_dim)
-    # all_next_observations: th.Tensor 
-    # all_actions: th.Tensor            
-    # behavior_log_probs: th.Tensor     # (B, n_step, 1)
-    observations: th.Tensor       # (B, obs_dim)
-    actions: th.Tensor            # (B, act_dim)
-    rewards: th.Tensor            # (B, 1), collapsed n-step reward
-    discounts: th.Tensor          # (B, 1), collapsed ACME discount
-    next_observations: th.Tensor  # (B, obs_dim), final arrival state
+    observations: th.Tensor              # (B, obs_dim), s_t
+    actions: th.Tensor                   # (B, act_dim), a_t
+    rewards: th.Tensor                   # (B, N), individual rewards
+    all_observations: th.Tensor          # (B, N, obs_dim)
+    all_next_observations: th.Tensor     # (B, N, obs_dim)
+    all_actions: th.Tensor               # (B, N, act_dim)
+    behavior_log_probs: th.Tensor        # (B, N), recorded when action was sampled
+    terminations: th.Tensor             # (B, N)
+    truncations: th.Tensor              # (B, N)
+    # observations: th.Tensor       # (B, obs_dim)
+    # actions: th.Tensor            # (B, act_dim)
+    # rewards: th.Tensor            # (B, 1), collapsed n-step reward
+    # discounts: th.Tensor          # (B, 1), collapsed ACME discount
+    # next_observations: th.Tensor  # (B, obs_dim), final arrival state
 
 
 def get_action_dim(action_space: spaces.Space) -> int:
@@ -319,7 +314,7 @@ class ReplayBuffer(BaseBuffer):
             self.next_observations = th.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=th.float32, device=self.device)
 
         self.actions = th.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=th.float32, device=self.device)
-        #self.behavior_log_probs = th.zeros((self.buffer_size, self.n_envs, 1), dtype=th.float32, device=self.device)
+        self.behavior_log_probs = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=self.device)
 
         self.rewards = th.zeros((self.buffer_size, self.n_envs), dtype=th.float32, device=self.device)
         self.terminations = th.zeros((self.buffer_size, self.n_envs),
@@ -362,6 +357,7 @@ class ReplayBuffer(BaseBuffer):
         terminated: th.Tensor,
         truncated: th.Tensor,
         valid: th.Tensor | None = None,
+        behavior_log_prob: th.Tensor | None = None,
     ) -> None:
 
         # Copy to avoid modification by reference
@@ -369,8 +365,9 @@ class ReplayBuffer(BaseBuffer):
 
         self.next_observations[self.pos].copy_(next_obs)
         self.actions[self.pos].copy_(action.view(self.n_envs, self.action_dim))
-        # if behavior_log_prob is not None:
-        #     self.behavior_log_probs[self.pos].copy_(behavior_log_prob.view(self.n_envs, 1))
+        if behavior_log_prob is None:
+            raise ValueError("behavior_log_prob is required for importance-sampled TD(N)")
+        self.behavior_log_probs[self.pos].copy_(behavior_log_prob.view(self.n_envs))
         self.rewards[self.pos].copy_(reward.view(self.n_envs))
 
         self.terminations[self.pos].copy_(
@@ -386,21 +383,7 @@ class ReplayBuffer(BaseBuffer):
             )
         else:
             self.valid[self.pos].fill_(1.0)
-        #_______________________________________________________________________________
-        # if self.handle_timeout_termination:
-        #     if truncation is not None:
-        #         self.timeouts[self.pos].copy_(
-        #             truncation.to(self.device).float().view(self.n_envs)
-        #         )
-        #     else:
-        #         self.timeouts[self.pos].copy_(
-        #             th.as_tensor(
-        #                 [info.get("TimeLimit.truncated", False) for info in infos],
-        #                 dtype=th.float32,
-        #                 device=self.device,
-        #             ).view(self.n_envs)
-        #         )
-        # #____________________________________________________________________________________
+
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -488,12 +471,17 @@ class ReplayBuffer(BaseBuffer):
         return self._get_nstep_samples(batch_inds, env_inds, n_step, gamma)
         
     def _get_nstep_samples(self, batch_inds, env_inds, n_step: int, gamma: float,) -> "NStepReplayBufferSamples":
+        # batch size.
         batch_inds = th.as_tensor(batch_inds, dtype=th.long, device=self.device)
         env_inds = th.as_tensor(env_inds, dtype=th.long, device=self.device)
+        # n step = td horizon, number of consecutive transitions sampled.
         offsets = th.arange(n_step, dtype=th.long, device=self.device).unsqueeze(0)
+        # batch_inds.unsqueeze(1) give vector of all 256 indices in batch.
+        # offset = the td horizon steps. thus at each batch index, want the next n transitions
         all_inds = (batch_inds.unsqueeze(1) + offsets) % self.buffer_size
             # shape of rewards, dones, timeouts = [buffer-rows, num-envs]
             # unsqueeze(1) turns a row of env ids being sampled into 1 column
+        # get reward at every batch index, and every batch index's corresponding t + n transitions
         rewards = self.rewards[all_inds, env_inds.unsqueeze(1)]
         
         terminations = self.terminations[all_inds, env_inds.unsqueeze(1)]
@@ -502,81 +490,85 @@ class ReplayBuffer(BaseBuffer):
         # and env_inds[b] - which supplies the environment coordinate.
         # Episode boundary = termination or truncation
         
-        boundaries = terminations | truncations 
-        # environment discount = 1 - termination. no bootstrapping in termination, but have bootstrapping in truncation
-        env_discounts = (~terminations).to(rewards.dtype)       
+        # boundaries = terminations | truncations 
+        # # environment discount = 1 - termination. no bootstrapping in termination, but have bootstrapping in truncation
+        # env_discounts = (~terminations).to(rewards.dtype)       
         
-        # array that is like the b"boundaries" tensor, but shift eveyrthing 1 position right 
-        # so it would indicate whether the previous transition is a boundary. 
-        prior_boundaries = th.cat(
-            [th.zeros_like(boundaries[:, :1]), boundaries[:, :-1]], dim=1)
-        # if the prev transition is reaching an s_t+1 = boundary, this transition is not valid
-        valid = th.cumprod((~prior_boundaries).to(rewards.dtype), dim=1)
+        # # array that is like the b"boundaries" tensor, but shift eveyrthing 1 position right 
+        # # so it would indicate whether the previous transition is a boundary. 
+        # prior_boundaries = th.cat(
+        #     [th.zeros_like(boundaries[:, :1]), boundaries[:, :-1]], dim=1)
+        # # if the prev transition is reaching an s_t+1 = boundary, this transition is not valid
+        # valid = th.cumprod((~prior_boundaries).to(rewards.dtype), dim=1)
 
-        # Product of environment discounts before each reward:
-        # reward 0 multiplier has no preceding discount
-        preceding_env_discount = th.cumprod(
-            th.cat(
-                [th.ones_like(env_discounts[:, :1]),env_discounts[:, :-1]],
-                dim=1), dim=1)
+        # # Product of environment discounts before each reward:
+        # # reward 0 multiplier has no preceding discount
+        # preceding_env_discount = th.cumprod(
+        #     th.cat(
+        #         [th.ones_like(env_discounts[:, :1]),env_discounts[:, :-1]],
+        #         dim=1), dim=1)
 
-        gamma_tensor = th.as_tensor(
-            gamma,dtype=rewards.dtype,device=self.device)
+        # gamma_tensor = th.as_tensor(
+        #     gamma,dtype=rewards.dtype,device=self.device)
 
-        # gamma_powers = [1, gamma, gamma^2, ..., gamma^(n_step-1)]
-        gamma_powers = th.pow(
-            gamma_tensor,
-            th.arange(n_step,dtype=rewards.dtype,device=self.device)).unsqueeze(0)
+        # # gamma_powers = [1, gamma, gamma^2, ..., gamma^(n_step-1)]
+        # gamma_powers = th.pow(
+        #     gamma_tensor,
+        #     th.arange(n_step,dtype=rewards.dtype,device=self.device)).unsqueeze(0)
 
-        # n-step reward: r_0 + gamma*d_0*r_1 + ...
-        # sum of all the V[b,k] * gamma^k * r[b,k] * preceding-env-discount
-        # note, if preceding_env_discount[b,k] = 0: means termination = true at the last transition
-        # so reward term k and subsequent terms all = 0 (zero bootstrapping)
-        # include rewards up to & including the boundary transition
-        # and exclude rewrds from after the boundary 
-        collapsed_rewards = (
-            valid
-            * preceding_env_discount
-            * gamma_powers
-            * rewards
-        ).sum(dim=1,keepdim=True)
+        # # n-step reward: r_0 + gamma*d_0*r_1 + ...
+        # # sum of all the V[b,k] * gamma^k * r[b,k] * preceding-env-discount
+        # # note, if preceding_env_discount[b,k] = 0: means termination = true at the last transition
+        # # so reward term k and subsequent terms all = 0 (zero bootstrapping)
+        # # include rewards up to & including the boundary transition
+        # # and exclude rewrds from after the boundary 
+        # collapsed_rewards = (
+        #     valid
+        #     * preceding_env_discount
+        #     * gamma_powers
+        #     * rewards
+        # ).sum(dim=1,keepdim=True)
 
-        # trajectory length / number of included transitions 
-        horizons = valid.sum(dim=1).to(th.long)  # (B,)
+        # # trajectory length / number of included transitions 
+        # horizons = valid.sum(dim=1).to(th.long)  # (B,)
 
-        # Product of environment discounts over included transitions
-        # if "valid = true", use value at "env_discounts"
-        # if valid = false, put "1" there since it won't influence the env_discount_product 
-        included_env_discounts = th.where(
-            valid.bool(),
-            env_discounts,
-            th.ones_like(env_discounts))
+        # # Product of environment discounts over included transitions
+        # # if "valid = true", use value at "env_discounts"
+        # # if valid = false, put "1" there since it won't influence the env_discount_product 
+        # included_env_discounts = th.where(
+        #     valid.bool(),
+        #     env_discounts,
+        #     th.ones_like(env_discounts))
 
-        env_discount_product = included_env_discounts.prod(
-            dim=1,
-            keepdim=True)
+        # env_discount_product = included_env_discounts.prod(
+        #     dim=1,
+        #     keepdim=True)
 
-        #  stores gamma^(horizon - 1) * product(environment discounts)
-        # then during training, the learner applies the final gamma
-        collapsed_discounts = (
-            th.pow(gamma_tensor,horizons.to(rewards.dtype) - 1.0).unsqueeze(-1)
-            * env_discount_product)
+        # #  stores gamma^(horizon - 1) * product(environment discounts)
+        # # then during training, the learner applies the final gamma
+        # collapsed_discounts = (
+        #     th.pow(gamma_tensor,horizons.to(rewards.dtype) - 1.0).unsqueeze(-1)
+        #     * env_discount_product)
 
-        # Select s_{t+horizon}
-        last_inds = (batch_inds + horizons - 1) % self.buffer_size
+        # # Select s_{t+horizon}
+        # last_inds = (batch_inds + horizons - 1) % self.buffer_size
 
-        observations = self.observations[batch_inds,env_inds]
+        # observations = self.observations[batch_inds,env_inds]
 
-        actions = self.actions[batch_inds,env_inds]
-        # self.next_obs[t+n-1] = s_t+n
-        next_observations = self.next_observations[last_inds,env_inds]
+        # actions = self.actions[batch_inds,env_inds]
+        
+        # next_observations = self.next_observations[last_inds,env_inds]
 
         return NStepReplayBufferSamples(
-            observations=observations,
-            actions=actions,
-            rewards=collapsed_rewards,
-            discounts=collapsed_discounts,
-            next_observations=next_observations,
+            observations=self.observations[batch_inds, env_inds],
+            actions=self.actions[batch_inds, env_inds],
+            rewards=rewards,
+            all_observations=self.observations[all_inds, env_inds.unsqueeze(1)],
+            all_next_observations=self.next_observations[all_inds, env_inds.unsqueeze(1)],
+            all_actions=self.actions[all_inds, env_inds.unsqueeze(1)],
+            behavior_log_probs=self.behavior_log_probs[all_inds, env_inds.unsqueeze(1)],
+            terminations=terminations,
+            truncations=truncations,
         )
 
     def save(self, filepath: str) -> None:
@@ -591,7 +583,7 @@ class ReplayBuffer(BaseBuffer):
             observations=self.observations.cpu().numpy(),
             next_observations=self.next_observations.cpu().numpy(),
             actions=self.actions.cpu().numpy(),
-           # behavior_log_probs=self.behavior_log_probs.cpu().numpy(),
+            behavior_log_probs=self.behavior_log_probs.cpu().numpy(),
             rewards=self.rewards.cpu().numpy(),
             terminations=self.terminations.cpu().numpy(),
             truncations=self.truncations.cpu().numpy(),
@@ -607,7 +599,10 @@ class ReplayBuffer(BaseBuffer):
         self.observations = th.from_numpy(data['observations']).to(self.device)
         self.next_observations = th.from_numpy(data['next_observations']).to(self.device)
         self.actions = th.from_numpy(data['actions']).to(self.device)
-       # self.behavior_log_probs = th.from_numpy(data['behavior_log_probs']).to(self.device) if 'behavior_log_probs' in data else th.zeros_like(self.behavior_log_probs)
+        # zeros would silently give wrong IS ratios, so refuse buffers saved without log probs
+        if 'behavior_log_probs' not in data:
+            raise ValueError(f"{filepath} has no behavior_log_probs; cannot resume importance-sampled TD(N)")
+        self.behavior_log_probs = th.from_numpy(data['behavior_log_probs']).to(self.device)
         self.rewards = th.from_numpy(data['rewards']).to(self.device)
         self.terminations = th.from_numpy(data["terminations"]).to(self.device)
         self.truncations = th.from_numpy(data["truncations"]).to(self.device)
