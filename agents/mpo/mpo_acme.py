@@ -1184,7 +1184,7 @@ def parse_args(argv=None):
     parser.add_argument("--learning_starts", type=int, default=200)
     parser.add_argument("--policy_lr", type=float, default=3e-4)
     parser.add_argument("--q_lr", type=float, default=1e-3)
-    parser.add_argument("--gamma", type=float, default=0.92)
+    parser.add_argument("--gamma", type=float, default=0.99)
     # layer norm arg is only effective if old Actor class is used rather than AcmeActo
     parser.add_argument("--use_layer_norm", action=argparse.BooleanOptionalAction, default=True) 
 
