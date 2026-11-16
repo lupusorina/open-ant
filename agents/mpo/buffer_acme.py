@@ -70,6 +70,8 @@ class NStepReplayBufferSamples(NamedTuple):
     rewards: th.Tensor            # (B, 1), collapsed n-step reward
     discounts: th.Tensor          # (B, 1), collapsed ACME discount
     next_observations: th.Tensor  # (B, obs_dim), final arrival state
+    sources: th.Tensor | None = None  # (B,), index into ReplayBuffer.source_names of each sampled start transition
+    slots: th.Tensor | None = None    # (B,), buffer slot of each sampled start transition (td_terms.csv)
 
 
 def get_action_dim(action_space: spaces.Space) -> int:
@@ -337,6 +339,12 @@ class ReplayBuffer(BaseBuffer):
         # should not be sampled
         self.valid = th.ones((self.buffer_size, self.n_envs), dtype=th.bool, device=self.device)
 
+        # Which env XML each transition came from: an index into source_names (set_source).
+        # 0 = "unknown": nothing set, or a buffer saved before this existed.
+        self.source = th.zeros((self.buffer_size, self.n_envs), dtype=th.uint8, device=self.device)
+        self.source_names = ["unknown"]
+        self.current_source = 0
+
         if psutil is not None:
             total_memory_usage: float = (
                 self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.terminations.nbytes + self.truncations.nbytes)
@@ -352,6 +360,12 @@ class ReplayBuffer(BaseBuffer):
                     "This system does not have apparently enough memory to store the complete "
                     f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
                 )
+
+    def set_source(self, name: str) -> None:
+        """Transitions added from now on are tagged with this name (e.g. the model XML). Kept across load()."""
+        if name not in self.source_names:
+            self.source_names.append(name)
+        self.current_source = self.source_names.index(name)
 
     def add(
         self,
@@ -401,6 +415,7 @@ class ReplayBuffer(BaseBuffer):
         #             ).view(self.n_envs)
         #         )
         # #____________________________________________________________________________________
+        self.source[self.pos].fill_(self.current_source)
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -577,6 +592,8 @@ class ReplayBuffer(BaseBuffer):
             rewards=collapsed_rewards,
             discounts=collapsed_discounts,
             next_observations=next_observations,
+            sources=self.source[batch_inds, env_inds],
+            slots=batch_inds,
         )
 
     def save(self, filepath: str) -> None:
@@ -598,9 +615,13 @@ class ReplayBuffer(BaseBuffer):
             pos=self.pos,
             full=self.full,
             valid=self.valid.cpu().numpy(),
+            source=self.source.cpu().numpy(),
+            source_names=np.array(self.source_names),
         )
 
-    def load(self, filepath: str, device: th.device | str = "auto") -> None:
+    def load(self, filepath: str, device: th.device | str = "auto", untagged_source: str | None = None) -> None:
+        """untagged_source: the name for every transition of a buffer saved before sources were recorded
+        (e.g. the XML of the run that saved it); "unknown" if not given."""
         data = np.load(filepath)
 
         # Keep internal storage as numpy arrays.
@@ -615,6 +636,14 @@ class ReplayBuffer(BaseBuffer):
         self.pos = int(data['pos'])
         self.full = bool(data['full'])
         self.valid = th.from_numpy(data['valid']).to(self.device) if 'valid' in data else th.ones_like(self.terminations)
+        current = self.source_names[self.current_source]   # keep tagging new transitions as before the load
+        if 'source' in data:
+            self.source = th.from_numpy(data['source']).to(self.device)
+            self.source_names = [str(n) for n in data['source_names']]
+        else:   # saved before sources were recorded
+            self.source = th.zeros(self.terminations.shape, dtype=th.uint8, device=self.device)
+            self.source_names = [untagged_source or "unknown"]
+        self.set_source(current)
 
 
         # Only store device for later (used in to_torch)
