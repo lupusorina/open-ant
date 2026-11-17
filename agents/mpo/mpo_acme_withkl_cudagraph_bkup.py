@@ -33,6 +33,10 @@ try:
     from .resume_state import get_rng_state, set_rng_state, snapshot_envs, restore_envs
 except ImportError:
     from resume_state import get_rng_state, set_rng_state, snapshot_envs, restore_envs
+try:
+    from .dormant import DormantLogger, add_dormant_args
+except ImportError:
+    from dormant import DormantLogger, add_dormant_args
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../embodied_ant_env')))
 from embodied_ant_env import ForwardTask, BackAndForthTask
@@ -238,6 +242,17 @@ class MPO:
             self.device,
             n_envs=args.num_envs,
         )
+        self.rb.set_source(os.path.basename(args.model_path).removesuffix(".xml"))   # tag transitions with their XML
+        # Dormant neurons of the online actor / critic(s), every --dormant_every steps (dormant.py)
+        self.dormant = (DormantLogger(os.path.join(self.run_dir, "dormant_neurons.csv"),
+                                      args.dormant_batch, args.dormant_taus, args.seed)
+                        if args.dormant_every > 0 and not args.eval else None)
+        # --record_zero_neurons: dead ReLU neurons per layer and per data source (XML), see record_zero_neurons()
+        self.zero_neurons_path = os.path.join(self.run_dir, "zero_neurons_by_source.csv")
+        if args.record_zero_neurons and not args.eval and not os.path.exists(self.zero_neurons_path):
+            with open(self.zero_neurons_path, "w", newline="") as f:   # a resumed run appends to its CSV
+                csv.writer(f).writerow(["global_step", "net", "layer", "source", "neurons", "dead_neurons",
+                                        "transitions"])
 
         self.batch_size = self.args.batch_size
         self.trajectory_length = self.args.td_horizon
@@ -259,6 +274,12 @@ class MPO:
         self.reward_tracker = None
         self.csv_file_info = None
         self.csv_file_agent_vars = None
+        self.csv_file_batch_sources = None
+        self.batch_source_rows = []
+        self.csv_file_td_terms = None
+        self.writer_td_terms = None
+        self.td_terms_rows = []          # CPU rows for td_terms.csv, written every save_every_n_steps
+        self._last_batch_sources = None  # data.sources of the most recent learner update
         self.csv_file_raw_actions = None
         self.writer_raw_actions = None
         self.raw_action_buffer = []
@@ -326,7 +347,7 @@ class MPO:
         if evaluate or self.global_step > self.args.learning_starts:
             with torch.no_grad():
                 d = self.actor.forward(self.obs)
-                action = d.mean if evaluate else d.sample()
+                action = d.mean if (evaluate and not self.args.stochastic_action) else d.sample()
                 actions = action
                 actions = actions.squeeze(1) # (n_envs, act_dim)
 
@@ -358,6 +379,71 @@ class MPO:
                 if done_np[i]:
                     self.reward_tracker.record_episode_return(self._ep_returns[i])
 
+    def measure_dormant(self):
+        """Log dormant neurons of the online actor and critic(s) on a fresh replay batch (no_grad, no updates)."""
+        if self.dormant is None or self.global_step % self.args.dormant_every != 0:
+            return
+        nets = {"actor": (self.actor, "actor")}
+        for i, critic in enumerate(self.critics):
+            nets["critic" if len(self.critics) == 1 else f"critic{i}"] = (critic, "critic")
+        self.dormant.measure(self.global_step, self.rb, nets)
+
+    @torch.no_grad()
+    def record_zero_neurons(self, chunk=65536):
+        """Every --zero_neurons_every steps: run EVERY transition in the replay buffer through the online actor and
+        critic(s), and for each ReLU layer and each source XML in the buffer (e.g. Sim1, Sim2) write one row to
+        zero_neurons_by_source.csv with its number of dead neurons w.r.t. that source: neurons whose ReLU output is
+        exactly 0 for every buffer transition that came from that XML. `transitions` = how many there are.
+        Read-only: no gradients, nothing in the nets, optimizers or random state changes."""
+        if not self.args.record_zero_neurons or self.args.eval or self.global_step % self.args.zero_neurons_every != 0:
+            return
+        if self.rb.size() == 0:
+            return
+        rows = self.rb.buffer_size if self.rb.full else self.rb.pos
+        stored = self.rb.valid[:rows]                    # (rows, n_envs): which slots hold a transition
+        obs = self.rb.observations[:rows][stored]        # (transitions, obs_dim)
+        act = self.rb.actions[:rows][stored]             # (transitions, act_dim)
+        src = self.rb.source[:rows][stored]              # (transitions,): index into rb.source_names
+        src_ids = sorted(src.unique().tolist())          # the XMLs (Sim1, Sim2, ...) in the buffer right now
+        src_counts = {s: int((src == s).sum()) for s in src_ids}
+
+        nets = {"actor": self.actor}
+        for i, critic in enumerate(self.critics):
+            nets["critic" if len(self.critics) == 1 else f"critic{i}"] = critic
+        csv_rows = []
+        for name, net in nets.items():
+            relus = [m for m in net.modules() if isinstance(m, nn.ReLU)]   # hidden layers 1, 2, ... in forward order
+            if not relus:
+                raise ValueError(f"--record_zero_neurons: the {name} has no nn.ReLU (use the default, ReLU nets)")
+            # (layer, source) -> (neurons,) bool: True once the neuron's output was > 0 for some transition from source
+            ever_fired = {}
+            chunk_src = [None]   # source ids of the chunk being forwarded (a list so the hook sees the update)
+
+            def make_hook(layer):
+                def hook(_module, _input, out):
+                    pos = out > 0
+                    for s in src_ids:
+                        m = chunk_src[0] == s
+                        if not m.any():
+                            continue
+                        fired = pos[m].any(dim=0)
+                        key = (layer, s)
+                        ever_fired[key] = fired if key not in ever_fired else ever_fired[key] | fired
+                return hook
+
+            hooks = [relu.register_forward_hook(make_hook(layer)) for layer, relu in enumerate(relus, start=1)]
+            for start in range(0, len(obs), chunk):   # in chunks, so a 1M buffer fits in GPU memory
+                o, a = obs[start:start + chunk], act[start:start + chunk]
+                chunk_src[0] = src[start:start + chunk]
+                net(o) if name == "actor" else net(o, a)
+            for hook in hooks:
+                hook.remove()
+            for (layer, s), fired in sorted(ever_fired.items()):
+                csv_rows.append([self.global_step, name, layer, self.rb.source_names[s],
+                                 fired.numel(), int((~fired).sum()), src_counts[s]])
+        with open(self.zero_neurons_path, "a", newline="") as f:
+            csv.writer(f).writerows(csv_rows)
+
     def agent_step(self, next_obs, actions, rewards, terminations, truncations, infos):
         terminations = terminations.bool()
         truncations = truncations.bool()
@@ -375,15 +461,18 @@ class MPO:
         self._update_episode_returns(infos, rewards, boundaries, autoreset_now)
 
         num_inserts = int(valid.sum().item())
-        self.rb.add(
-            obs=self.obs,
-            next_obs=next_obs,
-            action=actions,
-            reward=rewards,
-            terminated=terminations,
-            truncated=truncations,
-            valid=valid,
-        )
+        # --freeze_buffer: keep training on the loaded (Sim1) buffer only. num_inserts still
+        # counts env transitions so the update rate (samples_per_insert) is unchanged.
+        if not self.args.freeze_buffer:
+            self.rb.add(
+                obs=self.obs,
+                next_obs=next_obs,
+                action=actions,
+                reward=rewards,
+                terminated=terminations,
+                truncated=truncations,
+                valid=valid,
+            )
 
         self.global_step += 1
         self.obs = next_obs
@@ -408,6 +497,13 @@ class MPO:
                         results.append({k: v.clone() for k, v in stats.items()})
                 if not need_stats:
                     return None
+                # Per-transition TD terms of the LAST update of this step -> td_terms.csv (not averaged)
+                td = {k: results[-1][k] for k in list(results[-1]) if k.startswith("td_")}
+                for r in results:
+                    for k in td:
+                        r.pop(k)
+                if td:
+                    self._collect_td_terms(td, self._last_batch_sources, self._last_batch_slots)
                 metrics = _stats_to_floats(
                     {k: sum(r[k] for r in results) / len(results) for k in results[0]})
 
@@ -453,6 +549,12 @@ class MPO:
                       if len(self.critics) > 1 else torch.zeros(0, dtype=torch.long, device=self.device))
         inputs = (data.observations, data.actions, data.rewards,
                   data.discounts, data.next_observations, noise, subset_idx)
+        # How many of this update's batch came from each XML -> batch_sources.csv. Outside the graph, and it stays
+        # on the GPU until _flush_batch_sources, so no sync per update.
+        self.batch_source_rows.append((self.learner_step, self.global_step,
+                                       torch.bincount(data.sources.long(), minlength=len(self.rb.source_names))))
+        self._last_batch_sources = data.sources  # per-row source labels for td_terms.csv
+        self._last_batch_slots = data.slots      # per-row buffer slot for td_terms.csv
         if not self._use_cuda_graph:
             return self._update(*inputs)
 
@@ -888,7 +990,46 @@ class MPO:
         }
         if self.args.ensemble > 1:
             fetches["critic_loss_"] = critic_loss_per_critic.detach()
+        if self.args.critic_type == "scalar":
+            # Per-transition TD terms (td_terms.csv): (B,) each, online_q / td_error (E, B)
+            fetches.update({
+                "td_r_t": r_t.detach(),
+                "td_pcont_t": pcont_t.detach(),
+                "td_bootstrap": averaged_q_t.detach(),
+                "td_online_q": online_q.detach(),
+                "td_target": _target.detach(),
+                "td_error": _td_error.detach(),
+            })
         return fetches
+
+    def _collect_td_terms(self, td, sources, slots=None):
+        """One batch of TD terms -> CPU rows for td_terms.csv (only on log_every_n_steps steps)."""
+        td = {k: v.float().cpu() for k, v in td.items()}
+        src = sources.reshape(-1).long().cpu().tolist()
+        # slot + age of each sampled transition, taken now, while the slot still holds it. age = writes since it was
+        # added (0 = newest), so it was collected at env step `step - age` no matter what overwrites that slot later:
+        # its true return comes from the reward log. Left out when resuming a td_terms.csv started without them.
+        extra = [[] for _ in src]
+        if getattr(self, "_td_log_slots", False) and slots is not None:
+            slot = slots.reshape(-1).long().cpu().tolist()
+            extra = [[s, (self.rb.pos - 1 - s) % self.rb.buffer_size] for s in slot]
+        r_t = td["td_r_t"].tolist()
+        pcont = td["td_pcont_t"].tolist()
+        boot = td["td_bootstrap"].tolist()
+        q = td["td_online_q"].reshape(-1, len(r_t)).tolist()        # (E, B)
+        target = td["td_target"].reshape(-1, len(r_t))[0].tolist()  # same target for every critic
+        err = td["td_error"].reshape(-1, len(r_t)).tolist()         # (E, B)
+        for i in range(len(r_t)):
+            self.td_terms_rows.append(
+                [self.global_step, self.learner_step, i, self.rb.source_names[src[i]], r_t[i], pcont[i], boot[i],
+                 *(qe[i] for qe in q), target[i], *(ee[i] for ee in err), *extra[i]])
+
+    def _flush_td_terms(self):
+        if self.csv_file_td_terms is None or not self.td_terms_rows:
+            return
+        self.writer_td_terms.writerows(self.td_terms_rows)
+        self.csv_file_td_terms.flush()
+        self.td_terms_rows = []
 
     def initialize_logging(self, info, append=False):
         self.start_time = time.time()
@@ -957,6 +1098,52 @@ class MPO:
         self.writer_agent_vars = csv.DictWriter(self.csv_file_agent_vars, fieldnames=["step"] + self.keys_agent_vars)
         if not performance_has_header:
             self.writer_agent_vars.writeheader()
+
+        # batch_sources.csv: one row per learner update, how many of its batch_size sampled transitions came from
+        # each XML. Columns: the XMLs the buffer holds (fixed once it is loaded) plus this run's own.
+        rows = self.rb.buffer_size if self.rb.full else self.rb.pos
+        stored = set(self.rb.source[:rows][self.rb.valid[:rows]].unique().tolist())
+        self.batch_source_idx = [i for i in range(len(self.rb.source_names)) if i == self.rb.current_source or i in stored]
+        batch_sources_path = os.path.join(log_dir, "batch_sources.csv")
+        batch_sources_has_header = (append and os.path.exists(batch_sources_path)
+                                    and os.path.getsize(batch_sources_path) > 0)
+        if batch_sources_has_header:   # resume: keep the file's columns (a source may have left the buffer since)
+            with open(batch_sources_path, newline="") as f:
+                existing = next(csv.reader(f))[2:]
+            if all(n in self.rb.source_names for n in existing):
+                self.batch_source_idx = [self.rb.source_names.index(n) for n in existing]
+        batch_sources_header = ["learner_step", "global_step"] + [self.rb.source_names[i] for i in self.batch_source_idx]
+        if batch_sources_has_header:
+            _check_existing_header(batch_sources_path, batch_sources_header)
+        self.csv_file_batch_sources = open(batch_sources_path, mode, newline="")
+        self.writer_batch_sources = csv.writer(self.csv_file_batch_sources)
+        if not batch_sources_has_header:
+            self.writer_batch_sources.writerow(batch_sources_header)
+        self.batch_source_rows = []
+
+        # td_terms.csv: every transition of the last learner update on each log_every_n_steps step (scalar critic).
+        # target = r_t + pcont_t * bootstrap ; td_error = target - online_q ; critic_loss = mean(0.5 * td_error^2)
+        E = self.args.ensemble
+        sfx = (lambda n: [n]) if E == 1 else (lambda n: [f"{n}_{e}" for e in range(E)])
+        td_header = (["step", "learner_step", "idx", "source", "r_t", "pcont_t", "bootstrap"]
+                     + sfx("online_q") + ["target"] + sfx("td_error"))
+        td_path = os.path.join(log_dir, "td_terms.csv")
+        td_has_header = append and os.path.exists(td_path) and os.path.getsize(td_path) > 0
+        self._td_log_slots = True
+        if td_has_header:
+            with open(td_path, "r", newline="") as f:
+                existing = next(csv.reader(f), None)
+            # a run started before slot/age were logged keeps its columns when resumed
+            self._td_log_slots = existing != td_header
+        if self._td_log_slots:
+            td_header = td_header + ["slot", "age"]
+        if td_has_header:
+            _check_existing_header(td_path, td_header)
+        self.csv_file_td_terms = open(td_path, mode, newline="")
+        self.writer_td_terms = csv.writer(self.csv_file_td_terms)
+        if not td_has_header:
+            self.writer_td_terms.writerow(td_header)
+        self.td_terms_rows = []
 
         self.info_log_buffer = []
         self.agent_vars_buffer = []
@@ -1055,6 +1242,18 @@ class MPO:
                 self.writer_agent_vars.writerow(row)
             self.csv_file_agent_vars.flush()
             self.agent_vars_buffer = []
+            self._flush_batch_sources()
+            self._flush_td_terms()
+
+    def _flush_batch_sources(self):
+        """Write the per-update source counts collected since the last flush to batch_sources.csv (one GPU sync)."""
+        if self.csv_file_batch_sources is None or not self.batch_source_rows:
+            return
+        counts = torch.stack([c for _, _, c in self.batch_source_rows]).cpu()[:, self.batch_source_idx].tolist()
+        self.writer_batch_sources.writerows(
+            [[learner_step, global_step, *c] for (learner_step, global_step, _), c in zip(self.batch_source_rows, counts)])
+        self.csv_file_batch_sources.flush()
+        self.batch_source_rows = []
     
     def save_checkpoint(self):
         checkpoint = {
@@ -1097,11 +1296,38 @@ class MPO:
         checkpoint["ep_returns"] = self._ep_returns.copy()
         checkpoint["learner_update_budget"] = self.learner_update_budget
         torch.save(checkpoint, os.path.join(self.weights_folder, f"checkpoint_{self.global_step}.pth"))
-        self.rb.save(os.path.join(self.weights_folder, "replay_buffer.npz"))
-        if self.args.save_rb_ckpt:
+        rb_path = os.path.join(self.weights_folder, "replay_buffer.npz")
+        if self.args.freeze_buffer:
+            # Frozen buffer never changes: save it once (so --resume_in_place still finds it), then skip.
+            if not os.path.exists(rb_path):
+                self.rb.save(rb_path)
+        else:
+            self.rb.save(rb_path)
+        if self.args.save_rb_ckpt and not self.args.freeze_buffer:
             self.rb.save(os.path.join(self.weights_folder, f"replay_buffer_{self.global_step}.npz"))
+        if not self.args.freeze_buffer:
+            self.save_overwritten()
 
-    def load_checkpoint(self, weights_path, checkpoint_step=None):
+    def save_overwritten(self):
+        """Append the slots the next save_every_n_steps writes will overwrite to overwritten_buffer.npz, so every
+        transition of the run survives somewhere (this file + replay_buffer.npz). step = env step it was collected at."""
+        path = os.path.join(self.weights_folder, "overwritten_buffer.npz")
+        if getattr(self, "_overwritten", None) is None:   # first call; a resumed run continues its file
+            self._overwritten = [dict(np.load(path))] if os.path.exists(path) else []
+        rb = self.rb
+        idx = (rb.pos + np.arange(self.args.save_every_n_steps)) % rb.buffer_size
+        idx = idx[rb.full | (idx < rb.pos)]   # only slots that hold a transition now
+        if len(idx) == 0:
+            return
+        chunk = {k: getattr(rb, k)[idx].cpu().numpy() for k in
+                 ("observations", "next_observations", "actions", "rewards", "terminations", "truncations",
+                  "valid", "source")}
+        chunk["step"] = self.global_step - (rb.pos - 1 - idx) % rb.buffer_size
+        self._overwritten.append(chunk)
+        np.savez(path, source_names=np.array(rb.source_names),
+                 **{k: np.concatenate([c[k] for c in self._overwritten]) for k in chunk})
+
+    def load_checkpoint(self, weights_path, checkpoint_step=None, load_buffer=True):
         weights_path = os.path.abspath(weights_path.rstrip("/"))
         if os.path.basename(weights_path) != "weights_and_args":
             nested = os.path.join(weights_path, "weights_and_args")
@@ -1184,6 +1410,18 @@ class MPO:
                     self.param_log_eta_mu.copy_(torch.as_tensor(checkpoint["param_log_eta_mu"],dtype=self.param_log_eta_mu.dtype,device=self.device).reshape_as(self.param_log_eta_mu))
                 if "param_log_eta_sigma" in checkpoint:
                     self.param_log_eta_sigma.copy_(torch.as_tensor(checkpoint["param_log_eta_sigma"],dtype=self.param_log_eta_sigma.dtype,device=self.device).reshape_as(self.param_log_eta_sigma))
+        if self.args.reset_decoupled_kl_duals:
+            # Fresh M-step duals: init values, and Adam state zeroed in place (same as a never-stepped
+            # Adam; in place so it is safe with capturable / CUDA-graph optimizers).
+            with torch.no_grad():
+                self.log_alpha_mean.fill_(self._init_log_alpha_mean)
+                self.log_alpha_stddev.fill_(self._init_log_alpha_stddev)
+            for p in (self.log_alpha_mean, self.log_alpha_stddev):
+                for v in self.dual_optimizer.state.get(p, {}).values():
+                    if torch.is_tensor(v):
+                        v.zero_()
+            print(f"[√] Reset decoupled KL duals to init (log_alpha_mean={self._init_log_alpha_mean}, "
+                  f"log_alpha_stddev={self._init_log_alpha_stddev}) and cleared their Adam state")
         self.global_step = int(checkpoint.get("global_step", 0))
         self.learner_step = int(checkpoint.get("learner_step", 0))
         print(f"[√] Loaded checkpoint from {weights_path}, global_step={self.global_step}")
@@ -1191,8 +1429,10 @@ class MPO:
         step_buffer_path = os.path.join(weights_path, f"replay_buffer_{self.global_step}.npz")
         buffer_path = (step_buffer_path if os.path.exists(step_buffer_path)
                        else os.path.join(weights_path, "replay_buffer.npz"))
-        if os.path.exists(buffer_path):
-            self.rb.load(buffer_path, self.device)
+        if not load_buffer:
+            print("[i] --no_load_buffer: replay buffer not loaded, starting empty")
+        elif os.path.exists(buffer_path):
+            self.rb.load(buffer_path, self.device, untagged_source=_xml_of_run(weights_path))
             print(f"[√] Loaded replay buffer {os.path.basename(buffer_path)}")
 
         # Continue the saved episode. Runs after envs.reset(), so the reset is overwritten.
@@ -1225,8 +1465,22 @@ class MPO:
             self.csv_file_raw_actions.close()
         if self.csv_file_agent_vars:
             self.csv_file_agent_vars.close()
+        self._flush_batch_sources()
+        if self.csv_file_batch_sources is not None:
+            self.csv_file_batch_sources.close()
+        self._flush_td_terms()
+        if self.csv_file_td_terms is not None:
+            self.csv_file_td_terms.close()
         if self.envs:
             self.envs.close()
+
+def _xml_of_run(folder):
+    """The model XML name (no .xml) in folder/args.json, or None: names the transitions of an old, untagged buffer."""
+    try:
+        with open(os.path.join(folder, "args.json")) as f:
+            return os.path.basename(json.load(f)["model_path"]).removesuffix(".xml")
+    except (OSError, KeyError, ValueError):
+        return None
 
 def _stats_to_floats(stats):
     """GPU stat tensors -> floats; keys ending in "_" become one entry per action dim."""
@@ -1359,7 +1613,16 @@ def parse_args(argv=None):
     parser.add_argument("--capture_video_every", type=int, default=None,
                         help="Start a capture_video_steps-long clip every N env steps (default: only at step 0)")
     parser.add_argument("--eval", action="store_true", default=False)
+    parser.add_argument("--stochastic_action", "--stochastic-action", action="store_true", default=False,
+                        help="Only with --eval: sample actions from the policy instead of taking its mean")
     parser.add_argument("--save_every_n_steps", type=int, default=4000)
+    add_dormant_args(parser)   # --dormant_every, --dormant_batch, --dormant_taus
+    parser.set_defaults(dormant_every=0)   # dormant logging off by default here; pass --dormant_every N to enable
+    parser.add_argument("--record_zero_neurons", action="store_true", default=False,
+                        help="every --zero_neurons_every steps, log the dead ReLU neurons of each layer of the online "
+                             "actor and critic(s), separately for each source XML in the replay buffer (output 0 on every "
+                             "buffer transition from that XML, e.g. Sim1 vs Sim2) to <run>/zero_neurons_by_source.csv")
+    parser.add_argument("--zero_neurons_every", type=int, default=4000)
     parser.add_argument("--save_rb_ckpt", action="store_true", default=False,
                         help="Also save replay_buffer_{step}.npz alongside every checkpoint_{step}.pth")
     parser.add_argument("--log_every_n_steps", type=int, default=4000)
@@ -1377,7 +1640,7 @@ def parse_args(argv=None):
     parser.add_argument("--num_envs", type=int, default=1)
 
     parser.add_argument("--buffer_size", type=int, default=int(1e6))
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=256)
 
     # Categorical distributional critic
     parser.add_argument("--vmin", type=float, default=-500.0,
@@ -1487,6 +1750,11 @@ def parse_args(argv=None):
                         help="bound on 0.5*||theta - theta_target||^2 over actor params (only with --kl_constraint l2)")
     parser.add_argument("--init_log_beta", type=float, default=0.0,
                         help="init log dual for the L2 M-step constraint (only with --kl_constraint l2)")
+    parser.add_argument("--reset_decoupled_kl_duals", action="store_true", default=False,
+                        help="With --weights_path and --kl_constraint decoupled: after loading, set log_alpha_mean / "
+                             "log_alpha_stddev back to --init_log_alpha_mean / --init_log_alpha_stddev and clear their "
+                             "Adam state, as an l2 run warm-started from a decoupled checkpoint gets for log_beta. "
+                             "Everything else (log_eta included) is still loaded.")
 
     # Environment.
     parser.add_argument("--dt", type=float, default=0.12)
@@ -1494,6 +1762,16 @@ def parse_args(argv=None):
     parser.add_argument("--render_mode", type=str, default=None)
     parser.add_argument("--terminate_on_upside_down", type=bool, default=True)
     parser.add_argument("--weights_path", type=str, default=None)
+    parser.add_argument("--buffer_path", type=str, default=None,
+                        help="Start with this replay_buffer.npz preloaded; nothing else is loaded "
+                             "(fresh nets/duals/optimizers, global_step 0). Not with --weights_path.")
+    parser.add_argument("--no_load_buffer", action="store_true", default=False,
+                        help="With --weights_path: load nets, duals, optimizers, step and env state, but start with an "
+                             "empty replay buffer. --learning_starts then counts from the loaded step.")
+    parser.add_argument("--freeze_buffer", action="store_true", default=False,
+                        help="Never add new transitions to the replay buffer; keep training on the buffer "
+                             "loaded via --weights_path / --buffer_path (e.g. Sim2 trained on Sim1 data only). "
+                             "The buffer is saved once, not at every checkpoint.")
     parser.add_argument("--resume_in_place", action="store_true", default=False)
     parser.add_argument("--task_type", type=str, default="back_and_forth",
                         choices=["forward", "back_and_forth"])
@@ -1566,6 +1844,21 @@ def main():
 
     date = datetime.now().strftime("%Y%m%d-%H%M%S")
     disk_folder = ""
+    if args.buffer_path is not None and args.weights_path is not None:
+        raise ValueError("--buffer_path is for buffer-only warm starts; --weights_path already loads the buffer")
+    if args.no_load_buffer and (args.weights_path is None or args.resume_in_place):
+        raise ValueError("--no_load_buffer is for warm starts: needs --weights_path, not --resume_in_place")
+    if args.freeze_buffer:
+        if args.weights_path is None and args.buffer_path is None:
+            raise ValueError("--freeze_buffer needs a loaded buffer: pass --weights_path or --buffer_path")
+        if args.no_load_buffer:
+            raise ValueError("--freeze_buffer with --no_load_buffer would train on an empty buffer")
+    if args.reset_decoupled_kl_duals:
+        if args.kl_constraint != "decoupled":
+            raise ValueError("--reset_decoupled_kl_duals is only for --kl_constraint decoupled")
+        if args.weights_path is None or args.resume_in_place:
+            # Resuming a run would reset its duals again mid-training.
+            raise ValueError("--reset_decoupled_kl_duals is for warm starts: needs --weights_path, not --resume_in_place")
     if args.resume_in_place:
         if args.weights_path is None:
             raise ValueError("--resume_in_place requires --weights_path")
@@ -1614,9 +1907,23 @@ def main():
     if args.weights_path is not None:
         agent.load_checkpoint(args.weights_path,
             checkpoint_step=args.checkpoint_step,
+            load_buffer=not args.no_load_buffer,
         )
+        if args.no_load_buffer:   # empty buffer: random actions and no learning for learning_starts steps from here
+            args.learning_starts += agent.global_step
+            print(f"[i] learning starts after global_step {args.learning_starts}")
         if args.eval:
             agent.global_step = 0
+    if args.buffer_path is not None:
+        agent.rb.load(args.buffer_path, agent.device, untagged_source=_xml_of_run(os.path.dirname(args.buffer_path)))
+        # The env was just reset, so the last Sim1 transition must not chain into the first Sim2 one in n-step returns.
+        agent.rb.truncations[(agent.rb.pos - 1) % agent.rb.buffer_size].fill_(True)
+        print(f"[√] Loaded replay buffer only: {args.buffer_path} (size {agent.rb.size()})")
+    if args.freeze_buffer:
+        if agent.rb.size() < agent.batch_size:
+            raise RuntimeError(f"--freeze_buffer: loaded buffer has {agent.rb.size()} rows (< batch_size "
+                               f"{agent.batch_size}); was replay_buffer.npz missing?")
+        print(f"[i] --freeze_buffer: training only on the loaded buffer ({agent.rb.size()} rows), no new inserts")
     print(f"obs space: {envs.observation_space}")
     print(f"act space: {envs.action_space}")
     print(f"device: {envs.device}")
@@ -1665,7 +1972,9 @@ def main():
                 metrics = None
             else:
                 metrics = agent.agent_step(next_obs, selected_actions, rewards, terminations, truncations, infos)
-            
+                agent.measure_dormant()   # after this step's learner updates
+                agent.record_zero_neurons()
+
             current_step = agent.global_step
             agent.log_step(current_step, infos, rewards, metrics, raw_action=selected_actions)
             if solved_tracker is not None and (terminations[0] or truncations[0]):

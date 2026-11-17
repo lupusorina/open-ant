@@ -169,16 +169,37 @@ def _make_embodied_ant_env(args, task, seed, idx, disk_folder, run_name, runs_di
     return env
 
 
-def _make_rccar_env(args, seed, reward_scale):
+def _make_rccar_env(args, seed, idx, disk_folder, run_name, runs_directory, reward_scale):
+    from dataclasses import asdict
+
     from rccar_env import RCCarEnv
 
+    # Fixed car from the launching shell script (JSON dict of CarParams fields); unset = random draw.
+    car_params = os.environ.get("RCCAR_CAR_PARAMS")
+    car_params = json.loads(car_params) if car_params else None
+    # Actuator delay in env steps (dt = 1/30 s each) from the launching shell script; unset = 1 (ss2r default).
+    action_delay = int(os.environ.get("RCCAR_ACTION_DELAY") or 1)
+    # First-order actuator lag time constant in seconds (like a MuJoCo timeconst); unset = 0 (none, ss2r default).
+    action_lag = float(os.environ.get("RCCAR_ACTION_LAG") or 0.0)
     env = RCCarEnv(
         dynamics=RCCAR_ENV_IDS[args.env_id],
         domain_randomization=getattr(args, "rccar_domain_randomization", "per_env"),
         max_episode_steps=getattr(args, "rccar_episode_length", 250),
+        car_params=car_params,
+        action_delay=action_delay,
+        action_lag=action_lag,
+        render_mode="rgb_array" if (args.capture_video and idx == 0) else None,
     )
+    args.rccar_action_delay = action_delay   # saved in args.json
+    args.rccar_action_lag = action_lag
+    print(f"[√] RC car action delay: {action_delay} steps ({action_delay * env.dt * 1000:.0f} ms), "
+          f"first-order lag: {action_lag * 1000:.0f} ms ({action_lag / env.dt:.2f} steps)")
     env.action_space.seed(seed)
     env.reset(seed=seed)  # seeds this env's per-env parameter draw and init states
+    # The car actually used (after reset, so a random draw is included); saved in args.json.
+    args.rccar_car_params = asdict(env.params)
+    print(f"[√] RC car params ({'fixed' if car_params else env.domain_randomization}): {args.rccar_car_params}")
+    env = _maybe_record_video(env, args, idx, disk_folder, run_name, runs_directory)
     env = OriginalRewardWrapper(env)
     env = gym.wrappers.TransformReward(env, lambda r, scale=reward_scale: r * scale)
     return env
@@ -199,6 +220,17 @@ def make_envs(
 
     Returns (env_raw, envs). When wrap_skrl is False, both are the SyncVectorEnv.
     """
+    if not (
+        args.env_id in EMBODIED_ANT_ENV_IDS
+        or args.env_id in RCCAR_ENV_IDS
+        or is_gymnasium_env(args.env_id)
+    ):
+        raise ValueError(
+            f"Unknown env_id {args.env_id!r}. Expected an embodied Ant id "
+            f"{sorted(EMBODIED_ANT_ENV_IDS)}, an RC car id {sorted(RCCAR_ENV_IDS)}, "
+            "or a registered Gymnasium id (dm_control/ ids also need shimmy)."
+        )
+
     reward_scale = effective_reward_scale(args)
     args.reward_scale = reward_scale
     use_gym = is_gymnasium_env(args.env_id)
@@ -208,8 +240,6 @@ def make_envs(
         print(f"[√] Using RC car env_id={args.env_id} (reward_scale={reward_scale})")
         if task is not None:
             print("[!] Ignoring --task_type for RC car environments")
-        if args.capture_video:
-            print("[!] --capture_video is not supported for RC car environments; ignoring")
     elif use_gym:
         print(f"[√] Using Gymnasium env_id={args.env_id} (reward_scale={reward_scale})")
         if task is not None:
@@ -222,7 +252,7 @@ def make_envs(
     def make_env(seed, idx):
         def _init():
             if use_rccar:
-                return _make_rccar_env(args, seed, reward_scale)
+                return _make_rccar_env(args, seed, idx, disk_folder, run_name, runs_directory, reward_scale)
             if use_gym:
                 return _make_gymnasium_env(
                     args, seed, idx, disk_folder, run_name, runs_directory, reward_scale
